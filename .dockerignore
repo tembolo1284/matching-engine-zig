@@ -1,0 +1,19 @@
+# Build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Git
+.git/
+.gitignore
+
+# Documentation (not needed in image)
+*.md
+docs/
+
+# IDE
+.vscode/
+.idea/
+
+# Tests (not needed in production image)
+tests/
