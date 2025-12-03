@@ -395,6 +395,140 @@ pub const OrderBook = struct {
         }
     }
 
+    /// Flush all orders from the book
+    pub fn flush(self: *Self, output: *OutputBuffer) void {
+        // Cancel all bids
+        for (self.bids[0..self.num_bid_levels]) |*level| {
+            if (level.active) {
+                var order = level.orders_head;
+                while (order) |o| {
+                    const next = o.next;
+                    output.add(msg.OutputMsg.makeCancelAck(
+                        o.user_id,
+                        o.user_order_id,
+                        self.symbol,
+                        o.client_id,
+                    ));
+                    self.pools.order_pool.release(o);
+                    order = next;
+                }
+                level.orders_head = null;
+                level.orders_tail = null;
+                level.total_quantity = 0;
+                level.active = false;
+            }
+        }
+        self.num_bid_levels = 0;
+
+        // Cancel all asks
+        for (self.asks[0..self.num_ask_levels]) |*level| {
+            if (level.active) {
+                var order = level.orders_head;
+                while (order) |o| {
+                    const next = o.next;
+                    output.add(msg.OutputMsg.makeCancelAck(
+                        o.user_id,
+                        o.user_order_id,
+                        self.symbol,
+                        o.client_id,
+                    ));
+                    self.pools.order_pool.release(o);
+                    order = next;
+                }
+                level.orders_head = null;
+                level.orders_tail = null;
+                level.total_quantity = 0;
+                level.active = false;
+            }
+        }
+        self.num_ask_levels = 0;
+
+        // Clear order map
+        self.order_map = OrderMap.init();
+
+        // Emit empty TOB
+        output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0));
+        output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0));
+
+        self.prev_best_bid_price = 0;
+        self.prev_best_bid_qty = 0;
+        self.prev_best_ask_price = 0;
+        self.prev_best_ask_qty = 0;
+    }
+
+    /// Cancel all orders for a specific client
+    pub fn cancelClientOrders(self: *Self, client_id: u32, output: *OutputBuffer) usize {
+        var cancelled: usize = 0;
+
+        // Scan bids
+        for (self.bids[0..self.num_bid_levels]) |*level| {
+            if (level.active) {
+                var order = level.orders_head;
+                while (order) |o| {
+                    const next = o.next;
+                    if (o.client_id == client_id) {
+                        level.removeOrder(o);
+                        const key = OrderMap.makeKey(o.user_id, o.user_order_id);
+                        _ = self.order_map.remove(key);
+                        output.add(msg.OutputMsg.makeCancelAck(
+                            o.user_id,
+                            o.user_order_id,
+                            self.symbol,
+                            client_id,
+                        ));
+                        self.pools.order_pool.release(o);
+                        cancelled += 1;
+                    }
+                    order = next;
+                }
+            }
+        }
+
+        // Scan asks
+        for (self.asks[0..self.num_ask_levels]) |*level| {
+            if (level.active) {
+                var order = level.orders_head;
+                while (order) |o| {
+                    const next = o.next;
+                    if (o.client_id == client_id) {
+                        level.removeOrder(o);
+                        const key = OrderMap.makeKey(o.user_id, o.user_order_id);
+                        _ = self.order_map.remove(key);
+                        output.add(msg.OutputMsg.makeCancelAck(
+                            o.user_id,
+                            o.user_order_id,
+                            self.symbol,
+                            client_id,
+                        ));
+                        self.pools.order_pool.release(o);
+                        cancelled += 1;
+                    }
+                    order = next;
+                }
+            }
+        }
+
+        if (cancelled > 0) {
+            self.cleanupEmptyLevels(.buy);
+            self.cleanupEmptyLevels(.sell);
+            self.checkTopOfBookChange(output);
+        }
+
+        return cancelled;
+    }
+
+    /// Reset book for new symbol
+    pub fn reset(self: *Self, symbol: msg.Symbol) void {
+        self.symbol = symbol;
+        self.num_bid_levels = 0;
+        self.num_ask_levels = 0;
+        self.order_map = OrderMap.init();
+        self.prev_best_bid_price = 0;
+        self.prev_best_bid_qty = 0;
+        self.prev_best_ask_price = 0;
+        self.prev_best_ask_qty = 0;
+    }
+
     fn insertOrder(self: *Self, order: *Order) void {
         const key = OrderMap.makeKey(order.user_id, order.user_order_id);
         const level = self.findOrCreateLevel(order.side, order.price);

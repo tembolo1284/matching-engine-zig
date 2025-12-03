@@ -1,12 +1,8 @@
 //! TCP server with 4-byte length-prefix framing.
-//!
-//! Wire format:
-//!   [4 bytes big-endian length][payload]
-//!
-//! This matches the C protocol specification.
 
 const std = @import("std");
 const posix = std.posix;
+const linux = std.os.linux;
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
 const config = @import("config.zig");
@@ -52,25 +48,21 @@ pub const TcpClient = struct {
         self.* = .{};
     }
 
-    /// Queue a framed message for sending (adds 4-byte length prefix)
     pub fn queueFramedSend(self: *Self, data: []const u8) bool {
         const frame_size = FRAME_HEADER_SIZE + data.len;
         const available = SEND_BUFFER_SIZE - self.send_len;
         if (frame_size > available) return false;
 
-        // Write length header (big-endian)
         const len_bytes = self.send_buf[self.send_len..][0..4];
         std.mem.writeInt(u32, len_bytes, @intCast(data.len), .big);
         self.send_len += 4;
 
-        // Write payload
         @memcpy(self.send_buf[self.send_len..][0..data.len], data);
         self.send_len += data.len;
 
         return true;
     }
 
-    /// Queue raw data (no framing - for responses in same format as received)
     pub fn queueSend(self: *Self, data: []const u8) bool {
         const available = SEND_BUFFER_SIZE - self.send_len;
         if (data.len > available) return false;
@@ -100,14 +92,11 @@ pub const TcpClient = struct {
         return self.send_pos < self.send_len;
     }
 
-    /// Try to extract a complete framed message from the receive buffer.
-    /// Returns the payload slice (without header) or null if incomplete.
     pub fn extractFrame(self: *Self) ?[]const u8 {
         if (self.recv_len < FRAME_HEADER_SIZE) return null;
 
         const msg_len = std.mem.readInt(u32, self.recv_buf[0..4], .big);
         if (msg_len > MAX_MESSAGE_SIZE) {
-            // Invalid frame - skip the header and try to recover
             self.compactBuffer(FRAME_HEADER_SIZE);
             return null;
         }
@@ -118,7 +107,6 @@ pub const TcpClient = struct {
         return self.recv_buf[FRAME_HEADER_SIZE..total_len];
     }
 
-    /// Remove processed bytes from buffer
     pub fn compactBuffer(self: *Self, bytes: usize) void {
         if (bytes >= self.recv_len) {
             self.recv_len = 0;
@@ -146,7 +134,7 @@ pub const TcpServer = struct {
     total_connections: u64 = 0,
     total_disconnections: u64 = 0,
 
-    use_framing: bool = true, // Enable TCP framing by default
+    use_framing: bool = true,
 
     allocator: std.mem.Allocator,
 
@@ -167,17 +155,18 @@ pub const TcpServer = struct {
         try posix.setsockopt(self.listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
         var addr = try parseAddress(address, port);
-        try posix.bind(self.listen_fd, &addr, @sizeOf(@TypeOf(addr)));
+        const addr_ptr: *const posix.sockaddr = @ptrCast(&addr);
+        try posix.bind(self.listen_fd, addr_ptr, @sizeOf(@TypeOf(addr)));
         try posix.listen(self.listen_fd, 128);
 
         self.epoll_fd = try posix.epoll_create1(0);
         errdefer posix.close(self.epoll_fd);
 
-        var ev = posix.epoll_event{
-            .events = posix.EPOLL.IN,
+        var ev = linux.epoll_event{
+            .events = linux.EPOLL.IN,
             .data = .{ .fd = self.listen_fd },
         };
-        try posix.epoll_ctl(self.epoll_fd, posix.EPOLL.CTL_ADD, self.listen_fd, &ev);
+        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, self.listen_fd, &ev);
 
         std.log.info("TCP server listening on {s}:{} (framing={})", .{ address, port, self.use_framing });
     }
@@ -202,7 +191,7 @@ pub const TcpServer = struct {
     }
 
     pub fn poll(self: *Self, timeout_ms: i32) !usize {
-        var events: [MAX_EVENTS]posix.epoll_event = undefined;
+        var events: [MAX_EVENTS]linux.epoll_event = undefined;
 
         const n = posix.epoll_wait(self.epoll_fd, &events, timeout_ms);
 
@@ -215,14 +204,14 @@ pub const TcpServer = struct {
                 const client_idx = self.findClientByFd(ev.data.fd) orelse continue;
                 const client = &self.clients[client_idx];
 
-                if (ev.events & posix.EPOLL.IN != 0) {
+                if (ev.events & linux.EPOLL.IN != 0) {
                     self.handleClientRead(client) catch |err| {
                         std.log.debug("Client {} read error: {}", .{ client.client_id, err });
                         self.disconnectClient(client);
                     };
                 }
 
-                if (ev.events & posix.EPOLL.OUT != 0) {
+                if (ev.events & linux.EPOLL.OUT != 0) {
                     client.flushSend() catch |err| {
                         std.log.debug("Client {} write error: {}", .{ client.client_id, err });
                         self.disconnectClient(client);
@@ -233,7 +222,7 @@ pub const TcpServer = struct {
                     }
                 }
 
-                if (ev.events & (posix.EPOLL.ERR | posix.EPOLL.HUP) != 0) {
+                if (ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
                     self.disconnectClient(client);
                 }
             }
@@ -275,7 +264,8 @@ pub const TcpServer = struct {
         var addr: posix.sockaddr.in = undefined;
         var addr_len: posix.socklen_t = @sizeOf(@TypeOf(addr));
 
-        const client_fd = try posix.accept(self.listen_fd, @ptrCast(&addr), &addr_len, posix.SOCK.NONBLOCK);
+        const addr_ptr: *posix.sockaddr = @ptrCast(&addr);
+        const client_fd = try posix.accept(self.listen_fd, addr_ptr, &addr_len, posix.SOCK.NONBLOCK);
         errdefer posix.close(client_fd);
 
         const client = self.findFreeClientSlot() orelse {
@@ -295,11 +285,11 @@ pub const TcpServer = struct {
 
         posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
-        var ev = posix.epoll_event{
-            .events = posix.EPOLL.IN | posix.EPOLL.ET,
+        var ev = linux.epoll_event{
+            .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = .{ .fd = client_fd },
         };
-        try posix.epoll_ctl(self.epoll_fd, posix.EPOLL.CTL_ADD, client_fd, &ev);
+        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev);
 
         std.log.info("Client {} connected (fd={})", .{ client.client_id, client_fd });
     }
@@ -334,12 +324,10 @@ pub const TcpServer = struct {
         while (true) {
             const payload = client.extractFrame() orelse break;
 
-            // Detect protocol if unknown
             if (client.protocol == .unknown) {
                 client.protocol = codec.detectProtocol(payload);
             }
 
-            // Decode message
             const result = codec.Codec.decodeInput(payload) catch |err| {
                 std.log.warn("Client {} decode error: {}", .{ client.client_id, err });
                 client.compactBuffer(FRAME_HEADER_SIZE + payload.len);
@@ -352,7 +340,6 @@ pub const TcpServer = struct {
                 callback(client.client_id, &result.message, self.callback_ctx);
             }
 
-            // Remove processed frame
             client.compactBuffer(FRAME_HEADER_SIZE + payload.len);
         }
     }
@@ -394,7 +381,7 @@ pub const TcpServer = struct {
         const client_id = client.client_id;
         std.log.info("Client {} disconnected", .{client_id});
 
-        posix.epoll_ctl(self.epoll_fd, posix.EPOLL.CTL_DEL, client.fd, null) catch {};
+        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, client.fd, null) catch {};
 
         client.reset();
         self.client_count -|= 1;
@@ -406,14 +393,14 @@ pub const TcpServer = struct {
     }
 
     fn updateClientEpoll(self: *Self, client: *TcpClient, want_write: bool) !void {
-        var events: u32 = posix.EPOLL.IN | posix.EPOLL.ET;
-        if (want_write) events |= posix.EPOLL.OUT;
+        var events: u32 = linux.EPOLL.IN | linux.EPOLL.ET;
+        if (want_write) events |= linux.EPOLL.OUT;
 
-        var ev = posix.epoll_event{
+        var ev = linux.epoll_event{
             .events = events,
             .data = .{ .fd = client.fd },
         };
-        try posix.epoll_ctl(self.epoll_fd, posix.EPOLL.CTL_MOD, client.fd, &ev);
+        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, client.fd, &ev);
     }
 
     fn findFreeClientSlot(self: *Self) ?*TcpClient {

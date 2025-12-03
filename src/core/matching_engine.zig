@@ -1,305 +1,289 @@
-//! Multi-symbol order book orchestrator.
-//!
-//! Routes orders to appropriate symbol books,
-//! handles cancel lookups across books.
+//! Multi-symbol matching engine orchestrator.
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const OrderBook = @import("order_book.zig").OrderBook;
 const OutputBuffer = @import("order_book.zig").OutputBuffer;
 const MemoryPools = @import("memory_pool.zig").MemoryPools;
+const config = @import("../transport/config.zig");
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
-pub const MAX_SYMBOLS = 256;
-pub const SYMBOL_MAP_SIZE = 512; // Power of 2
+pub const SYMBOL_MAP_SIZE = 512;
 pub const SYMBOL_MAP_MASK = SYMBOL_MAP_SIZE - 1;
-pub const MAX_SYMBOL_PROBE = 64;
+pub const ORDER_SYMBOL_MAP_SIZE = 16384;
+pub const ORDER_SYMBOL_MAP_MASK = ORDER_SYMBOL_MAP_SIZE - 1;
+pub const MAX_PROBE_LENGTH = 64;
 
 comptime {
     std.debug.assert(SYMBOL_MAP_SIZE & (SYMBOL_MAP_SIZE - 1) == 0);
+    std.debug.assert(ORDER_SYMBOL_MAP_SIZE & (ORDER_SYMBOL_MAP_SIZE - 1) == 0);
 }
 
-// ============================================================================
-// Symbol Hash Table
-// ============================================================================
-
-const SymbolMapSlot = struct {
+const SymbolSlot = struct {
     symbol: msg.Symbol,
-    book_index: i32, // -1 = empty
+    book_index: u16,
+    active: bool,
 };
-
-const SymbolMap = struct {
-    slots: [SYMBOL_MAP_SIZE]SymbolMapSlot = undefined,
-    count: u32 = 0,
-
-    const Self = @This();
-
-    pub fn init() Self {
-        var self = Self{};
-        for (&self.slots) |*slot| {
-            slot.symbol = [_]u8{0} ** msg.MAX_SYMBOL_LENGTH;
-            slot.book_index = -1;
-        }
-        return self;
-    }
-
-    /// FNV-1a hash for symbol
-    fn hash(symbol: msg.Symbol) u32 {
-        var h: u32 = 2166136261;
-        for (symbol) |c| {
-            if (c == 0) break;
-            h ^= c;
-            h *%= 16777619;
-        }
-        return h & SYMBOL_MAP_MASK;
-    }
-
-    pub fn find(self: *const Self, symbol: msg.Symbol) ?i32 {
-        var idx = hash(symbol);
-        
-        for (0..MAX_SYMBOL_PROBE) |_| {
-            const slot = &self.slots[idx];
-            if (slot.book_index == -1 and slot.symbol[0] == 0) return null;
-            if (msg.symbolEqual(slot.symbol, symbol)) return slot.book_index;
-            idx = (idx + 1) & SYMBOL_MAP_MASK;
-        }
-        return null;
-    }
-
-    pub fn insert(self: *Self, symbol: msg.Symbol, book_index: i32) bool {
-        var idx = hash(symbol);
-        
-        for (0..MAX_SYMBOL_PROBE) |_| {
-            const slot = &self.slots[idx];
-            if (slot.book_index == -1) {
-                slot.symbol = symbol;
-                slot.book_index = book_index;
-                self.count += 1;
-                return true;
-            }
-            idx = (idx + 1) & SYMBOL_MAP_MASK;
-        }
-        return false;
-    }
-};
-
-// ============================================================================
-// Order-to-Symbol Map (for cancels without symbol)
-// ============================================================================
-
-pub const ORDER_SYMBOL_MAP_SIZE = 16384;
-pub const ORDER_SYMBOL_MAP_MASK = ORDER_SYMBOL_MAP_SIZE - 1;
-pub const ORDER_KEY_EMPTY: u64 = 0;
-pub const ORDER_KEY_TOMBSTONE: u64 = std.math.maxInt(u64);
 
 const OrderSymbolSlot = struct {
-    order_key: u64, // (user_id << 32) | user_order_id
+    key: u64,
     symbol: msg.Symbol,
+    active: bool,
 };
-
-const OrderSymbolMap = struct {
-    slots: [ORDER_SYMBOL_MAP_SIZE]OrderSymbolSlot = undefined,
-    count: u32 = 0,
-    tombstone_count: u32 = 0,
-
-    const Self = @This();
-
-    pub fn init() Self {
-        var self = Self{};
-        for (&self.slots) |*slot| {
-            slot.order_key = ORDER_KEY_EMPTY;
-        }
-        return self;
-    }
-
-    fn hash(key: u64) u32 {
-        const GOLDEN: u64 = 0x9E3779B97F4A7C15;
-        var k = key;
-        k ^= k >> 33;
-        k *%= GOLDEN;
-        k ^= k >> 29;
-        return @intCast(k & ORDER_SYMBOL_MAP_MASK);
-    }
-
-    pub fn insert(self: *Self, key: u64, symbol: msg.Symbol) bool {
-        var idx = hash(key);
-        
-        for (0..128) |_| {
-            const k = self.slots[idx].order_key;
-            if (k == ORDER_KEY_EMPTY or k == ORDER_KEY_TOMBSTONE) {
-                self.slots[idx] = .{ .order_key = key, .symbol = symbol };
-                self.count += 1;
-                return true;
-            }
-            idx = (idx + 1) & ORDER_SYMBOL_MAP_MASK;
-        }
-        return false;
-    }
-
-    pub fn find(self: *const Self, key: u64) ?msg.Symbol {
-        var idx = hash(key);
-        
-        for (0..128) |_| {
-            const slot = &self.slots[idx];
-            if (slot.order_key == ORDER_KEY_EMPTY) return null;
-            if (slot.order_key == key) return slot.symbol;
-            idx = (idx + 1) & ORDER_SYMBOL_MAP_MASK;
-        }
-        return null;
-    }
-
-    pub fn remove(self: *Self, key: u64) bool {
-        var idx = hash(key);
-        
-        for (0..128) |_| {
-            if (self.slots[idx].order_key == ORDER_KEY_EMPTY) return false;
-            if (self.slots[idx].order_key == key) {
-                self.slots[idx].order_key = ORDER_KEY_TOMBSTONE;
-                self.count -= 1;
-                self.tombstone_count += 1;
-                return true;
-            }
-            idx = (idx + 1) & ORDER_SYMBOL_MAP_MASK;
-        }
-        return false;
-    }
-};
-
-// ============================================================================
-// Matching Engine
-// ============================================================================
 
 pub const MatchingEngine = struct {
-    symbol_map: SymbolMap,
-    order_to_symbol: OrderSymbolMap,
-    books: [MAX_SYMBOLS]OrderBook = undefined,
+    books: [SYMBOL_MAP_SIZE]?OrderBook = [_]?OrderBook{null} ** SYMBOL_MAP_SIZE,
     num_books: usize = 0,
+
+    symbol_map: [SYMBOL_MAP_SIZE]SymbolSlot = undefined,
+    order_symbol_map: [ORDER_SYMBOL_MAP_SIZE]OrderSymbolSlot = undefined,
+
     pools: *MemoryPools,
+
+    total_orders: u64 = 0,
+    total_cancels: u64 = 0,
+    total_trades: u64 = 0,
 
     const Self = @This();
 
     pub fn init(pools: *MemoryPools) Self {
-        return .{
-            .symbol_map = SymbolMap.init(),
-            .order_to_symbol = OrderSymbolMap.init(),
-            .pools = pools,
-        };
+        var engine = Self{ .pools = pools };
+
+        for (&engine.symbol_map) |*slot| {
+            slot.active = false;
+        }
+        for (&engine.order_symbol_map) |*slot| {
+            slot.active = false;
+        }
+
+        return engine;
     }
 
-    /// Process an input message
     pub fn processMessage(
         self: *Self,
-        input: *const msg.InputMsg,
-        client_id: u32,
+        message: *const msg.InputMsg,
+        client_id: config.ClientId,
         output: *OutputBuffer,
     ) void {
-        switch (input.msg_type) {
-            .new_order => self.processNewOrder(&input.data.new_order, client_id, output),
-            .cancel => self.processCancel(&input.data.cancel, client_id, output),
-            .flush => self.processFlush(output),
+        switch (message.msg_type) {
+            .new_order => self.handleNewOrder(&message.data.new_order, client_id, output),
+            .cancel => self.handleCancel(&message.data.cancel, client_id, output),
+            .flush => self.handleFlush(output),
         }
     }
 
-    /// Process new order
-    pub fn processNewOrder(
+    fn handleNewOrder(
         self: *Self,
-        order_msg: *const msg.NewOrderMsg,
-        client_id: u32,
+        order: *const msg.NewOrderMsg,
+        client_id: config.ClientId,
         output: *OutputBuffer,
     ) void {
-        // Get or create order book
-        const book = self.getOrCreateBook(order_msg.symbol) orelse {
+        self.total_orders += 1;
+
+        const book = self.findOrCreateBook(order.symbol) orelse {
             output.add(msg.OutputMsg.makeReject(
-                order_msg.user_id, order_msg.user_order_id,
-                .unknown_symbol, client_id,
+                order.user_id,
+                order.user_order_id,
+                .unknown_symbol,
+                order.symbol,
+                client_id,
             ));
             return;
         };
-        
-        // Track order→symbol mapping for cancels
-        const key = (@as(u64, order_msg.user_id) << 32) | order_msg.user_order_id;
-        _ = self.order_to_symbol.insert(key, order_msg.symbol);
-        
-        // Process order
-        book.addOrder(order_msg, client_id, output);
+
+        // Track order → symbol mapping for cancel routing
+        const key = makeOrderKey(order.user_id, order.user_order_id);
+        self.trackOrderSymbol(key, order.symbol);
+
+        book.addOrder(order, client_id, output);
     }
 
-    /// Process cancel
-    pub fn processCancel(
+    fn handleCancel(
         self: *Self,
-        cancel_msg: *const msg.CancelMsg,
-        client_id: u32,
+        cancel: *const msg.CancelMsg,
+        client_id: config.ClientId,
         output: *OutputBuffer,
     ) void {
-        // Find symbol for this order
-        const key = (@as(u64, cancel_msg.user_id) << 32) | cancel_msg.user_order_id;
-        
-        // Try explicit symbol first, then lookup
-        var symbol = cancel_msg.symbol;
-        if (symbol[0] == 0) {
-            symbol = self.order_to_symbol.find(key) orelse {
-                output.add(msg.OutputMsg.makeReject(
-                    cancel_msg.user_id, cancel_msg.user_order_id,
-                    .order_not_found, client_id,
-                ));
-                return;
-            };
-        }
-        
-        // Get book
-        if (self.getBook(symbol)) |book| {
-            book.cancelOrder(
-                cancel_msg.user_id,
-                cancel_msg.user_order_id,
-                client_id,
-                output,
-            );
-            _ = self.order_to_symbol.remove(key);
+        self.total_cancels += 1;
+
+        const key = makeOrderKey(cancel.user_id, cancel.user_order_id);
+
+        // Look up symbol from order tracking
+        const symbol = self.lookupOrderSymbol(key) orelse cancel.symbol;
+
+        if (msg.symbolIsEmpty(&symbol)) {
+            // Symbol unknown - try all books
+            for (&self.books) |*maybe_book| {
+                if (maybe_book.*) |*book| {
+                    book.cancelOrder(cancel.user_id, cancel.user_order_id, client_id, output);
+                }
+            }
         } else {
-            output.add(msg.OutputMsg.makeReject(
-                cancel_msg.user_id, cancel_msg.user_order_id,
-                .unknown_symbol, client_id,
-            ));
+            // Route to specific book
+            if (self.findBook(symbol)) |book| {
+                book.cancelOrder(cancel.user_id, cancel.user_order_id, client_id, output);
+            } else {
+                output.add(msg.OutputMsg.makeReject(
+                    cancel.user_id,
+                    cancel.user_order_id,
+                    .order_not_found,
+                    symbol,
+                    client_id,
+                ));
+            }
+        }
+
+        // Remove from tracking
+        self.removeOrderSymbol(key);
+    }
+
+    fn handleFlush(self: *Self, output: *OutputBuffer) void {
+        for (&self.books) |*maybe_book| {
+            if (maybe_book.*) |*book| {
+                book.flush(output);
+            }
+        }
+
+        // Clear order tracking
+        for (&self.order_symbol_map) |*slot| {
+            slot.active = false;
         }
     }
 
-    /// Process flush (clear all books)
-    pub fn processFlush(self: *Self, output: *OutputBuffer) void {
-        _ = output;
-        // TODO: Implement iterative flush
-        self.order_to_symbol = OrderSymbolMap.init();
-        
-        for (self.books[0..self.num_books]) |*book| {
-            book.* = OrderBook.init(book.symbol, self.pools);
+    /// Cancel all orders for a specific client (on disconnect)
+    pub fn cancelClientOrders(self: *Self, client_id: config.ClientId, output: *OutputBuffer) usize {
+        var cancelled: usize = 0;
+
+        for (&self.books) |*maybe_book| {
+            if (maybe_book.*) |*book| {
+                cancelled += book.cancelClientOrders(client_id, output);
+            }
         }
+
+        return cancelled;
     }
 
-    /// Get existing book for symbol
-    fn getBook(self: *Self, symbol: msg.Symbol) ?*OrderBook {
-        if (self.symbol_map.find(symbol)) |idx| {
-            return &self.books[@intCast(idx)];
+    fn findOrCreateBook(self: *Self, symbol: msg.Symbol) ?*OrderBook {
+        // First try to find existing
+        if (self.findBook(symbol)) |book| {
+            return book;
         }
+
+        // Create new book
+        const idx = hashSymbol(symbol);
+        var probe: usize = 0;
+
+        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
+            const slot_idx = (idx + probe) & SYMBOL_MAP_MASK;
+
+            if (!self.symbol_map[slot_idx].active) {
+                // Found empty slot
+                if (self.books[slot_idx] == null) {
+                    self.books[slot_idx] = OrderBook.init(symbol, self.pools);
+                } else {
+                    self.books[slot_idx].?.reset(symbol);
+                }
+
+                self.symbol_map[slot_idx] = .{
+                    .symbol = symbol,
+                    .book_index = @intCast(slot_idx),
+                    .active = true,
+                };
+                self.num_books += 1;
+
+                return &self.books[slot_idx].?;
+            }
+        }
+
         return null;
     }
 
-    /// Get or create book for symbol
-    fn getOrCreateBook(self: *Self, symbol: msg.Symbol) ?*OrderBook {
-        // Check existing
-        if (self.symbol_map.find(symbol)) |idx| {
-            return &self.books[@intCast(idx)];
+    fn findBook(self: *Self, symbol: msg.Symbol) ?*OrderBook {
+        const idx = hashSymbol(symbol);
+        var probe: usize = 0;
+
+        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
+            const slot_idx = (idx + probe) & SYMBOL_MAP_MASK;
+            const slot = &self.symbol_map[slot_idx];
+
+            if (!slot.active) return null;
+
+            if (msg.symbolEqual(slot.symbol, symbol)) {
+                return &self.books[slot.book_index].?;
+            }
         }
-        
-        // Create new
-        if (self.num_books >= MAX_SYMBOLS) return null;
-        
-        const idx = self.num_books;
-        self.books[idx] = OrderBook.init(symbol, self.pools);
-        _ = self.symbol_map.insert(symbol, @intCast(idx));
-        self.num_books += 1;
-        
-        return &self.books[idx];
+
+        return null;
+    }
+
+    fn trackOrderSymbol(self: *Self, key: u64, symbol: msg.Symbol) void {
+        const idx = hashOrderKey(key);
+        var probe: usize = 0;
+
+        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
+            const slot_idx = (idx + probe) & ORDER_SYMBOL_MAP_MASK;
+
+            if (!self.order_symbol_map[slot_idx].active) {
+                self.order_symbol_map[slot_idx] = .{
+                    .key = key,
+                    .symbol = symbol,
+                    .active = true,
+                };
+                return;
+            }
+        }
+    }
+
+    fn lookupOrderSymbol(self: *Self, key: u64) ?msg.Symbol {
+        const idx = hashOrderKey(key);
+        var probe: usize = 0;
+
+        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
+            const slot_idx = (idx + probe) & ORDER_SYMBOL_MAP_MASK;
+            const slot = &self.order_symbol_map[slot_idx];
+
+            if (!slot.active) return null;
+            if (slot.key == key) return slot.symbol;
+        }
+
+        return null;
+    }
+
+    fn removeOrderSymbol(self: *Self, key: u64) void {
+        const idx = hashOrderKey(key);
+        var probe: usize = 0;
+
+        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
+            const slot_idx = (idx + probe) & ORDER_SYMBOL_MAP_MASK;
+            const slot = &self.order_symbol_map[slot_idx];
+
+            if (!slot.active) return;
+            if (slot.key == key) {
+                slot.active = false;
+                return;
+            }
+        }
+    }
+
+    fn hashSymbol(symbol: msg.Symbol) u32 {
+        var hash: u32 = 2166136261;
+        for (symbol) |byte| {
+            if (byte == 0) break;
+            hash ^= byte;
+            hash *%= 16777619;
+        }
+        return hash & SYMBOL_MAP_MASK;
+    }
+
+    fn hashOrderKey(key: u64) u32 {
+        const GOLDEN_RATIO: u64 = 0x9E3779B97F4A7C15;
+        var k = key;
+        k ^= k >> 33;
+        k *%= GOLDEN_RATIO;
+        k ^= k >> 29;
+        return @intCast(k & ORDER_SYMBOL_MAP_MASK);
+    }
+
+    fn makeOrderKey(user_id: u32, order_id: u32) u64 {
+        return (@as(u64, user_id) << 32) | order_id;
     }
 };
