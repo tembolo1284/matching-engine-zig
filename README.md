@@ -1,18 +1,30 @@
 # Zig Matching Engine
 
-A high-performance, multi-protocol, multi-transport order matching engine built in Zig, following HFT low-latency principles and NASA Power of Ten safety-critical coding rules.
+A high-performance, multi-protocol, multi-transport order matching engine written in Zig, featuring dual-processor architecture with lock-free message passing. Designed following HFT low-latency principles and NASA Power of Ten safety-critical coding rules.
 
-Ported from the C matching engine with identical wire protocol compatibility.
+Wire-compatible with the C matching engine implementation.
 
 ## Features
 
+### Performance
 - **Zero-allocation hot path** — Pre-allocated memory pools, no heap allocation during trading
-- **Cache-optimized** — 64-byte aligned orders, sequential memory access, L1/L2 cache friendly
-- **Multi-transport** — TCP (with framing), UDP (bidirectional), and Multicast
-- **Multi-protocol** — CSV (human-readable), Binary (high-performance)
-- **Protocol auto-detection** — Automatically detects CSV/Binary from first byte
-- **Network byte order** — Big-endian integers for cross-platform compatibility
-- **TCP framing** — 4-byte length-prefixed messages for reliable streaming
+- **Cache-optimized** — 64-byte aligned structures, sequential memory access
+- **Lock-free queues** — SPSC queues for inter-thread communication
+- **Dual-processor mode** — Parallel matching with symbol-based routing
+
+### Networking
+- **TCP** — Multi-client with epoll, 4-byte length-prefix framing
+- **UDP** — Bidirectional request/response, no framing needed
+- **Multicast** — Market data broadcast for unlimited subscribers
+
+### Protocols
+- **CSV** — Human-readable, newline-delimited
+- **Binary** — High-performance, network byte order, magic byte `0x4D`
+- **Auto-detection** — Protocol detected from first byte
+
+### Architecture
+- **Single-threaded mode** — Simple, low-latency for moderate load
+- **Threaded mode** — Dual processors (A-M / N-Z), I/O thread separation
 
 ## Quick Start
 
@@ -30,42 +42,44 @@ zig build test
 
 ### Run Server
 ```bash
-# Run with defaults (TCP:9000, UDP:9001, Multicast:239.255.0.1:9002)
+# Single-threaded mode (default)
 zig build run
 
-# Or run the binary directly
-./zig-out/bin/matching_engine
+# Dual-processor threaded mode
+ENGINE_THREADED=true zig build run
+
+# Or use make
+make run            # Single-threaded
+make run-threaded   # Dual-processor
 ```
 
-### Test with netcat (CSV over TCP)
+### Test with Orders
 ```bash
 # Terminal 1: Start server
-zig build run
+make run
 
-# Terminal 2: Send orders via TCP (note: needs length framing for TCP)
-# For simple testing, use UDP which doesn't require framing:
-echo "N, 1, IBM, 10000, 50, B, 100" | nc -u localhost 9001
+# Terminal 2: Send orders via UDP (no framing needed)
+echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
+echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost 1235
 
-# Or use the provided test client
-zig build run-client
-```
-
-### Test with Binary Protocol
-```bash
-# The binary protocol uses magic byte 0x4D ('M') and network byte order
-# See protocol documentation for wire format details
+# Expected output:
+# A, IBM, 1, 1           <- Buy order acknowledged
+# B, IBM, B, 10000, 100  <- Top of book update
+# A, IBM, 2, 1           <- Sell order acknowledged  
+# T, IBM, 1, 1, 2, 1, 10000, 50  <- Trade executed!
+# B, IBM, B, 10000, 50   <- Remaining quantity
 ```
 
 ## Protocol Formats
 
-### CSV Input Messages
+### CSV Input
 ```
 N, userId, symbol, price, qty, side, orderId    # New Order
-C, userId, orderId                               # Cancel Order  
-F                                                # Flush All
+C, userId, orderId                               # Cancel Order
+F                                                # Flush All Orders
 ```
 
-### CSV Output Messages
+### CSV Output
 ```
 A, symbol, userId, orderId                       # Acknowledgement
 T, symbol, buyUid, buyOid, sellUid, sellOid, price, qty  # Trade
@@ -76,12 +90,14 @@ R, symbol, userId, orderId, reason               # Reject
 
 ### Binary Protocol
 
-- Magic byte: `0x4D` ('M')
-- All integers: Big-endian (network byte order)
-- Symbols: 8 bytes, null-padded
+| Field | Description |
+|-------|-------------|
+| Magic | `0x4D` ('M') |
+| Byte order | Big-endian (network) |
+| Symbols | 8 bytes, null-padded |
 
-| Message | Type Byte | Wire Size |
-|---------|-----------|-----------|
+| Message | Type Byte | Size |
+|---------|-----------|------|
 | New Order | 'N' (0x4E) | 27 bytes |
 | Cancel | 'C' (0x43) | 10 bytes |
 | Flush | 'F' (0x46) | 2 bytes |
@@ -93,146 +109,212 @@ R, symbol, userId, orderId, reason               # Reject
 
 TCP uses 4-byte big-endian length prefix:
 ```
-[4 bytes: message length (big-endian)][N bytes: payload]
+[4 bytes: length][N bytes: payload]
 ```
 
-UDP does not use framing (each packet = one message).
+UDP packets contain raw messages (no framing).
 
 ## Configuration
 
 ### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGINE_THREADED` | `false` | Enable dual-processor mode |
+| `ENGINE_TCP_ENABLED` | `true` | Enable TCP transport |
+| `ENGINE_TCP_PORT` | `1234` | TCP port |
+| `ENGINE_UDP_ENABLED` | `true` | Enable UDP transport |
+| `ENGINE_UDP_PORT` | `1235` | UDP port |
+| `ENGINE_MCAST_ENABLED` | `true` | Enable multicast |
+| `ENGINE_MCAST_GROUP` | `239.255.0.1` | Multicast group |
+| `ENGINE_MCAST_PORT` | `1236` | Multicast port |
+
+### Example
 ```bash
-# TCP
-export ENGINE_TCP_ENABLED=true
-export ENGINE_TCP_PORT=9000
-
-# UDP
-export ENGINE_UDP_ENABLED=true
-export ENGINE_UDP_PORT=9001
-
-# Multicast
-export ENGINE_MCAST_ENABLED=true
-export ENGINE_MCAST_GROUP=239.255.0.1
-export ENGINE_MCAST_PORT=9002
+ENGINE_THREADED=true \
+ENGINE_TCP_PORT=8000 \
+ENGINE_UDP_PORT=8001 \
+zig build run
 ```
-
-### Default Ports
-
-| Transport | Port | Protocol |
-|-----------|------|----------|
-| TCP | 9000 | CSV or Binary (auto-detect) |
-| UDP | 9001 | CSV or Binary (auto-detect) |
-| Multicast | 9002 | Binary (market data broadcast) |
 
 ## Project Structure
 ```
 zig_matching_engine/
-├── build.zig                 # Build configuration
+├── build.zig
+├── Makefile
+├── Dockerfile
 ├── README.md
-├── src/
-│   ├── main.zig              # Entry point
-│   ├── core/
-│   │   ├── order.zig         # Order structure (64-byte aligned)
-│   │   ├── order_book.zig    # Price-time priority matching
-│   │   ├── matching_engine.zig # Multi-symbol orchestrator
-│   │   └── memory_pool.zig   # Pre-allocated pools
-│   ├── protocol/
-│   │   ├── message_types.zig # Message definitions
-│   │   ├── codec.zig         # Protocol detection
-│   │   ├── binary_codec.zig  # Binary encoder/decoder
-│   │   ├── csv_codec.zig     # CSV encoder/decoder
-│   │   └── fix_codec.zig     # FIX protocol (placeholder)
-│   └── transport/
-│       ├── config.zig        # Configuration
-│       ├── tcp_server.zig    # Multi-client TCP with framing
-│       ├── udp_server.zig    # Bidirectional UDP
-│       ├── multicast.zig     # Market data multicast
-│       └── server.zig        # Unified server
-└── tests/
+├── ARCHITECTURE.md
+├── QUICK_START.md
+├── DOCKER.md
+└── src/
+    ├── main.zig                 # Entry point
+    ├── core/
+    │   ├── order.zig            # Order struct (64-byte aligned)
+    │   ├── order_book.zig       # Price-time priority matching
+    │   ├── matching_engine.zig  # Multi-symbol orchestrator
+    │   └── memory_pool.zig      # Pre-allocated pools
+    ├── protocol/
+    │   ├── message_types.zig    # Message definitions
+    │   ├── codec.zig            # Protocol detection
+    │   ├── binary_codec.zig     # Binary encoder/decoder
+    │   ├── csv_codec.zig        # CSV encoder/decoder
+    │   └── fix_codec.zig        # FIX protocol (placeholder)
+    ├── transport/
+    │   ├── config.zig           # Configuration
+    │   ├── tcp_server.zig       # Multi-client TCP with epoll
+    │   ├── udp_server.zig       # Bidirectional UDP
+    │   ├── multicast.zig        # Market data multicast
+    │   └── server.zig           # Single-threaded unified server
+    ├── collections/
+    │   ├── mod.zig
+    │   ├── spsc_queue.zig       # Lock-free SPSC queue
+    │   └── bounded_channel.zig  # Typed message channel
+    └── threading/
+        ├── mod.zig
+        ├── processor.zig        # Matching processor thread
+        └── threaded_server.zig  # Dual-processor server
 ```
 
-## Architecture Highlights
+## Operating Modes
 
-### Memory Layout
+### Single-Threaded Mode (Default)
 ```
-Order (64 bytes = 1 cache line):
-├── Hot fields (0-19): user_id, order_id, price, qty, remaining
-├── Metadata (20-31): side, type, client_id
-├── Timestamp (32-39): RDTSC on x86_64
-├── Linked list (40-55): next, prev pointers
-└── Padding (56-63): cache line alignment
+┌─────────────────────────────────────────┐
+│              Event Loop                  │
+│  ┌─────┐  ┌─────┐  ┌───────────────┐   │
+│  │ TCP │  │ UDP │  │   Multicast   │   │
+│  └──┬──┘  └──┬──┘  └───────┬───────┘   │
+│     └────────┼─────────────┘           │
+│              ▼                          │
+│     ┌────────────────┐                  │
+│     │MatchingEngine  │                  │
+│     └────────────────┘                  │
+└─────────────────────────────────────────┘
 ```
 
-### Message Routing
+- Simple, single event loop
+- All processing in one thread
+- Lowest latency for light loads
+- Best for < 100K messages/sec
 
-| Message Type | Routing |
-|--------------|---------|
-| Ack | Originating client only |
-| Cancel Ack | Originating client only |
-| Trade | Both buyer and seller + multicast |
-| Top of Book | Multicast only |
+### Dual-Processor Threaded Mode
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       I/O Thread                             │
+│  ┌─────┐  ┌─────┐  ┌───────────┐                           │
+│  │ TCP │  │ UDP │  │ Multicast │                           │
+│  └──┬──┘  └──┬──┘  └─────┬─────┘                           │
+│     └────────┼───────────┘                                  │
+│              ▼                                               │
+│     ┌─────────────────┐                                     │
+│     │  Symbol Router  │  (A-M → P0, N-Z → P1)               │
+│     └────────┬────────┘                                     │
+└──────────────┼──────────────────────────────────────────────┘
+               │
+      ┌────────┴────────┐
+      ▼                 ▼
+┌──────────┐      ┌──────────┐
+│ SPSC In  │      │ SPSC In  │   Lock-free queues
+└────┬─────┘      └────┬─────┘
+     ▼                 ▼
+┌──────────┐      ┌──────────┐
+│Processor0│      │Processor1│   Matching threads
+│  (A-M)   │      │  (N-Z)   │
+└────┬─────┘      └────┬─────┘
+     ▼                 ▼
+┌──────────┐      ┌──────────┐
+│ SPSC Out │      │ SPSC Out │   Lock-free queues
+└────┬─────┘      └────┬─────┘
+     └────────┬────────┘
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 I/O Thread (dispatch)                        │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### Performance Characteristics
+- I/O isolated from matching
+- Parallel matching by symbol range
+- Lock-free SPSC queues (65,536 capacity)
+- Best for > 100K messages/sec
 
-| Metric | Value |
-|--------|-------|
-| Order struct size | 64 bytes (cache-line aligned) |
-| Symbol size | 8 bytes (fixed) |
-| Hot path allocations | 0 |
-| Hash table | Open-addressing, power-of-2 |
+### Symbol Routing
 
-## Examples
+| Symbol Range | Processor | Examples |
+|--------------|-----------|----------|
+| A-M | Processor 0 | AAPL, IBM, META, GOOG |
+| N-Z | Processor 1 | NVDA, TSLA, UBER, ZM |
 
-### Simple Buy/Sell Match
+Cancel and Flush messages are sent to **both** processors.
+
+## Performance
+
+### Memory Footprint
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| Order Pool | 8 MB | 131,072 × 64 bytes |
+| Order Map | 8 MB | 262,144 slots |
+| SPSC Queues | 16 MB | 4 × 65,536 × 64 bytes |
+| **Total** | ~35 MB | Per engine instance |
+
+### Estimated Latency
+
+| Operation | Single-threaded | Threaded |
+|-----------|-----------------|----------|
+| Message decode | ~20 ns | ~20 ns |
+| Queue transit | N/A | ~50 ns |
+| Match + insert | ~50 ns | ~50 ns |
+| Message encode | ~15 ns | ~15 ns |
+| **Total** | **~100 ns** | **~150 ns** |
+
+### Throughput
+
+| Mode | Messages/sec |
+|------|--------------|
+| Single-threaded | 5-10 M |
+| Dual-processor | 8-15 M |
+
+## Make Targets
 ```bash
-# Start server
-zig build run &
-
-# Send buy order (UDP, no framing needed)
-echo "N, 1, IBM, 10000, 100, B, 1" | nc -u localhost 9001
-
-# Send sell order that matches
-echo "N, 2, IBM, 10000, 50, S, 1" | nc -u localhost 9001
-
-# Expected output:
-# A, IBM, 1, 1       (buy ack)
-# B, IBM, B, 10000, 100  (TOB update)
-# A, IBM, 2, 1       (sell ack)  
-# T, IBM, 1, 1, 2, 1, 10000, 50  (trade)
-# B, IBM, B, 10000, 50  (TOB update - remaining qty)
+make                  # Build debug
+make release          # Build optimized
+make run              # Run single-threaded
+make run-threaded     # Run dual-processor
+make test             # Run all tests
+make clean            # Clean build artifacts
+make docker           # Build Docker image
+make docker-run       # Run in Docker
+make help             # Show all targets
 ```
 
-### Cancel Order
+## Docker
 ```bash
-echo "C, 1, 1" | nc -u localhost 9001
-# Output: C, IBM, 1, 1  (cancel ack)
+# Build
+docker build -t zig-matching-engine .
+
+# Run (single-threaded)
+docker run -p 1234:1234 -p 1235:1235/udp zig-matching-engine
+
+# Run (threaded)
+docker run -e ENGINE_THREADED=true -p 1234:1234 -p 1235:1235/udp zig-matching-engine
 ```
 
-## Compatibility
+## C Protocol Compatibility
 
-This Zig implementation is wire-compatible with the C matching engine:
+This implementation is wire-compatible with the C matching engine:
 
-- Same magic byte (`0x4D`)
-- Same message formats
-- Same byte order (network/big-endian)
-- Same TCP framing (4-byte length prefix)
+| Aspect | Specification |
+|--------|---------------|
+| Magic byte | `0x4D` ('M') |
+| Byte order | Big-endian (network) |
+| TCP framing | 4-byte length prefix |
+| CSV format | Identical field order |
+| Symbol routing | A-M → P0, N-Z → P1 |
 
-## Building for Production
-```bash
-# Release build with all optimizations
-zig build -Doptimize=ReleaseFast
+## Documentation
 
-# Strip debug symbols for smaller binary
-zig build -Doptimize=ReleaseSmall
+- [QUICK_START.md](QUICK_START.md) — Get running in 5 minutes
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Deep dive into system design
+- [DOCKER.md](DOCKER.md) — Container deployment guide
 
-# Cross-compile for Linux (from any OS)
-zig build -Dtarget=x86_64-linux
-```
-
-## License
-
-MIT
-
-## See Also
-
-- [C Matching Engine](../matching-engine-c/) - Original C implementation

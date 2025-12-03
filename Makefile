@@ -68,6 +68,22 @@ run-all:
 run-custom:
 	ENGINE_TCP_PORT=8000 ENGINE_UDP_PORT=8001 zig build run
 
+
+# -----------------------------------------------------------------------------
+# Threaded Mode
+# -----------------------------------------------------------------------------
+
+## Run in single-threaded mode (default)
+run-single:
+	ENGINE_THREADED=false zig build run
+
+## Run in dual-processor threaded mode
+run-threaded:
+	ENGINE_THREADED=true zig build run
+
+## Run threaded with release build
+run-threaded-release: release
+	ENGINE_THREADED=true ./zig-out/bin/matching_engine
 # -----------------------------------------------------------------------------
 # Test Targets
 # -----------------------------------------------------------------------------
@@ -293,7 +309,8 @@ help:
 	@echo "  make clean          Clean build artifacts"
 	@echo ""
 	@echo "Run:"
-	@echo "  make run            Build and run (debug)"
+	@echo "  make run            Build and run single-threaded (debug)"       
+	@echo "  make run-threaded   Build and run dual-processor threaded mode"       
 	@echo "  make run-release    Build and run (optimized)"
 	@echo "  make run-tcp        Run with TCP only"
 	@echo "  make run-udp        Run with UDP only"
