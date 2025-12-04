@@ -236,13 +236,13 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     std.log.info("║     Zig Matching Engine v{s}             ║", .{VERSION});
     std.log.info("╠════════════════════════════════════════════╣", .{});
     if (config.tcp_enabled) {
-        std.log.info("║  TCP:       {s}:{d:<5}                    ║", .{
+        std.log.info("║  TCP:       {s}:{d:<5}                  ║", .{
             config.tcp_addr,
             config.tcp_port,
         });
     }
     if (config.udp_enabled) {
-        std.log.info("║  UDP:       {s}:{d:<5}                    ║", .{
+        std.log.info("║  UDP:       {s}:{d:<5}                  ║", .{
             config.udp_addr,
             config.udp_port,
         });
