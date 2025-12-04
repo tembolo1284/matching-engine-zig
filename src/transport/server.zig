@@ -24,22 +24,27 @@ pub const Server = struct {
     multicast: MulticastPublisher,
     engine: *MatchingEngine,
     output: OutputBuffer,
-    send_buf: [4096]u8 = undefined,
+    send_buf: [4096]u8,
     cfg: config.Config,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, engine: *MatchingEngine, cfg: config.Config) Self {
-        return .{
-            .tcp = TcpServer.init(allocator),
-            .udp = UdpServer.init(),
-            .multicast = MulticastPublisher.init(),
-            .engine = engine,
-            .output = OutputBuffer.init(),
-            .cfg = cfg,
-            .allocator = allocator,
-        };
+    /// Initialize server in-place. Required due to large embedded structs.
+    pub fn initInPlace(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        engine: *MatchingEngine,
+        cfg: config.Config,
+    ) void {
+        self.tcp = TcpServer.init(allocator);
+        self.udp = UdpServer.init();
+        self.multicast = MulticastPublisher.init();
+        self.engine = engine;
+        self.output = OutputBuffer.init();
+        self.send_buf = undefined;
+        self.cfg = cfg;
+        self.allocator = allocator;
     }
 
     pub fn deinit(self: *Self) void {

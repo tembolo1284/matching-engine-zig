@@ -189,8 +189,10 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
         server.deinit();
         allocator.destroy(server);
     }
-    server.* = Server.init(allocator, engine, config);
+    std.debug.print("DEBUG 6: Server created, calling initInPlace\n", .{});
+    server.initInPlace(allocator, engine, config);
 
+    std.debug.print("DEBUG 7: Starting server\n", .{});
     try server.start();
 
     printStartupBanner(config, false);
@@ -223,6 +225,8 @@ fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
     }
 
     std.log.info("Shutting down...", .{});
+
+    printThreadedStats(server);
     server.stop();
 }
 
@@ -231,28 +235,26 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     std.log.info("╔════════════════════════════════════════════╗", .{});
     std.log.info("║     Zig Matching Engine v{s}             ║", .{VERSION});
     std.log.info("╠════════════════════════════════════════════╣", .{});
-
     if (config.tcp_enabled) {
         std.log.info("║  TCP:       {s}:{d:<5}                    ║", .{
             config.tcp_addr,
             config.tcp_port,
         });
     }
-
     if (config.udp_enabled) {
         std.log.info("║  UDP:       {s}:{d:<5}                    ║", .{
             config.udp_addr,
             config.udp_port,
         });
     }
-
     if (config.mcast_enabled) {
         std.log.info("║  Multicast: {s}:{d:<5}              ║", .{
             config.mcast_group,
             config.mcast_port,
         });
     }
-
+    const protocol_str = if (config.use_binary_protocol) "Binary" else "CSV";
+    std.log.info("║  Protocol:  {s:<30} ║", .{protocol_str});
     if (threaded) {
         std.log.info("║  Mode:      Dual-Processor                 ║", .{});
         std.log.info("║  Proc 0:    Symbols A-M                    ║", .{});
@@ -260,10 +262,38 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     } else {
         std.log.info("║  Mode:      Single-Threaded                ║", .{});
     }
-
     std.log.info("╚════════════════════════════════════════════╝", .{});
     std.log.info("", .{});
     std.log.info("Press Ctrl+C to shutdown gracefully", .{});
+    std.log.info("", .{});
+}
+
+fn printThreadedStats(server: *ThreadedServer) void {
+    const stats = server.getStats();
+    
+    std.log.info("", .{});
+    std.log.info("═══════════════ Session Statistics ═══════════════", .{});
+    std.log.info("  Messages routed:    Proc0={d}, Proc1={d}", .{
+        stats.messages_routed[0],
+        stats.messages_routed[1],
+    });
+    std.log.info("  Total processed:    {d}", .{stats.totalProcessed()});
+    std.log.info("  Outputs dispatched: {d}", .{stats.outputs_dispatched});
+    std.log.info("  Messages dropped:   {d}", .{stats.messages_dropped});
+    std.log.info("  Disconnect cancels: {d}", .{stats.disconnect_cancels});
+    
+    for (0..2) |i| {
+        const ps = stats.processor_stats[i];
+        std.log.info("  Processor {d}:", .{i});
+        std.log.info("    Messages:    {d}", .{ps.messages_processed});
+        std.log.info("    Outputs:     {d}", .{ps.outputs_generated});
+        std.log.info("    Backpressure:{d}", .{ps.output_backpressure_count});
+        if (ps.messages_processed > 0) {
+            const avg_ns = @divTrunc(ps.total_processing_time_ns, @as(i64, @intCast(ps.messages_processed)));
+            std.log.info("    Avg latency: {d}ns", .{avg_ns});
+        }
+    }
+    std.log.info("═══════════════════════════════════════════════════", .{});
     std.log.info("", .{});
 }
 

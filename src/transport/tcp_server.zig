@@ -50,7 +50,7 @@ pub const ClientStats = tcp_client.ClientStats;
 // ============================================================================
 
 /// Maximum concurrent clients.
-pub const MAX_CLIENTS: u32 = 1024;
+pub const MAX_CLIENTS: u32 = 64;
 
 /// Maximum epoll events per poll cycle.
 const MAX_EVENTS: u32 = 64;

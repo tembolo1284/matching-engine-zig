@@ -91,7 +91,7 @@ pub fn decodeInput(data: []const u8) codec.CodecError!codec.DecodeResult {
 
 fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
     // N, userId, symbol, price, qty, side, userOrderId
-    if (fields.len < 7) return codec.CodecError.InvalidField;
+    if (fields.len < 7) return codec.CodecError.IncompleteMessage;
 
     const user_id = codec.parseU32(codec.trim(fields[1])) orelse return codec.CodecError.InvalidField;
     const symbol_str = codec.trim(fields[2]);
@@ -120,7 +120,7 @@ fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
 
 fn parseCancel(fields: [][]const u8) codec.CodecError!msg.InputMsg {
     // C, userId, userOrderId [, symbol]
-    if (fields.len < 3) return codec.CodecError.InvalidField;
+    if (fields.len < 3) return codec.CodecError.IncompleteMessage;
 
     const user_id = codec.parseU32(codec.trim(fields[1])) orelse return codec.CodecError.InvalidField;
     const order_id = codec.parseU32(codec.trim(fields[2])) orelse return codec.CodecError.InvalidField;

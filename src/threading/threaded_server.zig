@@ -56,55 +56,65 @@ pub const ThreadedServer = struct {
 
     processors: [NUM_PROCESSORS]?proc.Processor,
 
-    send_buf: [4096]u8 = undefined,
+    send_buf: [4096]u8,
 
     cfg: config.Config,
     allocator: std.mem.Allocator,
 
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    running: std.atomic.Value(bool),
 
     messages_routed: [NUM_PROCESSORS]std.atomic.Value(u64),
-    outputs_dispatched: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    messages_dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    disconnect_cancels: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    outputs_dispatched: std.atomic.Value(u64),
+    messages_dropped: std.atomic.Value(u64),
+    disconnect_cancels: std.atomic.Value(u64),
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Self {
-        var input_queues: [NUM_PROCESSORS]*proc.InputQueue = undefined;
-        var output_queues: [NUM_PROCESSORS]*proc.OutputQueue = undefined;
+    /// Heap-allocate and initialize a ThreadedServer.
+    /// Returns pointer to avoid stack overflow from large embedded structs.
+    pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !*Self {
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
 
+        // Initialize queues
         for (0..NUM_PROCESSORS) |i| {
-            input_queues[i] = try allocator.create(proc.InputQueue);
-            errdefer {
-                for (0..i) |j| allocator.destroy(input_queues[j]);
+            self.input_queues[i] = try allocator.create(proc.InputQueue);
+            self.input_queues[i].* = proc.InputQueue.init();
+        }
+        errdefer {
+            for (0..NUM_PROCESSORS) |i| {
+                allocator.destroy(self.input_queues[i]);
             }
-            input_queues[i].* = proc.InputQueue.init();
         }
 
         for (0..NUM_PROCESSORS) |i| {
-            output_queues[i] = try allocator.create(proc.OutputQueue);
-            errdefer {
-                for (0..i) |j| allocator.destroy(output_queues[j]);
-                for (0..NUM_PROCESSORS) |j| allocator.destroy(input_queues[j]);
+            self.output_queues[i] = try allocator.create(proc.OutputQueue);
+            self.output_queues[i].* = proc.OutputQueue.init();
+        }
+        errdefer {
+            for (0..NUM_PROCESSORS) |i| {
+                allocator.destroy(self.output_queues[i]);
             }
-            output_queues[i].* = proc.OutputQueue.init();
         }
 
-        return .{
-            .tcp = TcpServer.init(allocator),
-            .udp = UdpServer.init(),
-            .multicast = MulticastPublisher.init(),
-            .input_queues = input_queues,
-            .output_queues = output_queues,
-            .processors = .{ null, null },
-            .cfg = cfg,
-            .allocator = allocator,
-            .messages_routed = .{
-                std.atomic.Value(u64).init(0),
-                std.atomic.Value(u64).init(0),
-            },
+        // Initialize embedded structs in-place
+        self.tcp = TcpServer.init(allocator);
+        self.udp = UdpServer.init();
+        self.multicast = MulticastPublisher.init();
+        self.processors = .{ null, null };
+        self.send_buf = undefined;
+        self.cfg = cfg;
+        self.allocator = allocator;
+        self.running = std.atomic.Value(bool).init(false);
+        self.messages_routed = .{
+            std.atomic.Value(u64).init(0),
+            std.atomic.Value(u64).init(0),
         };
+        self.outputs_dispatched = std.atomic.Value(u64).init(0);
+        self.messages_dropped = std.atomic.Value(u64).init(0);
+        self.disconnect_cancels = std.atomic.Value(u64).init(0);
+
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
@@ -117,6 +127,8 @@ pub const ThreadedServer = struct {
             self.allocator.destroy(self.input_queues[i]);
             self.allocator.destroy(self.output_queues[i]);
         }
+
+        self.allocator.destroy(self);
     }
 
     pub fn start(self: *Self) !void {
