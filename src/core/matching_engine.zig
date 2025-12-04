@@ -175,7 +175,7 @@ pub const MatchingEngine = struct {
         switch (message.msg_type) {
             .new_order => self.handleNewOrder(&message.data.new_order, client_id, output),
             .cancel => self.handleCancel(&message.data.cancel, client_id, output),
-            .flush => self.handleFlush(output),
+            .flush => self.handleFlush(output, client_id),
         }
 
         std.debug.assert(self.isValid());
@@ -255,10 +255,10 @@ pub const MatchingEngine = struct {
         self.removeOrderSymbol(key);
     }
 
-    fn handleFlush(self: *Self, output: *OutputBuffer) void {
+    fn handleFlush(self: *Self, output: *OutputBuffer, client_id: u32) void {
         for (self.books) |maybe_book| {
             if (maybe_book) |book| {
-                book.flush(output);
+                book.flush(output, client_id);
             }
         }
 

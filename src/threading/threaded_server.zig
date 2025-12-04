@@ -305,6 +305,10 @@ pub const ThreadedServer = struct {
                 }
             },
             .top_of_book => {
+                if (out_msg.client_id != 0) {
+                    self.sendToClient(out_msg.client_id, data);
+                }
+
                 if (self.cfg.mcast_enabled) {
                     _ = self.multicast.publish(out_msg);
                 }

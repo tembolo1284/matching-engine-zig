@@ -635,7 +635,7 @@ test "OutputMsg factories" {
     const reject = OutputMsg.makeReject(1, 100, .invalid_price, makeSymbol("IBM"), 42);
     try std.testing.expect(reject.isError());
 
-    const tob = OutputMsg.makeTopOfBook(makeSymbol("IBM"), .buy, 100, 500);
+    const tob = OutputMsg.makeTopOfBook(makeSymbol("IBM"), .buy, 100, 500, 0);
     try std.testing.expect(tob.isBroadcast());
 }
 
