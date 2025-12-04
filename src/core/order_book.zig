@@ -617,6 +617,8 @@ pub const OrderBook = struct {
 
         self.matchOrder(order, client_id, output);
 
+        self.checkTopOfBookChange(output, client_id);
+
         if (!order.isFilled()) {
             const inserted = self.insertOrder(order);
             if (!inserted) {
@@ -632,7 +634,6 @@ pub const OrderBook = struct {
                 self.pools.order_pool.release(order);
                 return;
             }
-            self.checkTopOfBookChange(output);
         } else {
             self.pools.order_pool.release(order);
         }
@@ -681,7 +682,7 @@ pub const OrderBook = struct {
             ));
 
             self.cleanupEmptyLevels(loc.side);
-            self.checkTopOfBookChange(output);
+            self.checkTopOfBookChange(output, client_id);
         } else {
             self.total_rejects += 1;
             _ = output.add(msg.OutputMsg.makeReject(
@@ -708,7 +709,7 @@ pub const OrderBook = struct {
         if (cancelled > 0) {
             self.cleanupEmptyLevels(.buy);
             self.cleanupEmptyLevels(.sell);
-            self.checkTopOfBookChange(output);
+            self.checkTopOfBookChange(output, client_id);
         }
 
         std.debug.assert(self.isValid());
@@ -818,6 +819,7 @@ pub const OrderBook = struct {
                 ));
 
                 if (rest_order.isFilled()) {
+                    best_level.reduceQuantity(fill_qty);
                     best_level.removeOrder(rest_order);
 
                     const key = OrderMap.makeKey(rest_order.user_id, rest_order.user_order_id);
@@ -854,8 +856,8 @@ pub const OrderBook = struct {
 
         self.order_map.initInPlace();
 
-        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0));
-        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0));
+        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
+        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
 
         self.prev_best_bid_price = 0;
         self.prev_best_bid_qty = 0;
@@ -1037,19 +1039,23 @@ pub const OrderBook = struct {
     // Top of Book
     // ========================================================================
 
-    fn checkTopOfBookChange(self: *Self, output: *OutputBuffer) void {
+    fn checkTopOfBookChange(self: *Self, output: *OutputBuffer, client_id: u32) void {
         if (self.getBestLevel(.buy)) |bid| {
             if (bid.price != self.prev_best_bid_price or
                 bid.total_quantity != self.prev_best_bid_qty)
             {
                 _ = output.add(msg.OutputMsg.makeTopOfBook(
-                    self.symbol, .buy, bid.price, bid.total_quantity,
+                    self.symbol, .buy, bid.price, bid.total_quantity, client_id,
+                ));
+                _ = output.add(msg.OutputMsg.makeTopOfBook(
+                    self.symbol, .buy, bid.price, bid.total_quantity, 0, 
                 ));
                 self.prev_best_bid_price = bid.price;
                 self.prev_best_bid_qty = bid.total_quantity;
             }
         } else if (self.prev_best_bid_price != 0) {
-            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0));
+            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, client_id));
+            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
             self.prev_best_bid_price = 0;
             self.prev_best_bid_qty = 0;
         }
@@ -1059,13 +1065,16 @@ pub const OrderBook = struct {
                 ask.total_quantity != self.prev_best_ask_qty)
             {
                 _ = output.add(msg.OutputMsg.makeTopOfBook(
-                    self.symbol, .sell, ask.price, ask.total_quantity,
+                    self.symbol, .sell, ask.price, ask.total_quantity, client_id,
                 ));
-                self.prev_best_ask_price = ask.price;
+                _ = output.add(msg.OutputMsg.makeTopOfBook(
+                    self.symbol, .sell, ask.price, ask.total_quantity, 0,
+            ));                self.prev_best_ask_price = ask.price;
                 self.prev_best_ask_qty = ask.total_quantity;
             }
         } else if (self.prev_best_ask_price != 0) {
-            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0));
+            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, client_id));
+            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
             self.prev_best_ask_price = 0;
             self.prev_best_ask_qty = 0;
         }

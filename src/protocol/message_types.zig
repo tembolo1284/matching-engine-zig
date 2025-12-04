@@ -472,10 +472,10 @@ pub const OutputMsg = struct {
         };
     }
 
-    pub fn makeTopOfBook(symbol: Symbol, side: Side, price: u32, qty: u32) Self {
+    pub fn makeTopOfBook(symbol: Symbol, side: Side, price: u32, qty: u32, client_id: u32) Self {
         return .{
             .msg_type = .top_of_book,
-            .client_id = 0, // Always broadcast
+            .client_id = client_id,
             .symbol = symbol,
             .data = .{ .top_of_book = .{
                 .side = side,
