@@ -158,7 +158,7 @@ pub const Codec = struct {
         return switch (proto) {
             .binary => @import("binary_codec.zig").decode(data),
             .csv => @import("csv_codec.zig").decodeInput(data),
-            .fix => @import("fix_codec.zig").decodeInput(data),
+            .fix => CodecError.UnknownMessageType, // FIX not implemented
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -169,7 +169,7 @@ pub const Codec = struct {
         return switch (proto) {
             .binary => @import("binary_codec.zig").decodeOutput(data),
             .csv => @import("csv_codec.zig").decodeOutput(data),
-            .fix => @import("fix_codec.zig").decodeOutput(data),
+            .fix => CodecError.UnknownMessageType, // FIX not implemented
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -179,7 +179,7 @@ pub const Codec = struct {
         return switch (self.protocol) {
             .binary => @import("binary_codec.zig").encode(message, buf),
             .csv => @import("csv_codec.zig").encodeInput(message, buf),
-            .fix => @import("fix_codec.zig").encodeInput(message, buf),
+            .fix => CodecError.UnknownMessageType, // FIX not implemented
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -189,7 +189,7 @@ pub const Codec = struct {
         return switch (self.protocol) {
             .binary => @import("binary_codec.zig").encodeOutput(message, buf),
             .csv => @import("csv_codec.zig").encodeOutput(message, buf),
-            .fix => @import("fix_codec.zig").encodeOutput(message, buf),
+            .fix => CodecError.UnknownMessageType, // FIX not implemented
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -211,20 +211,14 @@ pub fn parseU32(str: []const u8) ?u32 {
     if (str.len == 0) return null;
     if (str.len > MAX_U32_DIGITS) return null;
 
-    var result: u32 = 0;
-
+    var result: u64 = 0; // Use u64 to detect overflow
     for (str) |c| {
         if (c < '0' or c > '9') return null;
-
-        // Check for overflow before multiplication
-        if (result > (std.math.maxInt(u32) - (c - '0')) / 10) {
-            return null;
-        }
-
         result = result * 10 + (c - '0');
+        if (result > std.math.maxInt(u32)) return null;
     }
 
-    return result;
+    return @intCast(result);
 }
 
 /// Parse u64 from decimal string.
@@ -233,16 +227,13 @@ pub fn parseU64(str: []const u8) ?u64 {
     if (str.len > 20) return null;
 
     var result: u64 = 0;
-
     for (str) |c| {
         if (c < '0' or c > '9') return null;
-
-        // Check for overflow
-        const digit = c - '0';
+        // Check for overflow before multiplication
+        const digit: u64 = c - '0';
         if (result > (std.math.maxInt(u64) - digit) / 10) {
             return null;
         }
-
         result = result * 10 + digit;
     }
 
@@ -282,14 +273,12 @@ pub fn writeU32(buf: []u8, value: u32) usize {
 /// Returns bytes written.
 pub fn writeSymbol(buf: []u8, symbol: *const msg.Symbol) usize {
     var len: usize = 0;
-
     for (symbol) |c| {
         if (c == 0) break;
         if (len >= buf.len) break;
         buf[len] = c;
         len += 1;
     }
-
     return len;
 }
 

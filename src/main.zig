@@ -171,7 +171,7 @@ fn printVersion() void {
 fn validateConfig(config: *const cfg.Config) !void {
     // Validate configuration
     config.validate() catch |err| {
-        std.log.err("Configuration error: {}", .{err});
+        std.log.err("Configuration error: {any}", .{err});
         return err;
     };
 
@@ -186,9 +186,6 @@ fn validateConfig(config: *const cfg.Config) !void {
 }
 
 fn validateSystem() !void {
-    // Check available memory (basic sanity check)
-    // MemoryPools needs ~8MB for order pool
-
     // Check we're on Linux (required for epoll)
     if (builtin.os.tag != .linux) {
         std.log.warn("This engine is optimized for Linux. Performance may vary on {s}.", .{
@@ -210,15 +207,18 @@ fn validateSystem() !void {
 fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
     std.log.info("Starting in SINGLE-THREADED mode", .{});
 
-    // Initialize memory pools
+    // Initialize memory pools (heap allocated internally)
     var pools = try MemoryPools.init(allocator);
     defer pools.deinit();
 
-    // Initialize matching engine
-    var engine = MatchingEngine.init(&pools);
+    // CRITICAL: Heap-allocate matching engine (~7.5GB structure!)
+    // Cannot be on stack - would cause stack overflow
+    const engine = try allocator.create(MatchingEngine);
+    defer allocator.destroy(engine);
+    engine.* = MatchingEngine.init(&pools);
 
-    // Initialize and start server
-    var server = Server.init(allocator, &engine, config);
+    // Initialize and start server (engine is already a pointer)
+    var server = Server.init(allocator, engine, config);
     defer server.deinit();
 
     try server.start();
@@ -228,7 +228,7 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
     // Main loop with shutdown check
     while (!shutdown_requested.load(.acquire)) {
         server.pollOnce(100) catch |err| {
-            std.log.err("Server error: {}", .{err});
+            std.log.err("Server error: {any}", .{err});
             if (err == error.NotStarted) break;
         };
     }
@@ -240,8 +240,8 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
 fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
     std.log.info("Starting in THREADED mode (dual-processor)", .{});
 
-    // Initialize threaded server
-    var server = ThreadedServer.init(allocator, config);
+    // Initialize threaded server (now returns error union)
+    var server = try ThreadedServer.init(allocator, config);
     defer server.deinit();
 
     try server.start();
@@ -251,7 +251,7 @@ fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
     // Main loop with shutdown check
     while (!shutdown_requested.load(.acquire)) {
         server.pollOnce(100) catch |err| {
-            std.log.err("Server error: {}", .{err});
+            std.log.err("Server error: {any}", .{err});
         };
     }
 

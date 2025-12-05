@@ -759,7 +759,7 @@ pub const OrderBook = struct {
                 _ = output.add(msg.OutputMsg.makeReject(
                     order.user_id,
                     order.user_order_id,
-                    .book_full,
+                    .pool_exhausted,
                     self.symbol,
                     client_id,
                 ));

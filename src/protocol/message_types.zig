@@ -162,6 +162,8 @@ pub const RejectReason = enum(u8) {
     unauthorized = 7,
     /// System overloaded.
     throttled = 8,
+    /// Order book full (too many price levels).
+    book_full = 9,
 
     /// Get human-readable description.
     pub fn description(self: RejectReason) []const u8 {
@@ -174,6 +176,7 @@ pub const RejectReason = enum(u8) {
             .pool_exhausted => "Order pool exhausted",
             .unauthorized => "Unauthorized",
             .throttled => "Rate limit exceeded",
+            .book_full => "Order book full",
         };
     }
 };
@@ -549,6 +552,7 @@ test "Symbol operations" {
     try std.testing.expect(symbolEqual(&sym1, &sym2));
     try std.testing.expect(!symbolEqual(&sym1, &sym3));
     try std.testing.expectEqualStrings("AAPL", symbolSlice(&sym1));
+
     try std.testing.expect(!symbolIsEmpty(&sym1));
     try std.testing.expect(symbolIsEmpty(&EMPTY_SYMBOL));
 }
@@ -633,6 +637,11 @@ test "OutputMsg factories" {
 
     const tob = OutputMsg.makeTopOfBook(makeSymbol("IBM"), .buy, 100, 500);
     try std.testing.expect(tob.isBroadcast());
+}
+
+test "RejectReason descriptions" {
+    try std.testing.expectEqualStrings("Order book full", RejectReason.book_full.description());
+    try std.testing.expectEqualStrings("Order pool exhausted", RejectReason.pool_exhausted.description());
 }
 
 test "Struct sizes" {
