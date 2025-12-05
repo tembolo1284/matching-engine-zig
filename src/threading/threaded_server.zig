@@ -47,29 +47,22 @@ pub const ServerStats = struct {
 // ============================================================================
 
 pub const ThreadedServer = struct {
-    // === Network I/O ===
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
 
-    // === Channels (heap-allocated via pointers) ===
     input_queues: [NUM_PROCESSORS]*proc.InputQueue,
     output_queues: [NUM_PROCESSORS]*proc.OutputQueue,
 
-    // === Processor Threads ===
     processors: [NUM_PROCESSORS]?proc.Processor,
 
-    // === Buffers ===
     send_buf: [4096]u8 = undefined,
 
-    // === Configuration ===
     cfg: config.Config,
     allocator: std.mem.Allocator,
 
-    // === Control ===
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    // === Statistics ===
     messages_routed: [NUM_PROCESSORS]std.atomic.Value(u64),
     outputs_dispatched: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     messages_dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -77,12 +70,7 @@ pub const ThreadedServer = struct {
 
     const Self = @This();
 
-    // ========================================================================
-    // Lifecycle
-    // ========================================================================
-
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Self {
-        // Heap allocate all queues
         var input_queues: [NUM_PROCESSORS]*proc.InputQueue = undefined;
         var output_queues: [NUM_PROCESSORS]*proc.OutputQueue = undefined;
 
@@ -130,10 +118,6 @@ pub const ThreadedServer = struct {
             self.allocator.destroy(self.output_queues[i]);
         }
     }
-
-    // ========================================================================
-    // Server Control
-    // ========================================================================
 
     pub fn start(self: *Self) !void {
         std.debug.assert(!self.running.load(.acquire));
@@ -203,10 +187,6 @@ pub const ThreadedServer = struct {
         return self.running.load(.acquire);
     }
 
-    // ========================================================================
-    // Main Event Loop
-    // ========================================================================
-
     pub fn run(self: *Self) !void {
         std.log.info("Threaded server running...", .{});
 
@@ -231,10 +211,6 @@ pub const ThreadedServer = struct {
 
         self.drainOutputQueues();
     }
-
-    // ========================================================================
-    // Message Routing
-    // ========================================================================
 
     fn routeMessage(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
         std.debug.assert(self.running.load(.acquire));
@@ -283,10 +259,6 @@ pub const ThreadedServer = struct {
             }
         }
     }
-
-    // ========================================================================
-    // Output Dispatch
-    // ========================================================================
 
     fn drainOutputQueues(self: *Self) void {
         for (self.output_queues) |queue| {
@@ -338,10 +310,6 @@ pub const ThreadedServer = struct {
         }
     }
 
-    // ========================================================================
-    // Client Disconnect Handling
-    // ========================================================================
-
     fn handleClientDisconnect(self: *Self, client_id: config.ClientId) void {
         std.debug.assert(client_id != 0);
 
@@ -362,10 +330,6 @@ pub const ThreadedServer = struct {
         _ = self.disconnect_cancels.fetchAdd(1, .monotonic);
     }
 
-    // ========================================================================
-    // Callbacks
-    // ========================================================================
-
     fn onTcpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         std.debug.assert(self.running.load(.acquire));
@@ -383,10 +347,6 @@ pub const ThreadedServer = struct {
         std.debug.assert(self.running.load(.acquire));
         self.routeMessage(message, client_id);
     }
-
-    // ========================================================================
-    // Statistics
-    // ========================================================================
 
     pub fn getStats(self: *const Self) ServerStats {
         var stats = ServerStats{

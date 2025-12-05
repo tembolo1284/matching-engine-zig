@@ -101,7 +101,7 @@ pub const Config = struct {
     // === TCP Settings ===
     tcp_enabled: bool = true,
     tcp_addr: []const u8 = "0.0.0.0",
-    tcp_port: u16 = 9000,
+    tcp_port: u16 = 1234,
     tcp_max_clients: u32 = 1024,
     tcp_recv_buffer_size: u32 = 65536,
     tcp_send_buffer_size: u32 = 65536,
@@ -110,7 +110,7 @@ pub const Config = struct {
     // === UDP Settings ===
     udp_enabled: bool = true,
     udp_addr: []const u8 = "0.0.0.0",
-    udp_port: u16 = 9001,
+    udp_port: u16 = 1235,
     udp_recv_buffer_size: u32 = 1024 * 1024, // 1MB for burst handling
     udp_send_buffer_size: u32 = 1024 * 1024,
     udp_max_clients: u32 = 4096,
@@ -118,7 +118,7 @@ pub const Config = struct {
     // === Multicast Settings ===
     mcast_enabled: bool = true,
     mcast_group: []const u8 = "239.255.0.1",
-    mcast_port: u16 = 9002,
+    mcast_port: u16 = 1236,
     mcast_interface: []const u8 = "0.0.0.0",
     mcast_ttl: u8 = 1,
     mcast_loopback: bool = true, // Enable for local testing
@@ -200,7 +200,11 @@ pub const Config = struct {
         std.log.info("Configuration:", .{});
         std.log.info("  TCP: {} (port {})", .{ self.tcp_enabled, self.tcp_port });
         std.log.info("  UDP: {} (port {})", .{ self.udp_enabled, self.udp_port });
-        std.log.info("  Multicast: {} ({s}:{})", .{ self.mcast_enabled, self.mcast_group, self.mcast_port });
+        std.log.info("  Multicast: {} ({s}:{})", .{
+            self.mcast_enabled,
+            self.mcast_group,
+            self.mcast_port,
+        });
     }
 };
 
@@ -248,19 +252,16 @@ fn parseFirstOctet(addr: []const u8) !u8 {
 // ============================================================================
 
 test "ClientId utilities" {
-    // TCP client
     const tcp_id: ClientId = 42;
     try std.testing.expect(isTcpClient(tcp_id));
     try std.testing.expect(!isUdpClient(tcp_id));
     try std.testing.expect(isValidClient(tcp_id));
 
-    // UDP client
     const udp_id: ClientId = CLIENT_ID_UDP_BASE + 100;
     try std.testing.expect(!isTcpClient(udp_id));
     try std.testing.expect(isUdpClient(udp_id));
     try std.testing.expect(isValidClient(udp_id));
 
-    // None
     try std.testing.expect(!isValidClient(CLIENT_ID_NONE));
 }
 
@@ -278,11 +279,10 @@ test "Config validation" {
     var cfg = Config{};
     try cfg.validate();
 
-    // Invalid multicast group
-    cfg.mcast_group = "192.168.1.1"; // Not multicast range
+    cfg.mcast_group = "192.168.1.1";
     try std.testing.expectError(error.InvalidMcastGroup, cfg.validate());
 
-    // Valid multicast group
     cfg.mcast_group = "239.255.0.1";
     try cfg.validate();
 }
+
