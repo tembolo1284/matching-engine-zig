@@ -37,8 +37,8 @@
 //! ```
 
 const std = @import("std");
-const SpscQueue = @import("spsc_queue.zig").SpscQueue;
-const QueueStats = @import("spsc_queue.zig").QueueStats;
+const SpscQueue = @import("../collections/spsc_queue.zig").SpscQueue;
+const QueueStats = @import("../collections/spsc_queue.zig").QueueStats;
 
 // ============================================================================
 // Configuration

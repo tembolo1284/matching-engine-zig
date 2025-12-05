@@ -8,10 +8,10 @@
 //!
 //! Usage:
 //! ```zig
-//! var pub = MulticastPublisher.init();
-//! try pub.start("239.255.0.1", 9002, 1);
-//! _ = pub.publish(&trade_msg);
-//! pub.stop();
+//! var publisher = MulticastPublisher.init();
+//! try publisher.start("239.255.0.1", 1236, 1);
+//! _ = publisher.publish(&trade_msg);
+//! publisher.stop();
 //! ```
 
 const std = @import("std");
@@ -28,6 +28,11 @@ const net_utils = @import("net_utils.zig");
 
 const SEND_BUFFER_SIZE: u32 = 4096;
 const RECV_BUFFER_SIZE: u32 = 4096;
+
+// Linux socket option constants (from netinet/in.h)
+const IP_MULTICAST_TTL: u32 = 33;
+const IP_MULTICAST_LOOP: u32 = 34;
+const IP_ADD_MEMBERSHIP: u32 = 35;
 
 // ============================================================================
 // Publisher Statistics
@@ -86,10 +91,10 @@ pub const MulticastPublisher = struct {
         errdefer posix.close(fd);
 
         // Set multicast TTL
-        try posix.setsockopt(fd, posix.IPPROTO.IP, posix.IP.MULTICAST_TTL, &[1]u8{ttl});
+        try posix.setsockopt(fd, posix.IPPROTO.IP, IP_MULTICAST_TTL, &[1]u8{ttl});
 
         // Enable loopback for local testing
-        try posix.setsockopt(fd, posix.IPPROTO.IP, posix.IP.MULTICAST_LOOP, &[1]u8{1});
+        try posix.setsockopt(fd, posix.IPPROTO.IP, IP_MULTICAST_LOOP, &[1]u8{1});
 
         // Parse and store destination address
         self.dest_addr = .{
@@ -244,7 +249,8 @@ pub const MulticastSubscriber = struct {
             .multiaddr = group_addr,
             .interface = 0, // INADDR_ANY
         };
-        try posix.setsockopt(fd, posix.IPPROTO.IP, posix.IP.ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
+
+        try posix.setsockopt(fd, posix.IPPROTO.IP, IP_ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
 
         self.fd = fd;
         self.first_received = false;
@@ -328,10 +334,10 @@ pub const MulticastSubscriber = struct {
 // ============================================================================
 
 test "MulticastPublisher lifecycle" {
-    var pub = MulticastPublisher.init();
-    defer pub.deinit();
+    var publisher = MulticastPublisher.init();
+    defer publisher.deinit();
 
-    try std.testing.expect(!pub.isActive());
+    try std.testing.expect(!publisher.isActive());
 
     // Note: Actually starting requires network access
     // This just tests the init/deinit cycle

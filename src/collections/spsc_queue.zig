@@ -646,7 +646,7 @@ test "SpscQueue - drain" {
     _ = queue.push(2);
     _ = queue.push(3);
 
-    var sum: u32 = 0;
+    const sum: u32 = 0;
     const handler = struct {
         fn handle(item: u32) void {
             _ = item;

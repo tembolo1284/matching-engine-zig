@@ -43,6 +43,7 @@ const UdpClientMap = struct {
     const Self = @This();
 
     fn init() Self {
+        @setEvalBranchQuota(50000);
         var self = Self{};
         for (&self.entries) |*entry| {
             entry.active = false;
@@ -79,7 +80,6 @@ const UdpClientMap = struct {
         // Evict oldest (LRU)
         var oldest_idx: usize = 0;
         var oldest_time: i64 = std.math.maxInt(i64);
-
         for (self.entries, 0..) |entry, i| {
             if (entry.active and entry.last_seen < oldest_time) {
                 oldest_time = entry.last_seen;
@@ -93,7 +93,6 @@ const UdpClientMap = struct {
             .last_seen = now,
             .active = true,
         };
-
         return self.entries[oldest_idx].client_id;
     }
 
@@ -199,7 +198,6 @@ pub const UdpServer = struct {
         try posix.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
 
         self.fd = fd;
-
         std.log.info("UDP server listening on {s}:{}", .{ address, port });
     }
 
@@ -220,7 +218,6 @@ pub const UdpServer = struct {
     /// Poll for incoming packets (non-blocking).
     pub fn poll(self: *Self) !usize {
         const fd = self.fd orelse return 0;
-
         var count: usize = 0;
 
         while (true) {

@@ -376,7 +376,7 @@ pub const PriceLevel = extern struct {
     active: bool,
 
     /// Padding to fill cache line.
-    _padding: [27]u8 = undefined,
+    _padding: [35]u8 = undefined,
 
     // Compile-time size verification
     comptime {

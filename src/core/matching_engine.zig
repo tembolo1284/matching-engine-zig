@@ -206,7 +206,7 @@ pub const MatchingEngine = struct {
         // Find or create order book for this symbol
         const book = self.findOrCreateBook(order.symbol) orelse {
             self.total_rejects += 1;
-            output.add(msg.OutputMsg.makeReject(
+            _ = output.add(msg.OutputMsg.makeReject(
                 order.user_id,
                 order.user_order_id,
                 .unknown_symbol,
@@ -249,7 +249,7 @@ pub const MatchingEngine = struct {
             // We could scan all books, but that's O(n) and breaks latency guarantees.
             // Instead, reject with clear error - client should resend with symbol.
             self.total_rejects += 1;
-            output.add(msg.OutputMsg.makeReject(
+            _ = output.add(msg.OutputMsg.makeReject(
                 cancel.user_id,
                 cancel.user_order_id,
                 .order_not_found,
@@ -264,7 +264,7 @@ pub const MatchingEngine = struct {
             book.cancelOrder(cancel.user_id, cancel.user_order_id, client_id, output);
         } else {
             self.total_rejects += 1;
-            output.add(msg.OutputMsg.makeReject(
+            _ = output.add(msg.OutputMsg.makeReject(
                 cancel.user_id,
                 cancel.user_order_id,
                 .order_not_found,
@@ -380,7 +380,7 @@ pub const MatchingEngine = struct {
                 return null; // Empty slot = not found
             }
 
-            if (msg.symbolEqual(slot.symbol, symbol)) {
+            if (msg.symbolEqual(&slot.symbol, &symbol)) {
                 self.recordProbe(probe);
                 return &self.books[slot.book_index].?;
             }
