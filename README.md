@@ -10,7 +10,7 @@ Wire-compatible with the C matching engine implementation.
 - **Zero-allocation hot path** — Pre-allocated memory pools, no heap allocation during trading
 - **Cache-optimized** — 64-byte aligned structures, sequential memory access
 - **Lock-free queues** — SPSC queues for inter-thread communication
-- **Dual-processor mode** — Parallel matching with symbol-based routing
+- **Dual-processor mode** — Parallel matching with symbol-based routing (A-M / N-Z)
 
 ### Networking
 - **TCP** — Multi-client with epoll, 4-byte length-prefix framing
@@ -18,15 +18,20 @@ Wire-compatible with the C matching engine implementation.
 - **Multicast** — Market data broadcast for unlimited subscribers
 
 ### Protocols
-- **CSV** — Human-readable, newline-delimited
 - **Binary** — High-performance, network byte order, magic byte `0x4D`
+- **CSV** — Human-readable, newline-delimited
 - **Auto-detection** — Protocol detected from first byte
 
 ### Architecture
 - **Single-threaded mode** — Simple, low-latency for moderate load
-- **Threaded mode** — Dual processors (A-M / N-Z), I/O thread separation
+- **Threaded mode** — Dual processors with I/O thread separation
 
 ## Quick Start
+
+### Prerequisites
+- Zig 0.13.0 or later (`zig version` to check)
+- netcat (`nc`) for testing
+- Optional: Docker for containerized deployment
 
 ### Build
 ```bash
@@ -104,6 +109,7 @@ R, symbol, userId, orderId, reason               # Reject
 | Ack | 'A' (0x41) | 18 bytes |
 | Trade | 'T' (0x54) | 34 bytes |
 | Top of Book | 'B' (0x42) | 20 bytes |
+| Reject | 'R' (0x52) | 19 bytes |
 
 ### TCP Framing
 
@@ -139,41 +145,54 @@ zig build run
 
 ## Project Structure
 ```
-zig_matching_engine/
-├── build.zig
-├── Makefile
-├── Dockerfile
+matching-engine-zig/
+├── build.zig               # Build configuration
+├── build.zig.zon           # Package metadata
+├── Makefile                # Development shortcuts
+├── Dockerfile              # Container build
+├── docker-compose.yml      # Container orchestration
 ├── README.md
-├── ARCHITECTURE.md
-├── QUICK_START.md
-├── DOCKER.md
 └── src/
-    ├── main.zig                 # Entry point
-    ├── core/
-    │   ├── order.zig            # Order struct (64-byte aligned)
-    │   ├── order_book.zig       # Price-time priority matching
-    │   ├── matching_engine.zig  # Multi-symbol orchestrator
-    │   └── memory_pool.zig      # Pre-allocated pools
-    ├── protocol/
-    │   ├── message_types.zig    # Message definitions
-    │   ├── codec.zig            # Protocol detection
-    │   ├── binary_codec.zig     # Binary encoder/decoder
-    │   ├── csv_codec.zig        # CSV encoder/decoder
-    │   └── fix_codec.zig        # FIX protocol (placeholder)
-    ├── transport/
-    │   ├── config.zig           # Configuration
-    │   ├── tcp_server.zig       # Multi-client TCP with epoll
-    │   ├── udp_server.zig       # Bidirectional UDP
-    │   ├── multicast.zig        # Market data multicast
-    │   └── server.zig           # Single-threaded unified server
-    ├── collections/
-    │   ├── mod.zig
-    │   ├── spsc_queue.zig       # Lock-free SPSC queue
-    │   └── bounded_channel.zig  # Typed message channel
-    └── threading/
-        ├── mod.zig
-        ├── processor.zig        # Matching processor thread
-        └── threaded_server.zig  # Dual-processor server
+    ├── main.zig                    # Entry point
+    │
+    ├── core/                       # Matching engine core
+    │   ├── order.zig               # Order struct (64-byte aligned)
+    │   ├── order_book.zig          # Price-time priority matching
+    │   ├── matching_engine.zig     # Multi-symbol orchestrator
+    │   └── memory_pool.zig         # Pre-allocated pools
+    │
+    ├── protocol/                   # Wire protocols
+    │   ├── mod.zig                 # Module exports
+    │   ├── message_types.zig       # Message definitions
+    │   ├── codec.zig               # Protocol detection
+    │   ├── binary_codec.zig        # Binary encoder/decoder
+    │   ├── csv_codec.zig           # CSV encoder/decoder
+    │   └── fix_codec.zig           # FIX protocol (stub)
+    │
+    ├── transport/                  # Network layer
+    │   ├── config.zig              # Configuration
+    │   ├── net_utils.zig           # Shared network utilities
+    │   ├── tcp_client.zig          # Per-connection state
+    │   ├── tcp_server.zig          # Multi-client TCP with epoll
+    │   ├── udp_server.zig          # Bidirectional UDP
+    │   ├── multicast.zig           # Market data multicast
+    │   └── server.zig              # Single-threaded server
+    │
+    ├── collections/                # Data structures
+    │   ├── mod.zig                 # Module exports
+    │   ├── spsc_queue.zig          # Lock-free SPSC queue
+    │   └── bounded_channel.zig     # Typed message channel
+    │
+    ├── threading/                  # Multi-threaded mode
+    │   ├── mod.zig                 # Module exports
+    │   ├── processor.zig           # Matching processor thread
+    │   └── threaded_server.zig     # Dual-processor server
+    │
+    ├── bench/                      # Benchmarks
+    │   └── main.zig
+    │
+    └── tools/                      # Utilities
+        └── client.zig              # Test client
 ```
 
 ## Operating Modes
@@ -282,6 +301,7 @@ make release          # Build optimized
 make run              # Run single-threaded
 make run-threaded     # Run dual-processor
 make test             # Run all tests
+make bench            # Run benchmarks
 make clean            # Clean build artifacts
 make docker           # Build Docker image
 make docker-run       # Run in Docker
@@ -298,6 +318,9 @@ docker run -p 1234:1234 -p 1235:1235/udp zig-matching-engine
 
 # Run (threaded)
 docker run -e ENGINE_THREADED=true -p 1234:1234 -p 1235:1235/udp zig-matching-engine
+
+# Test
+echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
 ```
 
 ## C Protocol Compatibility
@@ -314,7 +337,7 @@ This implementation is wire-compatible with the C matching engine:
 
 ## Documentation
 
-- [QUICK_START.md](QUICK_START.md) — Get running in 5 minutes
-- [ARCHITECTURE.md](ARCHITECTURE.md) — Deep dive into system design
-- [DOCKER.md](DOCKER.md) — Container deployment guide
+- [QUICK_START.md](docs/QUICK_START.md) — Get running in 5 minutes
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Deep dive into system design
+- [DOCKER.md](docs/DOCKER.md) — Container deployment guide
 

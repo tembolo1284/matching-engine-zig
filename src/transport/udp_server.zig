@@ -1,97 +1,103 @@
 //! Bidirectional UDP server for ultra-low latency trading.
 //!
 //! Features:
-//! - Tracks client addresses for response routing
-//! - No connection state - pure request/response
+//! - Connectionless request/response
+//! - Client address tracking for response routing
 //! - Protocol auto-detection per packet
-//! - Optional client address caching for repeated interactions
+//! - LRU eviction for client table
+//!
+//! Thread Safety:
+//! - NOT thread-safe. Use from I/O thread only.
 
 const std = @import("std");
 const posix = std.posix;
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
 const config = @import("config.zig");
+const net_utils = @import("net_utils.zig");
 
 // ============================================================================
-// Constants
+// Configuration
 // ============================================================================
 
-const RECV_BUFFER_SIZE = 65536;
-const MAX_UDP_CLIENTS = 4096;
+const RECV_BUFFER_SIZE: u32 = 65536;
+const MAX_UDP_CLIENTS: u32 = 4096;
 
 // ============================================================================
-// UDP Client Tracking
+// Client Tracking
 // ============================================================================
 
-/// Tracks recent UDP clients for response routing
 const UdpClientEntry = struct {
     addr: config.UdpClientAddr,
     client_id: config.ClientId,
-    last_seen: i64, // Timestamp
+    last_seen: i64,
     active: bool = false,
 };
 
+/// Hash map for UDP client address → client ID mapping.
 const UdpClientMap = struct {
-    entries: [MAX_UDP_CLIENTS]UdpClientEntry = [_]UdpClientEntry{.{
-        .addr = .{ .addr = 0, .port = 0 },
-        .client_id = 0,
-        .last_seen = 0,
-    }} ** MAX_UDP_CLIENTS,
-    count: usize = 0,
+    entries: [MAX_UDP_CLIENTS]UdpClientEntry = undefined,
+    count: u32 = 0,
     next_id: config.ClientId = config.CLIENT_ID_UDP_BASE + 1,
 
     const Self = @This();
 
-    /// Get or create client ID for address
+    fn init() Self {
+        var self = Self{};
+        for (&self.entries) |*entry| {
+            entry.active = false;
+        }
+        return self;
+    }
+
+    /// Get or create client ID for address.
     fn getOrCreate(self: *Self, addr: config.UdpClientAddr) config.ClientId {
+        const now = std.time.timestamp();
+
         // Search existing
         for (&self.entries) |*entry| {
-            if (entry.active and entry.addr.addr == addr.addr and entry.addr.port == addr.port) {
-                entry.last_seen = std.time.timestamp();
+            if (entry.active and entry.addr.eql(addr)) {
+                entry.last_seen = now;
                 return entry.client_id;
             }
         }
-        
-        // Create new
+
+        // Find free slot
         for (&self.entries) |*entry| {
             if (!entry.active) {
-                entry.addr = addr;
-                entry.client_id = self.next_id;
-                entry.last_seen = std.time.timestamp();
-                entry.active = true;
-                
-                self.next_id +%= 1;
-                if (self.next_id < config.CLIENT_ID_UDP_BASE) {
-                    self.next_id = config.CLIENT_ID_UDP_BASE + 1;
-                }
+                entry.* = .{
+                    .addr = addr,
+                    .client_id = self.allocateId(),
+                    .last_seen = now,
+                    .active = true,
+                };
                 self.count += 1;
-                
                 return entry.client_id;
             }
         }
-        
-        // Table full - evict oldest
+
+        // Evict oldest (LRU)
         var oldest_idx: usize = 0;
         var oldest_time: i64 = std.math.maxInt(i64);
+
         for (self.entries, 0..) |entry, i| {
             if (entry.active and entry.last_seen < oldest_time) {
                 oldest_time = entry.last_seen;
                 oldest_idx = i;
             }
         }
-        
+
         self.entries[oldest_idx] = .{
             .addr = addr,
-            .client_id = self.next_id,
-            .last_seen = std.time.timestamp(),
+            .client_id = self.allocateId(),
+            .last_seen = now,
             .active = true,
         };
-        self.next_id +%= 1;
-        
+
         return self.entries[oldest_idx].client_id;
     }
 
-    /// Find address by client ID
+    /// Find address by client ID.
     fn findAddr(self: *const Self, client_id: config.ClientId) ?config.UdpClientAddr {
         for (self.entries) |entry| {
             if (entry.active and entry.client_id == client_id) {
@@ -100,6 +106,29 @@ const UdpClientMap = struct {
         }
         return null;
     }
+
+    fn allocateId(self: *Self) config.ClientId {
+        const id = self.next_id;
+        self.next_id +%= 1;
+        if (self.next_id < config.CLIENT_ID_UDP_BASE) {
+            self.next_id = config.CLIENT_ID_UDP_BASE + 1;
+        }
+        return id;
+    }
+};
+
+// ============================================================================
+// Server Statistics
+// ============================================================================
+
+pub const UdpServerStats = struct {
+    packets_received: u64,
+    packets_sent: u64,
+    bytes_received: u64,
+    bytes_sent: u64,
+    decode_errors: u64,
+    send_errors: u64,
+    active_clients: u32,
 };
 
 // ============================================================================
@@ -107,28 +136,37 @@ const UdpClientMap = struct {
 // ============================================================================
 
 pub const UdpServer = struct {
-    fd: posix.fd_t = -1,
-    
+    /// Socket file descriptor.
+    fd: ?posix.fd_t = null,
+
+    /// Receive buffer.
     recv_buf: [RECV_BUFFER_SIZE]u8 = undefined,
+
+    /// Send buffer.
     send_buf: [RECV_BUFFER_SIZE]u8 = undefined,
-    
-    // Client tracking for responses
-    clients: UdpClientMap = .{},
-    
-    // Last received address (for immediate response)
+
+    /// Client tracking for response routing.
+    clients: UdpClientMap = UdpClientMap.init(),
+
+    /// Last received address (for fast response).
     last_recv_addr: posix.sockaddr.in = undefined,
-    last_recv_addr_len: posix.socklen_t = 0,
-    
-    // Callback for processing messages
-    on_message: ?*const fn (client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void = null,
+    last_recv_len: posix.socklen_t = 0,
+
+    /// Message callback.
+    on_message: ?*const fn (
+        client_id: config.ClientId,
+        message: *const msg.InputMsg,
+        ctx: ?*anyopaque,
+    ) void = null,
     callback_ctx: ?*anyopaque = null,
-    
-    // Statistics
+
+    // === Statistics ===
     packets_received: u64 = 0,
     packets_sent: u64 = 0,
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
     decode_errors: u64 = 0,
+    send_errors: u64 = 0,
 
     const Self = @This();
 
@@ -140,184 +178,206 @@ pub const UdpServer = struct {
         self.stop();
     }
 
-    /// Start listening on the specified address and port
+    /// Start listening on address:port.
     pub fn start(self: *Self, address: []const u8, port: u16) !void {
+        std.debug.assert(self.fd == null);
+
         // Create UDP socket
-        self.fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(self.fd);
-        
+        const fd = try posix.socket(
+            posix.AF.INET,
+            posix.SOCK.DGRAM | posix.SOCK.NONBLOCK,
+            0,
+        );
+        errdefer posix.close(fd);
+
         // Set socket options
-        try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        
-        // Increase buffer sizes for burst handling
-        posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1024 * 1024))) catch {};
-        posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1024 * 1024))) catch {};
-        
+        try net_utils.setReuseAddr(fd);
+        net_utils.setBufferSizes(fd, 1024 * 1024, 1024 * 1024);
+
         // Bind
-        var addr = try parseAddress(address, port);
-        try posix.bind(self.fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-        
+        const addr = try net_utils.parseSockAddr(address, port);
+        try posix.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+
+        self.fd = fd;
+
         std.log.info("UDP server listening on {s}:{}", .{ address, port });
     }
 
-    /// Stop the server
+    /// Stop the server.
     pub fn stop(self: *Self) void {
-        if (self.fd >= 0) {
-            posix.close(self.fd);
-            self.fd = -1;
+        if (self.fd) |fd| {
+            posix.close(fd);
+            self.fd = null;
+            std.log.info("UDP server stopped (received {} packets)", .{self.packets_received});
         }
     }
 
-    /// Poll for incoming packets (non-blocking)
-    /// Returns number of packets processed
+    /// Check if server is running.
+    pub fn isRunning(self: *const Self) bool {
+        return self.fd != null;
+    }
+
+    /// Poll for incoming packets (non-blocking).
     pub fn poll(self: *Self) !usize {
+        const fd = self.fd orelse return 0;
+
         var count: usize = 0;
-        
+
         while (true) {
-            self.last_recv_addr_len = @sizeOf(@TypeOf(self.last_recv_addr));
-            
+            self.last_recv_len = @sizeOf(@TypeOf(self.last_recv_addr));
+
             const n = posix.recvfrom(
-                self.fd,
+                fd,
                 &self.recv_buf,
                 0,
                 @ptrCast(&self.last_recv_addr),
-                &self.last_recv_addr_len,
+                &self.last_recv_len,
             ) catch |err| {
-                if (err == error.WouldBlock) break;
+                if (net_utils.isWouldBlock(err)) break;
                 return err;
             };
-            
+
             if (n == 0) continue;
-            
+
             self.packets_received += 1;
             self.bytes_received += n;
             count += 1;
-            
-            // Get/create client ID for this address
+
+            // Get client ID
             const client_addr = config.UdpClientAddr{
                 .addr = self.last_recv_addr.addr,
                 .port = self.last_recv_addr.port,
             };
             const client_id = self.clients.getOrCreate(client_addr);
-            
+
             // Process packet
             self.processPacket(self.recv_buf[0..n], client_id);
         }
-        
+
         return count;
     }
 
-    /// Send response to specific client
+    /// Send to client by ID.
     pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
-        const addr = self.clients.findAddr(client_id) orelse return false;
+        std.debug.assert(config.isUdpClient(client_id));
+
+        const addr = self.clients.findAddr(client_id) orelse {
+            self.send_errors += 1;
+            return false;
+        };
+
         return self.sendToAddr(addr, data);
     }
 
-    /// Send to last received address (fastest path)
+    /// Send to last received address (fastest path).
     pub fn sendToLast(self: *Self, data: []const u8) bool {
-        if (self.last_recv_addr_len == 0) return false;
-        
+        if (self.last_recv_len == 0) return false;
+
+        const fd = self.fd orelse return false;
+
         const sent = posix.sendto(
-            self.fd,
+            fd,
             data,
             0,
             @ptrCast(&self.last_recv_addr),
-            self.last_recv_addr_len,
-        ) catch return false;
-        
+            self.last_recv_len,
+        ) catch {
+            self.send_errors += 1;
+            return false;
+        };
+
         self.packets_sent += 1;
         self.bytes_sent += sent;
         return true;
     }
 
-    /// Send to specific address
+    /// Send to specific address.
     pub fn sendToAddr(self: *Self, addr: config.UdpClientAddr, data: []const u8) bool {
+        const fd = self.fd orelse return false;
+
         var sock_addr = posix.sockaddr.in{
             .family = posix.AF.INET,
             .port = addr.port,
             .addr = addr.addr,
         };
-        
+
         const sent = posix.sendto(
-            self.fd,
+            fd,
             data,
             0,
             @ptrCast(&sock_addr),
             @sizeOf(@TypeOf(sock_addr)),
-        ) catch return false;
-        
+        ) catch {
+            self.send_errors += 1;
+            return false;
+        };
+
         self.packets_sent += 1;
         self.bytes_sent += sent;
         return true;
     }
 
-    /// Get socket fd for epoll integration
-    pub fn getFd(self: *const Self) posix.fd_t {
+    /// Get socket fd for external polling.
+    pub fn getFd(self: *const Self) ?posix.fd_t {
         return self.fd;
     }
 
-    // ========================================================================
-    // Private Methods
-    // ========================================================================
-
     fn processPacket(self: *Self, data: []const u8, client_id: config.ClientId) void {
-        // Decode message (auto-detect protocol)
         const result = codec.Codec.decodeInput(data) catch |err| {
             self.decode_errors += 1;
             std.log.debug("UDP decode error: {}", .{err});
             return;
         };
-        
-        // Dispatch to callback
+
         if (self.on_message) |callback| {
             callback(client_id, &result.message, self.callback_ctx);
         }
     }
-};
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-fn parseAddress(address: []const u8, port: u16) !posix.sockaddr.in {
-    var addr = posix.sockaddr.in{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = 0,
-    };
-    
-    if (std.mem.eql(u8, address, "0.0.0.0")) {
-        addr.addr = 0;
-    } else {
-        var parts: [4]u8 = undefined;
-        var iter = std.mem.splitScalar(u8, address, '.');
-        var i: usize = 0;
-        while (iter.next()) |part| : (i += 1) {
-            if (i >= 4) return error.InvalidAddress;
-            parts[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
-        }
-        if (i != 4) return error.InvalidAddress;
-        addr.addr = @bitCast(parts);
+    /// Get statistics.
+    pub fn getStats(self: *const Self) UdpServerStats {
+        return .{
+            .packets_received = self.packets_received,
+            .packets_sent = self.packets_sent,
+            .bytes_received = self.bytes_received,
+            .bytes_sent = self.bytes_sent,
+            .decode_errors = self.decode_errors,
+            .send_errors = self.send_errors,
+            .active_clients = self.clients.count,
+        };
     }
-    
-    return addr;
-}
+};
 
 // ============================================================================
 // Tests
 // ============================================================================
 
 test "UdpClientMap get or create" {
-    var map = UdpClientMap{};
-    
-    const addr1 = config.UdpClientAddr{ .addr = 0x0100007F, .port = 1234 };
-    const addr2 = config.UdpClientAddr{ .addr = 0x0100007F, .port = 1235 };
-    
+    var map = UdpClientMap.init();
+
+    const addr1 = config.UdpClientAddr.init(0x0100007F, 1234);
+    const addr2 = config.UdpClientAddr.init(0x0100007F, 1235);
+
     const id1 = map.getOrCreate(addr1);
     const id2 = map.getOrCreate(addr2);
     const id1_again = map.getOrCreate(addr1);
-    
+
     try std.testing.expect(id1 != id2);
     try std.testing.expectEqual(id1, id1_again);
     try std.testing.expect(config.isUdpClient(id1));
+    try std.testing.expect(config.isUdpClient(id2));
+}
+
+test "UdpClientMap find addr" {
+    var map = UdpClientMap.init();
+
+    const addr = config.UdpClientAddr.init(0x0100007F, 8080);
+    const id = map.getOrCreate(addr);
+
+    const found = map.findAddr(id);
+    try std.testing.expect(found != null);
+    try std.testing.expect(found.?.eql(addr));
+
+    // Unknown ID
+    try std.testing.expect(map.findAddr(99999) == null);
 }

@@ -1,35 +1,77 @@
 //! Order structure - 64-byte cache-line aligned.
-//! 
+//!
 //! Design decisions (from Power of Ten + HFT principles):
 //! - Aligned to 64-byte cache line to prevent false sharing
 //! - No symbol field - order book is single-symbol
 //! - Hot fields (accessed during matching) packed first
 //! - Uses RDTSC timestamp for time priority on x86_64
+//!
+//! Linked list rationale:
+//! We use intrusive prev/next pointers despite "avoid lists in hot path"
+//! because at each price level, orders are FIFO. Linked lists give O(1)
+//! insert at tail and O(1) remove at known position - both critical for
+//! matching. The alternative (array + compaction) has worse cache behavior
+//! for removals from the middle.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const msg = @import("../protocol/message_types.zig");
+
+// ============================================================================
+// Platform Verification
+// ============================================================================
+
+/// We only support x86_64 Linux for production - other platforms may work
+/// but haven't been validated for latency characteristics.
+const SUPPORTED_PLATFORM = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
+
+comptime {
+    if (!SUPPORTED_PLATFORM) {
+        @compileLog("WARNING: Non-x86_64-linux platform detected. Timestamp fallback will use std.time which may syscall.");
+    }
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Cache line size on modern x86_64 processors
+pub const CACHE_LINE_SIZE = 64;
+
+/// Order alignment - one cache line to prevent false sharing
+pub const ORDER_ALIGNMENT = CACHE_LINE_SIZE;
 
 // ============================================================================
 // Timestamp Implementation
 // ============================================================================
 
 /// Get current timestamp using RDTSC on x86_64, fallback elsewhere.
-/// For strict ordering, RDTSC is sufficient - we only need monotonicity.
+/// 
+/// RDTSC characteristics:
+/// - ~20-30 cycles on modern CPUs (with RDTSCP serialization)
+/// - Monotonic within a core (may need adjustment for cross-core)
+/// - No syscall overhead
+///
+/// For strict ordering within a single-threaded matching engine,
+/// RDTSC provides sufficient monotonicity guarantees.
 pub inline fn getCurrentTimestamp() u64 {
-    const builtin = @import("builtin");
-    
-    if (comptime builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux) {
-        // RDTSC: ~5-10 cycles, no syscall overhead
+    if (comptime SUPPORTED_PLATFORM) {
+        // RDTSC: Read Time Stamp Counter
+        // We use RDTSC (not RDTSCP) for lower latency - ordering is
+        // guaranteed by the surrounding code structure in our engine.
         var lo: u32 = undefined;
         var hi: u32 = undefined;
         asm volatile ("rdtsc"
             : [lo] "={eax}" (lo),
-              [hi] "={edx}" (hi),
+              [hi] "={edx}" (hi)
         );
         return (@as(u64, hi) << 32) | lo;
     } else {
-        // Fallback: clock_gettime equivalent
-        return @intCast(@as(u128, @bitCast(std.time.Instant.now().timestamp)));
+        // Fallback for development/testing on other platforms
+        // WARNING: This may syscall and add microseconds of latency
+        const ts = std.time.nanoTimestamp();
+        std.debug.assert(ts >= 0);
+        return @intCast(@as(u128, @intCast(ts)));
     }
 }
 
@@ -39,57 +81,95 @@ pub inline fn getCurrentTimestamp() u64 {
 
 /// Order structure - exactly 64 bytes (one cache line).
 ///
-/// Memory layout:
+/// Memory layout (verified at comptime):
+/// ```
 ///   Bytes 0-19:  Hot path fields (accessed during matching)
 ///   Bytes 20-31: Metadata
 ///   Bytes 32-39: Timestamp
 ///   Bytes 40-55: Linked list pointers
-///   Bytes 56-63: Padding
+///   Bytes 56-63: Reserved padding
+/// ```
+///
+/// Field ordering rationale:
+/// - user_id, user_order_id, price, quantity, remaining_qty are accessed
+///   on every match check - keeping them in first cache line fetch
+/// - Linked list pointers are only touched during insert/remove
+/// - Padding ensures the struct is exactly one cache line
 pub const Order = extern struct {
-    // === HOT PATH FIELDS === (bytes 0-19)
-    user_id: u32,           // 0-3
-    user_order_id: u32,     // 4-7
-    price: u32,             // 8-11: 0 = market order
-    quantity: u32,          // 12-15: Original quantity
-    remaining_qty: u32,     // 16-19: Remaining unfilled
+    // === HOT PATH FIELDS === (bytes 0-19, accessed every match check)
+    user_id: u32,           // 0-3:   Owner identification
+    user_order_id: u32,     // 4-7:   Client's order reference
+    price: u32,             // 8-11:  Price in ticks (0 = market order)
+    quantity: u32,          // 12-15: Original quantity (immutable after init)
+    remaining_qty: u32,     // 16-19: Remaining unfilled quantity
 
     // === METADATA === (bytes 20-31)
-    side: msg.Side,         // 20
-    order_type: msg.OrderType, // 21
-    _pad1: [2]u8 = undefined, // 22-23
-    client_id: u32,         // 24-27: 0 for UDP, >0 for TCP
-    _pad2: u32 = undefined, // 28-31: Align timestamp
+    side: msg.Side,         // 20:    Buy or Sell
+    order_type: msg.OrderType, // 21: Market or Limit
+    _pad1: [2]u8 = .{ 0, 0 }, // 22-23: Explicit zero padding
+    client_id: u32,         // 24-27: TCP client ID (0 for UDP)
+    _pad2: u32 = 0,         // 28-31: Align timestamp to 8-byte boundary
 
     // === TIME PRIORITY === (bytes 32-39)
-    timestamp: u64,         // 32-39
+    timestamp: u64,         // 32-39: RDTSC timestamp for FIFO ordering
 
     // === LINKED LIST POINTERS === (bytes 40-55)
+    /// Next order at same price level (toward tail, newer orders)
     next: ?*Order,          // 40-47
+    /// Previous order at same price level (toward head, older orders)
     prev: ?*Order,          // 48-55
 
-    // === PADDING === (bytes 56-63)
-    _padding: [8]u8 = undefined,
+    // === RESERVED === (bytes 56-63)
+    /// Reserved for future use (e.g., order flags, sequence number)
+    _reserved: u64 = 0,     // 56-63
 
     const Self = @This();
 
-    // Compile-time verification
+    // ========================================================================
+    // Compile-time Layout Verification
+    // ========================================================================
     comptime {
-        std.debug.assert(@sizeOf(Self) == 64);
-        // Verify field offsets match C layout
+        // Size must be exactly one cache line
+        std.debug.assert(@sizeOf(Self) == CACHE_LINE_SIZE);
+        std.debug.assert(@alignOf(Self) >= 8); // Minimum for pointer alignment
+
+        // Verify hot path fields are in first 20 bytes
         std.debug.assert(@offsetOf(Self, "user_id") == 0);
+        std.debug.assert(@offsetOf(Self, "user_order_id") == 4);
         std.debug.assert(@offsetOf(Self, "price") == 8);
+        std.debug.assert(@offsetOf(Self, "quantity") == 12);
         std.debug.assert(@offsetOf(Self, "remaining_qty") == 16);
+
+        // Verify metadata layout
         std.debug.assert(@offsetOf(Self, "side") == 20);
+        std.debug.assert(@offsetOf(Self, "order_type") == 21);
+        std.debug.assert(@offsetOf(Self, "client_id") == 24);
+
+        // Verify timestamp is 8-byte aligned for atomic access
         std.debug.assert(@offsetOf(Self, "timestamp") == 32);
+        std.debug.assert(@offsetOf(Self, "timestamp") % 8 == 0);
+
+        // Verify pointer layout
         std.debug.assert(@offsetOf(Self, "next") == 40);
         std.debug.assert(@offsetOf(Self, "prev") == 48);
+        std.debug.assert(@offsetOf(Self, "_reserved") == 56);
     }
 
-    /// Initialize order from new order message
-    pub fn init(order_msg: *const msg.NewOrderMsg, ts: u64) Self {
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+
+    /// Initialize order from new order message.
+    /// 
+    /// Caller must provide timestamp from getCurrentTimestamp().
+    /// This separation allows batching timestamp reads.
+    pub fn init(order_msg: *const msg.NewOrderMsg, client_id: u32, ts: u64) Self {
+        // Rule 7: Validate all parameters
         std.debug.assert(order_msg.quantity > 0);
-        
-        return .{
+        std.debug.assert(order_msg.quantity <= 1_000_000_000); // Sanity bound
+        std.debug.assert(ts > 0);
+
+        const order = Self{
             .user_id = order_msg.user_id,
             .user_order_id = order_msg.user_order_id,
             .price = order_msg.price,
@@ -97,50 +177,155 @@ pub const Order = extern struct {
             .remaining_qty = order_msg.quantity,
             .side = order_msg.side,
             .order_type = if (order_msg.price == 0) .market else .limit,
-            .client_id = 0,
+            .client_id = client_id,
             .timestamp = ts,
             .next = null,
             .prev = null,
         };
+
+        // Post-condition: order is valid
+        std.debug.assert(order.isValid());
+        return order;
     }
 
-    /// Check if order is fully filled
+    // ========================================================================
+    // Invariant Checking
+    // ========================================================================
+
+    /// Check all order invariants. Use in debug assertions.
+    pub inline fn isValid(self: *const Self) bool {
+        // Remaining can't exceed original
+        if (self.remaining_qty > self.quantity) return false;
+
+        // Original quantity must be positive
+        if (self.quantity == 0) return false;
+
+        // Market orders have price 0, limit orders have price > 0
+        if (self.order_type == .market and self.price != 0) return false;
+        if (self.order_type == .limit and self.price == 0) return false;
+
+        // Timestamp must be set
+        if (self.timestamp == 0) return false;
+
+        return true;
+    }
+
+    // ========================================================================
+    // Order State Queries
+    // ========================================================================
+
+    /// Check if order is fully filled (remaining quantity is zero).
     pub inline fn isFilled(self: *const Self) bool {
+        std.debug.assert(self.isValid());
         return self.remaining_qty == 0;
     }
 
-    /// Fill order by quantity, returns amount actually filled
+    /// Check if order is still active (has remaining quantity).
+    pub inline fn isActive(self: *const Self) bool {
+        std.debug.assert(self.isValid());
+        return self.remaining_qty > 0;
+    }
+
+    // ========================================================================
+    // Order Modification
+    // ========================================================================
+
+    /// Fill order by quantity, returns amount actually filled.
+    ///
+    /// Guarantees:
+    /// - Never fills more than remaining
+    /// - Never underflows remaining_qty
+    /// - Returns exact amount filled
     pub inline fn fill(self: *Self, qty: u32) u32 {
+        // Pre-conditions
         std.debug.assert(qty > 0);
-        std.debug.assert(self.remaining_qty >= qty);
-        
+        std.debug.assert(self.remaining_qty > 0);
+        std.debug.assert(self.isValid());
+
         const filled = @min(qty, self.remaining_qty);
+
+        // This subtraction is safe: filled <= remaining_qty by construction
         self.remaining_qty -= filled;
+
+        // Post-condition: invariants preserved
+        std.debug.assert(self.remaining_qty <= self.quantity);
+        std.debug.assert(filled > 0);
+        std.debug.assert(filled <= qty);
+
         return filled;
     }
 
+    // ========================================================================
+    // Price-Time Priority
+    // ========================================================================
+
     /// Get order priority for comparison (price-time priority).
-    /// Lower value = higher priority.
-    /// For bids: higher price is better (negate).
-    /// For asks: lower price is better.
+    ///
+    /// Returns a value where LOWER = HIGHER PRIORITY.
+    /// This allows using min-heap semantics uniformly.
+    ///
+    /// For bids: higher price is better → negate price
+    /// For asks: lower price is better → use price directly
+    ///
+    /// Time priority (FIFO) is handled separately by linked list ordering.
     pub inline fn getPriority(self: *const Self, is_bid: bool) i64 {
+        // Pre-conditions
+        std.debug.assert(self.isActive()); // Only prioritize live orders
+        std.debug.assert(self.price > 0 or self.order_type == .market);
+
         if (is_bid) {
-            // Bids: higher price = higher priority (negate for min-ordering)
+            // Bids: higher price = higher priority = lower sort value
             return -@as(i64, @intCast(self.price));
         } else {
-            // Asks: lower price = higher priority
+            // Asks: lower price = higher priority = lower sort value
             return @as(i64, @intCast(self.price));
         }
     }
 
-    /// Check if this order's price crosses the given price.
-    /// For buys: our price >= their price means we're willing to pay enough.
-    /// For sells: our price <= their price means we're willing to sell low enough.
+    /// Check if this order's price crosses (can trade with) the given price.
+    ///
+    /// Crossing means:
+    /// - For buys:  our bid >= their ask (we're willing to pay enough)
+    /// - For sells: our ask <= their bid (we're willing to sell cheap enough)
+    /// - Market orders (price=0) cross any price
     pub inline fn pricesCross(self: *const Self, resting_price: u32) bool {
+        // Pre-conditions
+        std.debug.assert(self.isActive());
+        std.debug.assert(resting_price > 0); // Resting orders should have real prices
+
+        // Market orders always cross
+        if (self.price == 0) {
+            std.debug.assert(self.order_type == .market);
+            return true;
+        }
+
         return switch (self.side) {
-            .buy => self.price >= resting_price or self.price == 0, // Market orders cross any price
-            .sell => self.price <= resting_price or self.price == 0,
+            .buy => self.price >= resting_price,
+            .sell => self.price <= resting_price,
         };
+    }
+
+    // ========================================================================
+    // Linked List Operations
+    // ========================================================================
+
+    /// Unlink this order from its doubly-linked list.
+    /// Does not modify the order's own next/prev pointers.
+    /// Returns true if the order was linked, false if already unlinked.
+    pub inline fn unlink(self: *Self) bool {
+        const was_linked = (self.prev != null or self.next != null);
+
+        if (self.prev) |prev| {
+            prev.next = self.next;
+        }
+        if (self.next) |next| {
+            next.prev = self.prev;
+        }
+
+        self.prev = null;
+        self.next = null;
+
+        return was_linked;
     }
 };
 
@@ -150,9 +335,20 @@ pub const Order = extern struct {
 
 test "Order size and alignment" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Order));
+    try std.testing.expect(@alignOf(Order) >= 8);
 }
 
-test "Order init and fill" {
+test "Order field offsets" {
+    // Hot path fields in first 20 bytes
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Order, "user_id"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Order, "price"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Order, "remaining_qty"));
+
+    // Timestamp 8-byte aligned
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(Order, "timestamp"));
+}
+
+test "Order init and validation" {
     const new_order = msg.NewOrderMsg{
         .user_id = 1,
         .user_order_id = 100,
@@ -161,17 +357,180 @@ test "Order init and fill" {
         .side = .buy,
         .symbol = msg.makeSymbol("IBM"),
     };
-    
-    var order = Order.init(&new_order, 12345);
-    
+
+    const order = Order.init(&new_order, 42, 12345);
+
     try std.testing.expectEqual(@as(u32, 1), order.user_id);
+    try std.testing.expectEqual(@as(u32, 100), order.user_order_id);
+    try std.testing.expectEqual(@as(u32, 5000), order.price);
+    try std.testing.expectEqual(@as(u32, 100), order.quantity);
     try std.testing.expectEqual(@as(u32, 100), order.remaining_qty);
+    try std.testing.expectEqual(@as(u32, 42), order.client_id);
+    try std.testing.expectEqual(msg.OrderType.limit, order.order_type);
+    try std.testing.expect(order.isValid());
+    try std.testing.expect(order.isActive());
     try std.testing.expect(!order.isFilled());
-    
-    const filled = order.fill(30);
-    try std.testing.expectEqual(@as(u32, 30), filled);
+}
+
+test "Order fill mechanics" {
+    const new_order = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .price = 5000,
+        .quantity = 100,
+        .side = .buy,
+        .symbol = msg.makeSymbol("IBM"),
+    };
+
+    var order = Order.init(&new_order, 0, 12345);
+
+    // Partial fill
+    const filled1 = order.fill(30);
+    try std.testing.expectEqual(@as(u32, 30), filled1);
     try std.testing.expectEqual(@as(u32, 70), order.remaining_qty);
-    
-    _ = order.fill(70);
+    try std.testing.expect(order.isValid());
+    try std.testing.expect(!order.isFilled());
+
+    // Another partial fill
+    const filled2 = order.fill(50);
+    try std.testing.expectEqual(@as(u32, 50), filled2);
+    try std.testing.expectEqual(@as(u32, 20), order.remaining_qty);
+
+    // Final fill
+    const filled3 = order.fill(20);
+    try std.testing.expectEqual(@as(u32, 20), filled3);
+    try std.testing.expectEqual(@as(u32, 0), order.remaining_qty);
     try std.testing.expect(order.isFilled());
+}
+
+test "Order fill clamping" {
+    const new_order = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .price = 5000,
+        .quantity = 50,
+        .side = .buy,
+        .symbol = msg.makeSymbol("IBM"),
+    };
+
+    var order = Order.init(&new_order, 0, 12345);
+
+    // Try to fill more than available
+    const filled = order.fill(100);
+    try std.testing.expectEqual(@as(u32, 50), filled); // Clamped
+    try std.testing.expectEqual(@as(u32, 0), order.remaining_qty);
+    try std.testing.expect(order.isFilled());
+}
+
+test "Order price crossing" {
+    const buy_order_msg = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 1,
+        .price = 100, // Willing to pay up to 100
+        .quantity = 10,
+        .side = .buy,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const buy = Order.init(&buy_order_msg, 0, 1);
+
+    // Buy at 100 crosses sell at 100 or below
+    try std.testing.expect(buy.pricesCross(100)); // Equal
+    try std.testing.expect(buy.pricesCross(99));  // Below
+    try std.testing.expect(!buy.pricesCross(101)); // Above
+
+    const sell_order_msg = msg.NewOrderMsg{
+        .user_id = 2,
+        .user_order_id = 2,
+        .price = 100, // Willing to sell at 100 or above
+        .quantity = 10,
+        .side = .sell,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const sell = Order.init(&sell_order_msg, 0, 2);
+
+    // Sell at 100 crosses buy at 100 or above
+    try std.testing.expect(sell.pricesCross(100)); // Equal
+    try std.testing.expect(sell.pricesCross(101)); // Above
+    try std.testing.expect(!sell.pricesCross(99)); // Below
+}
+
+test "Market order crossing" {
+    const market_buy_msg = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 1,
+        .price = 0, // Market order
+        .quantity = 10,
+        .side = .buy,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const market = Order.init(&market_buy_msg, 0, 1);
+
+    try std.testing.expectEqual(msg.OrderType.market, market.order_type);
+
+    // Market orders cross any price
+    try std.testing.expect(market.pricesCross(1));
+    try std.testing.expect(market.pricesCross(1000));
+    try std.testing.expect(market.pricesCross(999999));
+}
+
+test "Order priority" {
+    const bid_msg = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 1,
+        .price = 100,
+        .quantity = 10,
+        .side = .buy,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const low_bid = Order.init(&bid_msg, 0, 1);
+
+    const high_bid_msg = msg.NewOrderMsg{
+        .user_id = 2,
+        .user_order_id = 2,
+        .price = 110,
+        .quantity = 10,
+        .side = .buy,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const high_bid = Order.init(&high_bid_msg, 0, 2);
+
+    // Higher bid should have lower (better) priority value
+    try std.testing.expect(high_bid.getPriority(true) < low_bid.getPriority(true));
+
+    const ask_msg = msg.NewOrderMsg{
+        .user_id = 3,
+        .user_order_id = 3,
+        .price = 100,
+        .quantity = 10,
+        .side = .sell,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const low_ask = Order.init(&ask_msg, 0, 3);
+
+    const high_ask_msg = msg.NewOrderMsg{
+        .user_id = 4,
+        .user_order_id = 4,
+        .price = 110,
+        .quantity = 10,
+        .side = .sell,
+        .symbol = msg.makeSymbol("TEST"),
+    };
+    const high_ask = Order.init(&high_ask_msg, 0, 4);
+
+    // Lower ask should have lower (better) priority value
+    try std.testing.expect(low_ask.getPriority(false) < high_ask.getPriority(false));
+}
+
+test "RDTSC timestamp monotonicity" {
+    if (!SUPPORTED_PLATFORM) {
+        return error.SkipZigTest;
+    }
+
+    const t1 = getCurrentTimestamp();
+    const t2 = getCurrentTimestamp();
+    const t3 = getCurrentTimestamp();
+
+    // Timestamps should be monotonically increasing
+    try std.testing.expect(t2 >= t1);
+    try std.testing.expect(t3 >= t2);
 }

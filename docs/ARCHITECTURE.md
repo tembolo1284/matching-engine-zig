@@ -10,7 +10,8 @@ Detailed technical documentation of the Zig Matching Engine's architecture, focu
 4. [Protocol Layer](#protocol-layer)
 5. [Transport Layer](#transport-layer)
 6. [Matching Algorithm](#matching-algorithm)
-7. [Performance Analysis](#performance-analysis)
+7. [Threading Model](#threading-model)
+8. [Performance Analysis](#performance-analysis)
 
 ---
 
@@ -20,7 +21,7 @@ Detailed technical documentation of the Zig Matching Engine's architecture, focu
 
 1. **Cache is King** — Every data structure designed around 64-byte cache lines
 2. **Zero Allocation** — No heap allocation in the hot path
-3. **Predictable Latency** — Bounded loops, no unbounded operations
+3. **Predictable Latency** — Bounded loops, no unbounded operations (NASA Rule 2)
 4. **Compile-Time Verification** — `comptime` assertions validate all assumptions
 5. **Wire Compatibility** — Identical protocol to C implementation
 
@@ -107,23 +108,47 @@ pub const PriceLevel = extern struct {
 };
 ```
 
+### SPSC Queue with Cache Line Isolation
+```zig
+pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        // Producer and consumer on separate cache lines
+        // to prevent false sharing
+        head: CacheLineAtomic,      // Producer writes
+        _pad1: [56]u8,              // Padding to 64 bytes
+        tail: CacheLineAtomic,      // Consumer writes
+        _pad2: [56]u8,              // Padding to 64 bytes
+        buffer: [capacity]T,
+
+        const CacheLineAtomic = struct {
+            value: std.atomic.Value(usize) align(64),
+            _padding: [64 - @sizeOf(std.atomic.Value(usize))]u8,
+
+            comptime {
+                std.debug.assert(@sizeOf(@This()) == 64);
+            }
+        };
+    };
+}
+```
+
 ### Memory Pool (Zero-Allocation Hot Path)
 ```zig
 pub const OrderPool = struct {
     orders: []align(64) Order,  // Cache-aligned array
     free_list: []u32,           // Indices of free slots
     free_count: i32,            // Stack pointer
-    
+
     pub fn acquire(self: *Self) ?*Order {
         if (self.free_count <= 0) return null;
         self.free_count -= 1;
         const idx = self.free_list[@intCast(self.free_count)];
         return &self.orders[idx];
     }
-    
+
     pub fn release(self: *Self, order: *Order) void {
-        const idx = (order - self.orders.ptr) / @sizeOf(Order);
-        self.free_list[@intCast(self.free_count)] = idx;
+        const idx = (@intFromPtr(order) - @intFromPtr(self.orders.ptr)) / @sizeOf(Order);
+        self.free_list[@intCast(self.free_count)] = @intCast(idx);
         self.free_count += 1;
     }
 };
@@ -147,11 +172,11 @@ pub const OrderMap = struct {
     slots: [ORDER_MAP_SIZE]OrderMapSlot,  // 262,144 slots
     count: u32,
     tombstone_count: u32,
-    
+
     // Power-of-2 size for fast modulo via bitmask
     const ORDER_MAP_SIZE = 262144;
     const ORDER_MAP_MASK = ORDER_MAP_SIZE - 1;
-    
+
     inline fn hash(key: u64) u32 {
         const GOLDEN_RATIO: u64 = 0x9E3779B97F4A7C15;
         var k = key;
@@ -188,19 +213,19 @@ Order Book (single symbol)
 
 ## Protocol Layer
 
-### Magic Byte Detection
+### Protocol Detection
 ```zig
 pub fn detectProtocol(data: []const u8) Protocol {
     if (data.len == 0) return .unknown;
-    
+
     const first = data[0];
-    
+
     if (first == 0x4D) return .binary;  // 'M' magic byte
     if (first == '8') {
         if (std.mem.startsWith(u8, data, "8=FIX")) return .fix;
     }
     if (first == 'N' or first == 'C' or first == 'F') return .csv;
-    
+
     return .unknown;
 }
 ```
@@ -214,6 +239,12 @@ New Order (27 bytes):
 │Magic │ Type │ user_id  │  symbol  │ price │ qty │ side │ order_id │
 │ 0x4D │ 'N'  │ 4 bytes  │ 8 bytes  │  4B   │ 4B  │  1B  │  4 bytes │
 └──────┴──────┴──────────┴──────────┴───────┴─────┴──────┴──────────┘
+
+Trade (34 bytes):
+┌──────┬──────┬──────────┬─────────┬─────────┬──────────┬──────────┬───────┬─────┐
+│Magic │ Type │  symbol  │ buy_uid │ buy_oid │ sell_uid │ sell_oid │ price │ qty │
+│ 0x4D │ 'T'  │ 8 bytes  │   4B    │   4B    │    4B    │    4B    │  4B   │ 4B  │
+└──────┴──────┴──────────┴─────────┴─────────┴──────────┴──────────┴───────┴─────┘
 ```
 
 ### TCP Framing
@@ -248,50 +279,25 @@ New Order (27 bytes):
     ┌──────┴──────┐     ┌───────┴───────┐    ┌──────┴──────┐
     │ TCP Server  │     │  UDP Server   │    │  Multicast  │
     │ (Framed)    │     │ (Bidirectional)│   │ (Broadcast) │
-    │ Port 9000   │     │  Port 9001    │    │ 239.255.0.1 │
+    │ Port 1234   │     │  Port 1235    │    │ 239.255.0.1 │
     └─────────────┘     └───────────────┘    └─────────────┘
 ```
 
-### TCP Server (Multi-Client, Epoll)
-```zig
-pub const TcpServer = struct {
-    listen_fd: posix.fd_t,
-    epoll_fd: posix.fd_t,
-    clients: [MAX_CLIENTS]TcpClient,
-    
-    // Edge-triggered epoll for efficiency
-    pub fn poll(self: *Self, timeout_ms: i32) !usize {
-        const n = posix.epoll_wait(self.epoll_fd, &events, timeout_ms);
-        
-        for (events[0..n]) |ev| {
-            if (ev.data.fd == self.listen_fd) {
-                self.acceptConnection();
-            } else {
-                self.handleClientEvent(ev);
-            }
-        }
-    }
-};
-```
+### TCP Server Components
 
-### UDP Server (Bidirectional)
-```zig
-pub const UdpServer = struct {
-    fd: posix.fd_t,
-    clients: UdpClientMap,  // Tracks client addresses for responses
-    
-    pub fn poll(self: *Self) !usize {
-        // Receive with address capture
-        const n = posix.recvfrom(self.fd, &buf, 0, &addr, &addr_len);
-        
-        // Track client for response routing
-        const client_id = self.clients.getOrCreate(addr);
-        
-        // Process and respond to same address
-        self.processPacket(buf[0..n], client_id);
-    }
-};
-```
+The TCP server is split into two components for testability:
+
+**TcpClient** (per-connection state):
+- Receive/send buffers (64KB each)
+- Frame extraction with length-prefix parsing
+- Connection state (disconnected, connected, draining)
+- Per-client statistics
+
+**TcpServer** (orchestration):
+- Epoll-based event loop (edge-triggered)
+- Client pool management
+- Message routing to engine
+- Response dispatching
 
 ### Client ID Scheme
 ```zig
@@ -315,6 +321,56 @@ pub fn isUdpClient(client_id: u32) bool {
 
 ---
 
+## Threading Model
+
+### Bounded Channel with Backoff
+```zig
+pub const RecvResult(T) = union(enum) {
+    message: T,
+    empty,
+    closed,
+};
+
+pub fn recvTimeout(self: *Self, timeout_ns: u64) RecvResult(T) {
+    var elapsed: u64 = 0;
+    var sleep_ns: u64 = MIN_SLEEP_NS;
+
+    while (elapsed < timeout_ns) {
+        if (self.queue.pop()) |msg| {
+            return .{ .message = msg };
+        }
+
+        if (self.closed.load(.acquire)) {
+            return .closed;
+        }
+
+        // Exponential backoff
+        std.time.sleep(sleep_ns);
+        elapsed += sleep_ns;
+        sleep_ns = @min(sleep_ns * 2, MAX_SLEEP_NS);
+    }
+
+    return .empty;
+}
+```
+
+### Graceful Shutdown
+```zig
+// Signal shutdown
+channel.close();
+
+// Drain remaining messages
+while (true) {
+    switch (channel.recv()) {
+        .message => |msg| processMessage(msg),
+        .closed => break,
+        .empty => break,
+    }
+}
+```
+
+---
+
 ## Matching Algorithm
 
 ### Price-Time Priority (FIFO)
@@ -335,33 +391,34 @@ Incoming BUY @ 100:
 fn matchOrder(self: *Self, incoming: *Order, output: *OutputBuffer) void {
     const opposite_side = incoming.side.opposite();
     var iterations: usize = 0;
-    
+
     while (!incoming.isFilled() and iterations < MAX_MATCH_ITERATIONS) {
         const best_level = self.getBestLevel(opposite_side) orelse break;
-        
+
         // Check price crossing
-        if (!incoming.pricesCross(best_level.price)) break;
-        
+        if (!incoming.side.wouldCross(incoming.price, best_level.price)) break;
+
         // Match against orders at this level (FIFO)
         var resting = best_level.orders_head;
-        while (resting) |order| {
+        while (resting) |order| : (iterations += 1) {
+            if (iterations >= MAX_MATCH_ITERATIONS) break;
+
             const fill_qty = @min(incoming.remaining_qty, order.remaining_qty);
-            
+
             // Execute fill
             _ = incoming.fill(fill_qty);
             _ = order.fill(fill_qty);
-            
+
             // Emit trade
             output.add(makeTrade(...));
-            
+
             // Remove filled orders
             if (order.isFilled()) {
                 best_level.removeOrder(order);
                 self.pools.release(order);
             }
-            
+
             resting = order.next;
-            iterations += 1;
         }
     }
 }

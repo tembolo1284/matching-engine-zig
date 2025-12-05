@@ -4,14 +4,14 @@ Get the Zig Matching Engine running in under 5 minutes.
 
 ## Prerequisites
 
-- Zig 0.11.0 or later (`zig version` to check)
+- Zig 0.13.0 or later (`zig version` to check)
 - netcat (`nc`) for testing
 - Optional: Docker for containerized deployment
 
 ## 1. Build
 ```bash
 # Clone and enter directory
-cd zig_matching_engine
+cd matching-engine-zig
 
 # Build (debug)
 zig build
@@ -31,14 +31,16 @@ zig build run
 
 You should see:
 ```
-info: TCP server listening on 0.0.0.0:9000 (framing=true)
-info: UDP server listening on 0.0.0.0:9001
-info: Multicast publisher started: 239.255.0.1:9002 (TTL=1)
-info: Zig Matching Engine Ready
-info:   TCP: 0.0.0.0:9000 (4-byte length framing)
-info:   UDP: 0.0.0.0:9001 (bidirectional)
-info:   Multicast: 239.255.0.1:9002
-info:   Binary magic: 0x4D ('M'), Network byte order
+╔════════════════════════════════════════════╗
+║     Zig Matching Engine v0.1.0             ║
+╠════════════════════════════════════════════╣
+║  TCP:       0.0.0.0:1234                   ║
+║  UDP:       0.0.0.0:1235                   ║
+║  Multicast: 239.255.0.1:1236               ║
+║  Mode:      Single-Threaded                ║
+╚════════════════════════════════════════════╝
+
+Press Ctrl+C to shutdown gracefully
 ```
 
 ## 3. Send Test Orders (UDP - Easiest)
@@ -46,7 +48,7 @@ info:   Binary magic: 0x4D ('M'), Network byte order
 UDP requires no framing, perfect for quick testing:
 ```bash
 # Terminal 2: Send a buy order
-echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
+echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
 ```
 
 **Message breakdown:**
@@ -61,10 +63,10 @@ echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
 ## 4. Create a Trade
 ```bash
 # Send buy order
-echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
+echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
 
 # Send matching sell order
-echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost 9001
+echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost 1235
 ```
 
 **Expected server output:**
@@ -78,7 +80,7 @@ B, IBM, B, 10000, 50   # Top of book: 50 shares remaining
 
 ## 5. Cancel an Order
 ```bash
-echo "C, 1, 1" | nc -u -w1 localhost 9001
+echo "C, 1, 1" | nc -u -w1 localhost 1235
 ```
 
 **Output:**
@@ -89,7 +91,7 @@ B, IBM, B, -, -        # Book now empty on bid side
 
 ## 6. Flush All Orders
 ```bash
-echo "F" | nc -u -w1 localhost 9001
+echo "F" | nc -u -w1 localhost 1235
 ```
 
 ---
@@ -108,7 +110,7 @@ def send_order(sock, message):
     # 4-byte big-endian length prefix
     frame = struct.pack('>I', len(data)) + data
     sock.sendall(frame)
-    
+
     # Read response
     header = sock.recv(4)
     if len(header) == 4:
@@ -118,7 +120,7 @@ def send_order(sock, message):
 
 # Connect
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('localhost', 9000))
+sock.connect(('localhost', 1234))
 
 # Send orders
 send_order(sock, "N, 1, IBM, 10000, 100, B, 1\n")
@@ -148,7 +150,7 @@ def create_new_order(user_id, symbol, price, qty, side, order_id):
     magic = 0x4D
     msg_type = ord('N')
     symbol_bytes = symbol.encode('ascii').ljust(8, b'\0')
-    
+
     # Pack in network byte order (big-endian)
     return struct.pack(
         '>BB I 8s I I B I',
@@ -164,11 +166,15 @@ def create_new_order(user_id, symbol, price, qty, side, order_id):
 # UDP - no framing
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 msg = create_new_order(1, "IBM", 10000, 100, 'B', 1)
-sock.sendto(msg, ('localhost', 9001))
+sock.sendto(msg, ('localhost', 1235))
 
 # Receive response
-data, addr = sock.recvfrom(1024)
-print(f"Response ({len(data)} bytes): {data.hex()}")
+sock.settimeout(1.0)
+try:
+    data, addr = sock.recvfrom(1024)
+    print(f"Response ({len(data)} bytes): {data.hex()}")
+except socket.timeout:
+    print("No response (check server output)")
 ```
 
 ---
@@ -183,7 +189,7 @@ import socket
 import struct
 
 MCAST_GROUP = '239.255.0.1'
-MCAST_PORT = 9002
+MCAST_PORT = 1236
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -201,6 +207,29 @@ while True:
         print(f"Binary: {data.hex()}")
     else:
         print(f"CSV: {data.decode('utf-8').strip()}")
+```
+
+---
+
+## Using Make
+```bash
+# Build and run
+make run
+
+# Run in threaded mode
+make run-threaded
+
+# Run tests
+make test
+
+# Send test order (server must be running)
+make send-udp
+
+# Send sequence of orders
+make send-orders
+
+# See all targets
+make help
 ```
 
 ---
@@ -230,7 +259,7 @@ zig build run
 docker build -t zig-matching-engine .
 
 # Run container
-docker run -p 9000:9000 -p 9001:9001/udp zig-matching-engine
+docker run -p 1234:1234 -p 1235:1235/udp zig-matching-engine
 
 # Test from host
 echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
@@ -243,12 +272,12 @@ echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
 ### "Address already in use"
 ```bash
 # Find and kill existing process
-lsof -i :9000
+lsof -i :1234
 kill <PID>
 ```
 
 ### UDP messages not received
-- Check firewall: `sudo ufw allow 9001/udp`
+- Check firewall: `sudo ufw allow 1235/udp`
 - Ensure netcat uses UDP: `nc -u` flag
 
 ### Multicast not working
@@ -266,6 +295,6 @@ kill <PID>
 ## Next Steps
 
 1. Read [ARCHITECTURE.md](ARCHITECTURE.md) for system design details
-2. Review protocol spec in [docs/PROTOCOL.md](docs/PROTOCOL.md)
-3. Run benchmarks: `zig build bench`
-4. Deploy with Docker: see [Dockerfile](Dockerfile)
+2. Run benchmarks: `make bench`
+3. Deploy with Docker: see [DOCKER.md](DOCKER.md)
+4. Try threaded mode: `make run-threaded`

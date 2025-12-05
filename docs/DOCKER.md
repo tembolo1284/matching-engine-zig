@@ -68,14 +68,24 @@ docker run -d \
   zig-matching-engine
 ```
 
+### Run in Threaded Mode
+```bash
+docker run -d \
+  --name matching-engine \
+  -p 1234:1234 \
+  -p 1235:1235/udp \
+  -e ENGINE_THREADED=true \
+  zig-matching-engine
+```
+
 ### Run with Custom Ports
 ```bash
 docker run -d \
   --name matching-engine \
-  -p 8000:9000 \
-  -p 8001:9001/udp \
-  -e ENGINE_TCP_PORT=1234 \
-  -e ENGINE_UDP_PORT=1235 \
+  -p 8000:8000 \
+  -p 8001:8001/udp \
+  -e ENGINE_TCP_PORT=8000 \
+  -e ENGINE_UDP_PORT=8001 \
   zig-matching-engine
 ```
 
@@ -118,22 +128,13 @@ docker run -it --rm \
   zig-matching-engine
 ```
 
-### Run with Volume (for Logs)
-```bash
-docker run -d \
-  --name matching-engine \
-  -p 1234:1234 \
-  -p 1235:1235/udp \
-  -v $(pwd)/logs:/var/log/engine \
-  zig-matching-engine
-```
-
 ---
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `ENGINE_THREADED` | `false` | Enable dual-processor mode |
 | `ENGINE_TCP_ENABLED` | `true` | Enable TCP transport |
 | `ENGINE_TCP_ADDR` | `0.0.0.0` | TCP bind address |
 | `ENGINE_TCP_PORT` | `1234` | TCP port |
@@ -158,7 +159,7 @@ docker run -d \
   -e ENGINE_MCAST_ENABLED=true \
   -e ENGINE_MCAST_GROUP=239.255.0.1 \
   -e ENGINE_MCAST_PORT=1236 \
-  -e ENGINE_MCAST_TTL=1 \
+  -e ENGINE_THREADED=true \
   zig-matching-engine
 ```
 
@@ -167,11 +168,7 @@ docker run -d \
 ## Docker Compose
 
 ### Basic Setup
-
-Create `docker-compose.yml`:
 ```yaml
-version: '3.8'
-
 services:
   matching-engine:
     build: .
@@ -190,22 +187,20 @@ services:
 ### Run with Docker Compose
 ```bash
 # Start
-docker-compose up -d
+docker compose up -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 
 # Stop
-docker-compose down
+docker compose down
 
 # Rebuild and start
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
 ### With Multicast (Host Network)
 ```yaml
-version: '3.8'
-
 services:
   matching-engine:
     build: .
@@ -216,30 +211,6 @@ services:
       - ENGINE_MCAST_ENABLED=true
       - ENGINE_MCAST_GROUP=239.255.0.1
     restart: unless-stopped
-```
-
-### Multiple Instances (Different Symbols)
-```yaml
-version: '3.8'
-
-services:
-  engine-az:
-    build: .
-    container_name: engine-az
-    ports:
-      - "1234:1234"
-      - "1235:1235/udp"
-    environment:
-      - ENGINE_SYMBOL_RANGE=A-M
-    
-  engine-nz:
-    build: .
-    container_name: engine-nz
-    ports:
-      - "9100:1234"
-      - "9101:1235/udp"
-    environment:
-      - ENGINE_SYMBOL_RANGE=N-Z
 ```
 
 ---
@@ -276,7 +247,6 @@ echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
 ```bash
 python3 -c "
 import socket, struct
-
 # Create binary new order
 magic = 0x4D
 msg_type = ord('N')
@@ -372,7 +342,7 @@ lsof -i :1234
 netstat -tlnp | grep 1234
 
 # Kill the process or use different port
-docker run -p 9100:1234 zig-matching-engine
+docker run -p 8000:1234 zig-matching-engine
 ```
 
 ### UDP Not Working
@@ -381,7 +351,7 @@ docker run -p 9100:1234 zig-matching-engine
 docker port matching-engine
 
 # Test from inside container
-docker exec -it matching-engine sh -c "nc -u -l 1235"
+docker exec -it matching-engine sh -c "echo test | nc -u localhost 1235"
 ```
 
 ### Multicast Not Working
@@ -446,8 +416,9 @@ docker push myregistry/matching-engine:latest
 | Task | Command |
 |------|---------|
 | Build | `docker build -t zig-matching-engine .` |
-| Run (all transports) | `docker run -d -p 1234:1234 -p 1235:1235/udp zig-matching-engine` |
-| Run (with multicast) | `docker run -d --network host zig-matching-engine` |
+| Run | `docker run -d -p 1234:1234 -p 1235:1235/udp zig-matching-engine` |
+| Run (threaded) | `docker run -d -e ENGINE_THREADED=true -p 1234:1234 -p 1235:1235/udp zig-matching-engine` |
+| Run (multicast) | `docker run -d --network host zig-matching-engine` |
 | View logs | `docker logs -f matching-engine` |
 | Stop | `docker stop matching-engine` |
 | Remove | `docker rm matching-engine` |

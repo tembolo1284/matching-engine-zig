@@ -1,4 +1,36 @@
-//! TCP server with 4-byte length-prefix framing.
+//! TCP server with epoll I/O multiplexing.
+//!
+//! Orchestrates:
+//! - Listening socket and connection acceptance
+//! - Epoll event loop for non-blocking I/O
+//! - Client lifecycle management
+//! - Message dispatch via callbacks
+//!
+//! Architecture:
+//! ```
+//!   ┌─────────────────────────────────────────────┐
+//!   │              TcpServer                       │
+//!   │  ┌─────────────────────────────────────┐   │
+//!   │  │         Listen Socket               │   │
+//!   │  └──────────────┬──────────────────────┘   │
+//!   │                 │ accept()                  │
+//!   │  ┌──────────────▼──────────────────────┐   │
+//!   │  │          Epoll FD                   │   │
+//!   │  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │   │
+//!   │  │  │ C0  │ │ C1  │ │ C2  │ │ ... │   │   │
+//!   │  │  └─────┘ └─────┘ └─────┘ └─────┘   │   │
+//!   │  └─────────────────────────────────────┘   │
+//!   │                 │                           │
+//!   │  ┌──────────────▼──────────────────────┐   │
+//!   │  │        ClientPool                   │   │
+//!   │  │  TcpClient[0..MAX_CLIENTS]          │   │
+//!   │  └─────────────────────────────────────┘   │
+//!   └─────────────────────────────────────────────┘
+//! ```
+//!
+//! Thread Safety:
+//! - NOT thread-safe. Use from single I/O thread only.
+//! - Callbacks invoked synchronously during poll().
 
 const std = @import("std");
 const posix = std.posix;
@@ -6,445 +38,611 @@ const linux = std.os.linux;
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
 const config = @import("config.zig");
+const net_utils = @import("net_utils.zig");
+const tcp_client = @import("tcp_client.zig");
 
-const MAX_CLIENTS = 1024;
-const RECV_BUFFER_SIZE = 65536;
-const SEND_BUFFER_SIZE = 65536;
-const MAX_EVENTS = 64;
-const FRAME_HEADER_SIZE = 4;
-const MAX_MESSAGE_SIZE = 16384;
+pub const TcpClient = tcp_client.TcpClient;
+pub const ClientState = tcp_client.ClientState;
+pub const ClientStats = tcp_client.ClientStats;
 
-pub const ClientState = enum {
-    disconnected,
-    connected,
-    draining,
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Maximum concurrent clients.
+pub const MAX_CLIENTS: u32 = 1024;
+
+/// Maximum epoll events per poll cycle.
+const MAX_EVENTS: u32 = 64;
+
+/// Listen backlog size.
+const LISTEN_BACKLOG: u31 = 128;
+
+// ============================================================================
+// Callback Types
+// ============================================================================
+
+/// Callback invoked when a complete message is received.
+pub const MessageCallback = *const fn (
+    client_id: config.ClientId,
+    message: *const msg.InputMsg,
+    ctx: ?*anyopaque,
+) void;
+
+/// Callback invoked when a client disconnects.
+pub const DisconnectCallback = *const fn (
+    client_id: config.ClientId,
+    ctx: ?*anyopaque,
+) void;
+
+// ============================================================================
+// Server Statistics
+// ============================================================================
+
+/// Server-wide statistics.
+pub const ServerStats = struct {
+    /// Currently connected clients.
+    current_clients: u32,
+    /// Total connections since start.
+    total_connections: u64,
+    /// Total disconnections since start.
+    total_disconnections: u64,
+    /// Total inbound messages.
+    total_messages_in: u64,
+    /// Total outbound messages.
+    total_messages_out: u64,
+    /// Total bytes received.
+    total_bytes_in: u64,
+    /// Total bytes sent.
+    total_bytes_out: u64,
+    /// Accept errors.
+    accept_errors: u64,
+    /// Decode errors.
+    decode_errors: u64,
 };
 
-pub const TcpClient = struct {
-    fd: posix.fd_t = -1,
-    client_id: config.ClientId = 0,
-    state: ClientState = .disconnected,
+// ============================================================================
+// TCP Server
+// ============================================================================
 
-    recv_buf: [RECV_BUFFER_SIZE]u8 = undefined,
-    recv_len: usize = 0,
-
-    send_buf: [SEND_BUFFER_SIZE]u8 = undefined,
-    send_len: usize = 0,
-    send_pos: usize = 0,
-
-    protocol: codec.Protocol = .unknown,
-
-    messages_received: u64 = 0,
-    messages_sent: u64 = 0,
-    bytes_received: u64 = 0,
-    bytes_sent: u64 = 0,
-
-    const Self = @This();
-
-    pub fn reset(self: *Self) void {
-        if (self.fd >= 0) {
-            posix.close(self.fd);
-        }
-        self.* = .{};
-    }
-
-    pub fn queueFramedSend(self: *Self, data: []const u8) bool {
-        const frame_size = FRAME_HEADER_SIZE + data.len;
-        const available = SEND_BUFFER_SIZE - self.send_len;
-        if (frame_size > available) return false;
-
-        const len_bytes = self.send_buf[self.send_len..][0..4];
-        std.mem.writeInt(u32, len_bytes, @intCast(data.len), .big);
-        self.send_len += 4;
-
-        @memcpy(self.send_buf[self.send_len..][0..data.len], data);
-        self.send_len += data.len;
-
-        return true;
-    }
-
-    pub fn queueSend(self: *Self, data: []const u8) bool {
-        const available = SEND_BUFFER_SIZE - self.send_len;
-        if (data.len > available) return false;
-
-        @memcpy(self.send_buf[self.send_len..][0..data.len], data);
-        self.send_len += data.len;
-        return true;
-    }
-
-    pub fn flushSend(self: *Self) !void {
-        while (self.send_pos < self.send_len) {
-            const sent = posix.send(self.fd, self.send_buf[self.send_pos..self.send_len], 0) catch |err| {
-                if (err == error.WouldBlock) return;
-                return err;
-            };
-            self.send_pos += sent;
-            self.bytes_sent += sent;
-        }
-
-        if (self.send_pos == self.send_len) {
-            self.send_pos = 0;
-            self.send_len = 0;
-        }
-    }
-
-    pub fn hasPendingSend(self: *const Self) bool {
-        return self.send_pos < self.send_len;
-    }
-
-    pub fn extractFrame(self: *Self) ?[]const u8 {
-        if (self.recv_len < FRAME_HEADER_SIZE) return null;
-
-        const msg_len = std.mem.readInt(u32, self.recv_buf[0..4], .big);
-        if (msg_len > MAX_MESSAGE_SIZE) {
-            self.compactBuffer(FRAME_HEADER_SIZE);
-            return null;
-        }
-
-        const total_len = FRAME_HEADER_SIZE + msg_len;
-        if (self.recv_len < total_len) return null;
-
-        return self.recv_buf[FRAME_HEADER_SIZE..total_len];
-    }
-
-    pub fn compactBuffer(self: *Self, bytes: usize) void {
-        if (bytes >= self.recv_len) {
-            self.recv_len = 0;
-            return;
-        }
-
-        const remaining = self.recv_len - bytes;
-        std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[bytes..self.recv_len]);
-        self.recv_len = remaining;
-    }
-};
-
+/// TCP server with epoll-based event loop.
 pub const TcpServer = struct {
-    listen_fd: posix.fd_t = -1,
-    epoll_fd: posix.fd_t = -1,
+    // === Sockets ===
+    /// Listening socket (null if not started).
+    listen_fd: ?posix.fd_t = null,
 
-    clients: [MAX_CLIENTS]TcpClient = [_]TcpClient{.{}} ** MAX_CLIENTS,
-    client_count: usize = 0,
+    /// Epoll instance (null if not started).
+    epoll_fd: ?posix.fd_t = null,
+
+    // === Clients ===
+    /// Pre-allocated client pool.
+    clients: tcp_client.ClientPool(MAX_CLIENTS) = .{},
+
+    /// Next client ID to assign.
     next_client_id: config.ClientId = 1,
 
-    on_message: ?*const fn (client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void = null,
-    on_disconnect: ?*const fn (client_id: config.ClientId, ctx: ?*anyopaque) void = null,
+    // === Callbacks ===
+    /// Message received callback.
+    on_message: ?MessageCallback = null,
+
+    /// Client disconnected callback.
+    on_disconnect: ?DisconnectCallback = null,
+
+    /// Callback context pointer.
     callback_ctx: ?*anyopaque = null,
 
-    total_connections: u64 = 0,
-    total_disconnections: u64 = 0,
-
+    // === Options ===
+    /// Whether to use length-prefix framing.
     use_framing: bool = true,
 
+    // === Statistics ===
+    total_connections: u64 = 0,
+    total_disconnections: u64 = 0,
+    accept_errors: u64 = 0,
+    decode_errors: u64 = 0,
+
+    // === Allocator ===
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
+    // ========================================================================
+    // Lifecycle
+    // ========================================================================
+
+    /// Initialize server (not yet listening).
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{ .allocator = allocator };
     }
 
+    /// Cleanup all resources.
     pub fn deinit(self: *Self) void {
         self.stop();
     }
 
+    /// Start listening on address:port.
     pub fn start(self: *Self, address: []const u8, port: u16) !void {
-        self.listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(self.listen_fd);
+        std.debug.assert(self.listen_fd == null);
+        std.debug.assert(self.epoll_fd == null);
 
-        try posix.setsockopt(self.listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        // Create listening socket
+        const listen_fd = try posix.socket(
+            posix.AF.INET,
+            posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+            0,
+        );
+        errdefer posix.close(listen_fd);
 
-        var addr = try parseAddress(address, port);
-        const addr_ptr: *const posix.sockaddr = @ptrCast(&addr);
-        try posix.bind(self.listen_fd, addr_ptr, @sizeOf(@TypeOf(addr)));
-        try posix.listen(self.listen_fd, 128);
+        // Set socket options
+        try net_utils.setReuseAddr(listen_fd);
 
-        self.epoll_fd = try posix.epoll_create1(0);
-        errdefer posix.close(self.epoll_fd);
+        // Bind to address
+        const addr = try net_utils.parseSockAddr(address, port);
+        try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
 
+        // Start listening
+        try posix.listen(listen_fd, LISTEN_BACKLOG);
+
+        // Create epoll instance
+        const epoll_fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
+        errdefer posix.close(epoll_fd);
+
+        // Add listen socket to epoll
         var ev = linux.epoll_event{
             .events = linux.EPOLL.IN,
-            .data = .{ .fd = self.listen_fd },
+            .data = .{ .fd = listen_fd },
         };
-        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, self.listen_fd, &ev);
+        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &ev);
 
-        std.log.info("TCP server listening on {s}:{} (framing={})", .{ address, port, self.use_framing });
+        self.listen_fd = listen_fd;
+        self.epoll_fd = epoll_fd;
+
+        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={})", .{
+            address,
+            port,
+            self.use_framing,
+            MAX_CLIENTS,
+        });
     }
 
+    /// Stop server and disconnect all clients.
     pub fn stop(self: *Self) void {
-        for (&self.clients) |*client| {
-            if (client.state != .disconnected) {
-                client.reset();
-            }
-        }
-        self.client_count = 0;
-
-        if (self.epoll_fd >= 0) {
-            posix.close(self.epoll_fd);
-            self.epoll_fd = -1;
+        // Disconnect all clients
+        var iter = self.clients.getActive();
+        while (iter.next()) |client| {
+            self.disconnectClientInternal(client, false);
         }
 
-        if (self.listen_fd >= 0) {
-            posix.close(self.listen_fd);
-            self.listen_fd = -1;
+        // Close epoll
+        if (self.epoll_fd) |fd| {
+            posix.close(fd);
+            self.epoll_fd = null;
         }
+
+        // Close listen socket
+        if (self.listen_fd) |fd| {
+            posix.close(fd);
+            self.listen_fd = null;
+        }
+
+        std.log.info("TCP server stopped (total connections: {})", .{self.total_connections});
     }
 
-    pub fn poll(self: *Self, timeout_ms: i32) !usize {
-        var events: [MAX_EVENTS]linux.epoll_event = undefined;
+    /// Check if server is running.
+    pub fn isRunning(self: *const Self) bool {
+        return self.listen_fd != null and self.epoll_fd != null;
+    }
 
-        const n = posix.epoll_wait(self.epoll_fd, &events, timeout_ms);
+    // ========================================================================
+    // Event Loop
+    // ========================================================================
+
+    /// Poll for events with timeout.
+    /// Returns number of events processed.
+    pub fn poll(self: *Self, timeout_ms: i32) !usize {
+        const epoll_fd = self.epoll_fd orelse return error.NotStarted;
+        const listen_fd = self.listen_fd orelse return error.NotStarted;
+
+        var events: [MAX_EVENTS]linux.epoll_event = undefined;
+        const n = posix.epoll_wait(epoll_fd, &events, timeout_ms);
+
+        var processed: usize = 0;
 
         for (events[0..n]) |ev| {
-            if (ev.data.fd == self.listen_fd) {
-                self.acceptConnection() catch |err| {
-                    std.log.warn("Accept failed: {}", .{err});
-                };
+            if (ev.data.fd == listen_fd) {
+                // New connection(s) pending
+                self.acceptConnections();
+                processed += 1;
             } else {
-                const client_idx = self.findClientByFd(ev.data.fd) orelse continue;
-                const client = &self.clients[client_idx];
-
-                if (ev.events & linux.EPOLL.IN != 0) {
-                    self.handleClientRead(client) catch |err| {
-                        std.log.debug("Client {} read error: {}", .{ client.client_id, err });
-                        self.disconnectClient(client);
-                    };
-                }
-
-                if (ev.events & linux.EPOLL.OUT != 0) {
-                    client.flushSend() catch |err| {
-                        std.log.debug("Client {} write error: {}", .{ client.client_id, err });
-                        self.disconnectClient(client);
-                    };
-
-                    if (!client.hasPendingSend()) {
-                        self.updateClientEpoll(client, false) catch {};
-                    }
-                }
-
-                if (ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
-                    self.disconnectClient(client);
+                // Client event
+                if (self.clients.findByFd(ev.data.fd)) |client| {
+                    self.handleClientEvent(client, ev.events);
+                    processed += 1;
                 }
             }
         }
 
-        return n;
+        return processed;
     }
 
-    pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
-        const client = self.findClientById(client_id) orelse return false;
+    /// Accept all pending connections.
+    fn acceptConnections(self: *Self) void {
+        const listen_fd = self.listen_fd orelse return;
 
-        const success = if (self.use_framing)
-            client.queueFramedSend(data)
-        else
-            client.queueSend(data);
+        // Accept in loop (edge-triggered)
+        while (true) {
+            self.acceptOne(listen_fd) catch |err| {
+                if (err == error.WouldBlock) break;
 
-        if (!success) return false;
+                self.accept_errors += 1;
+                std.log.warn("Accept error: {}", .{err});
 
-        client.messages_sent += 1;
-        self.updateClientEpoll(client, true) catch return false;
-
-        return true;
-    }
-
-    pub fn broadcast(self: *Self, data: []const u8) void {
-        for (&self.clients) |*client| {
-            if (client.state == .connected) {
-                if (self.use_framing) {
-                    _ = client.queueFramedSend(data);
-                } else {
-                    _ = client.queueSend(data);
+                // For transient errors, continue trying
+                if (err != error.SystemResources and
+                    err != error.ProcessFdQuotaExceeded)
+                {
+                    break;
                 }
-                self.updateClientEpoll(client, true) catch {};
-            }
+            };
         }
     }
 
-    fn acceptConnection(self: *Self) !void {
-        var addr: posix.sockaddr.in = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+    /// Accept a single connection.
+    fn acceptOne(self: *Self, listen_fd: posix.fd_t) !void {
+        const epoll_fd = self.epoll_fd orelse return error.NotStarted;
 
-        const addr_ptr: *posix.sockaddr = @ptrCast(&addr);
-        const client_fd = try posix.accept(self.listen_fd, addr_ptr, &addr_len, posix.SOCK.NONBLOCK);
+        var client_addr: posix.sockaddr.in = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(@TypeOf(client_addr));
+
+        const client_fd = try posix.accept(
+            listen_fd,
+            @ptrCast(&client_addr),
+            &addr_len,
+            posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+        );
         errdefer posix.close(client_fd);
 
-        const client = self.findFreeClientSlot() orelse {
-            std.log.warn("Max clients reached, rejecting connection", .{});
+        // Find free slot
+        const client = self.clients.allocate() orelse {
+            std.log.warn("Max clients ({}) reached, rejecting connection", .{MAX_CLIENTS});
             posix.close(client_fd);
             return;
         };
 
-        client.fd = client_fd;
-        client.client_id = self.next_client_id;
-        client.state = .connected;
-        self.next_client_id +%= 1;
-        if (self.next_client_id == 0) self.next_client_id = 1;
+        // Initialize client
+        const client_id = self.allocateClientId();
+        client.* = TcpClient.init(client_fd, client_id);
 
-        self.client_count += 1;
         self.total_connections += 1;
+        self.clients.active_count += 1;
 
-        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        // Set socket options for low latency
+        net_utils.setLowLatencyOptions(client_fd);
 
+        // Add to epoll (edge-triggered for efficiency)
         var ev = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET,
+            .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP,
             .data = .{ .fd = client_fd },
         };
-        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev);
+        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev);
 
-        std.log.info("Client {} connected (fd={})", .{ client.client_id, client_fd });
+        std.log.info("Client {} connected (fd={}, active={})", .{
+            client_id,
+            client_fd,
+            self.clients.active_count,
+        });
     }
 
-    fn handleClientRead(self: *Self, client: *TcpClient) !void {
-        while (true) {
-            const available = RECV_BUFFER_SIZE - client.recv_len;
-            if (available == 0) {
-                std.log.warn("Client {} buffer full", .{client.client_id});
-                return error.BufferFull;
-            }
+    /// Handle epoll event for a client.
+    fn handleClientEvent(self: *Self, client: *TcpClient, events: u32) void {
+        // Check for errors or hangup first
+        if (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP) != 0) {
+            self.disconnectClient(client);
+            return;
+        }
 
-            const n = posix.recv(client.fd, client.recv_buf[client.recv_len..], 0) catch |err| {
+        // Handle readable
+        if (events & linux.EPOLL.IN != 0) {
+            self.handleClientRead(client) catch |err| {
+                if (err != error.WouldBlock) {
+                    std.log.debug("Client {} read error: {}", .{ client.client_id, err });
+                    self.disconnectClient(client);
+                    return;
+                }
+            };
+        }
+
+        // Handle writable
+        if (events & linux.EPOLL.OUT != 0) {
+            client.flushSend() catch |err| {
+                std.log.debug("Client {} write error: {}", .{ client.client_id, err });
+                self.disconnectClient(client);
+                return;
+            };
+
+            // If send buffer drained, disable write events
+            if (!client.hasPendingSend()) {
+                self.updateClientEpoll(client, false) catch {};
+            }
+        }
+    }
+
+    /// Handle incoming data from client.
+    fn handleClientRead(self: *Self, client: *TcpClient) !void {
+        // Receive all available data (edge-triggered)
+        while (true) {
+            _ = client.receive() catch |err| {
                 if (err == error.WouldBlock) break;
                 return err;
             };
-
-            if (n == 0) return error.ConnectionClosed;
-
-            client.recv_len += n;
-            client.bytes_received += n;
         }
 
+        // Process received data
         if (self.use_framing) {
-            self.processClientFrames(client);
+            self.processFramedMessages(client);
         } else {
-            self.processClientRaw(client);
+            self.processRawMessages(client);
         }
     }
 
-    fn processClientFrames(self: *Self, client: *TcpClient) void {
+    /// Process length-prefixed framed messages.
+    fn processFramedMessages(self: *Self, client: *TcpClient) void {
         while (true) {
-            const payload = client.extractFrame() orelse break;
+            const frame_result = client.extractFrame();
 
-            if (client.protocol == .unknown) {
-                client.protocol = codec.detectProtocol(payload);
+            switch (frame_result) {
+                .frame => |payload| {
+                    // Auto-detect protocol on first message
+                    if (client.protocol == .unknown) {
+                        client.protocol = codec.detectProtocol(payload);
+                    }
+
+                    // Decode and dispatch
+                    self.decodeAndDispatch(client, payload);
+
+                    // Consume the frame
+                    client.consumeFrame(payload.len);
+                },
+
+                .incomplete, .empty => break,
+
+                .oversized => {
+                    // Already handled in extractFrame, continue processing
+                    continue;
+                },
             }
-
-            const result = codec.Codec.decodeInput(payload) catch |err| {
-                std.log.warn("Client {} decode error: {}", .{ client.client_id, err });
-                client.compactBuffer(FRAME_HEADER_SIZE + payload.len);
-                continue;
-            };
-
-            client.messages_received += 1;
-
-            if (self.on_message) |callback| {
-                callback(client.client_id, &result.message, self.callback_ctx);
-            }
-
-            client.compactBuffer(FRAME_HEADER_SIZE + payload.len);
         }
     }
 
-    fn processClientRaw(self: *Self, client: *TcpClient) void {
-        var processed: usize = 0;
+    /// Process raw (non-framed) messages.
+    fn processRawMessages(self: *Self, client: *TcpClient) void {
+        var processed: u32 = 0;
+        const data = client.getReceivedData();
 
-        while (processed < client.recv_len) {
-            const remaining = client.recv_buf[processed..client.recv_len];
+        while (processed < data.len) {
+            const remaining = data[processed..];
 
+            // Try protocol detection
             if (client.protocol == .unknown) {
                 client.protocol = codec.detectProtocol(remaining);
                 if (client.protocol == .unknown and remaining.len < 8) break;
             }
 
+            // Try to decode
             const result = codec.Codec.decodeInput(remaining) catch |err| {
                 if (err == codec.CodecError.IncompleteMessage) break;
-                std.log.warn("Client {} decode error: {}", .{ client.client_id, err });
-                processed += 1;
+
+                self.decode_errors += 1;
+                std.log.debug("Client {} decode error: {}", .{ client.client_id, err });
+                processed += 1; // Skip one byte and retry
                 continue;
             };
 
-            processed += result.bytes_consumed;
-            client.messages_received += 1;
-
+            // Dispatch message
             if (self.on_message) |callback| {
                 callback(client.client_id, &result.message, self.callback_ctx);
             }
+
+            client.stats.messages_received += 1;
+            processed += @intCast(result.bytes_consumed);
         }
 
+        // Compact buffer
         if (processed > 0) {
-            client.compactBuffer(processed);
+            client.compactRecvBuffer(processed);
         }
     }
 
-    fn disconnectClient(self: *Self, client: *TcpClient) void {
+    /// Decode payload and dispatch to callback.
+    fn decodeAndDispatch(self: *Self, client: *TcpClient, payload: []const u8) void {
+        const result = codec.Codec.decodeInput(payload) catch |err| {
+            self.decode_errors += 1;
+            std.log.debug("Client {} decode error: {}", .{ client.client_id, err });
+            return;
+        };
+
+        if (self.on_message) |callback| {
+            callback(client.client_id, &result.message, self.callback_ctx);
+        }
+    }
+
+    // ========================================================================
+    // Send Operations
+    // ========================================================================
+
+    /// Send data to specific client.
+    pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
+        std.debug.assert(config.isTcpClient(client_id));
+
+        const client = self.clients.findById(client_id) orelse return false;
+
+        const success = if (self.use_framing)
+            client.queueFramedSend(data)
+        else
+            client.queueRawSend(data);
+
+        if (!success) return false;
+
+        client.recordMessageSent();
+
+        // Enable write events to flush
+        self.updateClientEpoll(client, true) catch return false;
+
+        return true;
+    }
+
+    /// Broadcast data to all connected clients.
+    pub fn broadcast(self: *Self, data: []const u8) u32 {
+        var sent_count: u32 = 0;
+
+        var iter = self.clients.getActive();
+        while (iter.next()) |client| {
+            if (client.state != .connected) continue;
+
+            const success = if (self.use_framing)
+                client.queueFramedSend(data)
+            else
+                client.queueRawSend(data);
+
+            if (success) {
+                client.recordMessageSent();
+                sent_count += 1;
+                self.updateClientEpoll(client, true) catch {};
+            }
+        }
+
+        return sent_count;
+    }
+
+    // ========================================================================
+    // Client Management
+    // ========================================================================
+
+    /// Disconnect a client and invoke callback.
+    pub fn disconnectClient(self: *Self, client: *TcpClient) void {
+        self.disconnectClientInternal(client, true);
+    }
+
+    /// Internal disconnect implementation.
+    fn disconnectClientInternal(self: *Self, client: *TcpClient, invoke_callback: bool) void {
         if (client.state == .disconnected) return;
 
         const client_id = client.client_id;
-        std.log.info("Client {} disconnected", .{client_id});
+        const fd = client.fd;
 
-        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, client.fd, null) catch {};
+        std.log.info("Client {} disconnected (fd={})", .{ client_id, fd });
 
+        // Remove from epoll
+        if (self.epoll_fd) |epoll_fd| {
+            posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+        }
+
+        // Reset client slot
         client.reset();
-        self.client_count -|= 1;
+
+        std.debug.assert(self.clients.active_count > 0);
+        self.clients.active_count -= 1;
         self.total_disconnections += 1;
 
-        if (self.on_disconnect) |callback| {
-            callback(client_id, self.callback_ctx);
+        // Invoke callback
+        if (invoke_callback) {
+            if (self.on_disconnect) |callback| {
+                callback(client_id, self.callback_ctx);
+            }
         }
     }
 
+    /// Update epoll registration for client.
     fn updateClientEpoll(self: *Self, client: *TcpClient, want_write: bool) !void {
-        var events: u32 = linux.EPOLL.IN | linux.EPOLL.ET;
+        const epoll_fd = self.epoll_fd orelse return error.NotStarted;
+
+        var events: u32 = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP;
         if (want_write) events |= linux.EPOLL.OUT;
 
         var ev = linux.epoll_event{
             .events = events,
             .data = .{ .fd = client.fd },
         };
-        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, client.fd, &ev);
+
+        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, client.fd, &ev);
     }
 
-    fn findFreeClientSlot(self: *Self) ?*TcpClient {
-        for (&self.clients) |*client| {
-            if (client.state == .disconnected) return client;
+    /// Allocate next client ID.
+    fn allocateClientId(self: *Self) config.ClientId {
+        const id = self.next_client_id;
+
+        self.next_client_id +%= 1;
+
+        // Skip invalid IDs
+        if (self.next_client_id == 0 or
+            self.next_client_id >= config.CLIENT_ID_UDP_BASE)
+        {
+            self.next_client_id = 1;
         }
-        return null;
+
+        return id;
     }
 
-    fn findClientByFd(self: *Self, fd: posix.fd_t) ?usize {
-        for (self.clients, 0..) |client, i| {
-            if (client.fd == fd and client.state != .disconnected) return i;
-        }
-        return null;
+    // ========================================================================
+    // Statistics
+    // ========================================================================
+
+    /// Get server statistics.
+    pub fn getStats(self: *const Self) ServerStats {
+        const client_stats = self.clients.getAggregateStats();
+
+        return .{
+            .current_clients = self.clients.active_count,
+            .total_connections = self.total_connections,
+            .total_disconnections = self.total_disconnections,
+            .total_messages_in = client_stats.total_messages_in,
+            .total_messages_out = client_stats.total_messages_out,
+            .total_bytes_in = client_stats.total_bytes_in,
+            .total_bytes_out = client_stats.total_bytes_out,
+            .accept_errors = self.accept_errors,
+            .decode_errors = self.decode_errors,
+        };
     }
 
-    fn findClientById(self: *Self, client_id: config.ClientId) ?*TcpClient {
-        for (&self.clients) |*client| {
-            if (client.client_id == client_id and client.state != .disconnected) return client;
-        }
-        return null;
+    /// Get number of connected clients.
+    pub fn getClientCount(self: *const Self) u32 {
+        return self.clients.active_count;
     }
 };
 
-fn parseAddress(address: []const u8, port: u16) !posix.sockaddr.in {
-    var addr = posix.sockaddr.in{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = 0,
-    };
+// ============================================================================
+// Tests
+// ============================================================================
 
-    if (std.mem.eql(u8, address, "0.0.0.0")) {
-        addr.addr = 0;
-    } else {
-        var parts: [4]u8 = undefined;
-        var iter = std.mem.splitScalar(u8, address, '.');
-        var i: usize = 0;
-        while (iter.next()) |part| : (i += 1) {
-            if (i >= 4) return error.InvalidAddress;
-            parts[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
-        }
-        if (i != 4) return error.InvalidAddress;
-        addr.addr = @bitCast(parts);
-    }
+test "TcpServer initialization" {
+    var server = TcpServer.init(std.testing.allocator);
+    defer server.deinit();
 
-    return addr;
+    try std.testing.expect(!server.isRunning());
+    try std.testing.expectEqual(@as(u32, 0), server.getClientCount());
+}
+
+test "TcpServer client ID allocation" {
+    var server = TcpServer.init(std.testing.allocator);
+    defer server.deinit();
+
+    const id1 = server.allocateClientId();
+    const id2 = server.allocateClientId();
+    const id3 = server.allocateClientId();
+
+    try std.testing.expect(id1 != id2);
+    try std.testing.expect(id2 != id3);
+    try std.testing.expect(config.isTcpClient(id1));
+    try std.testing.expect(config.isTcpClient(id2));
+}
+
+test "TcpServer statistics initialization" {
+    var server = TcpServer.init(std.testing.allocator);
+    defer server.deinit();
+
+    const stats = server.getStats();
+
+    try std.testing.expectEqual(@as(u32, 0), stats.current_clients);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_connections);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_messages_in);
 }

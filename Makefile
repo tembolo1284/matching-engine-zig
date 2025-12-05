@@ -11,35 +11,62 @@
 #   make run          # Build and run (single-threaded)
 #   make run-threaded # Build and run (dual-processor)
 #   make test         # Run all tests
+#   make bench        # Run benchmarks
 #   make docker       # Build Docker image
 #   make clean        # Clean build artifacts
 #
 # =============================================================================
 
 .PHONY: all build release run test clean docker docker-run docker-stop help
+.DEFAULT_GOAL := all
 
-# Default target
-all: build
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+# Default ports (must match config.zig defaults)
+TCP_PORT ?= 1234
+UDP_PORT ?= 1235
+MCAST_PORT ?= 1236
+MCAST_GROUP ?= 239.255.0.1
+
+# Docker settings
+DOCKER_IMAGE := zig-matching-engine
+DOCKER_TAG := latest
+DOCKER_CONTAINER := matching-engine
+
+# Zig build output
+BUILD_DIR := zig-out
+BIN := $(BUILD_DIR)/bin/matching_engine
+BENCH_BIN := $(BUILD_DIR)/bin/benchmark
+CLIENT_BIN := $(BUILD_DIR)/bin/engine_client
 
 # -----------------------------------------------------------------------------
 # Build Targets
 # -----------------------------------------------------------------------------
 
+## Default: build debug version
+all: build
+
 ## Build debug version
 build:
 	zig build
 
-## Build release version (optimized)
+## Build release version (optimized for speed)
 release:
 	zig build -Doptimize=ReleaseFast
 
-## Build small release (size optimized)
+## Build with safety checks (optimized but safe)
+release-safe:
+	zig build -Doptimize=ReleaseSafe
+
+## Build small release (optimized for size)
 release-small:
 	zig build -Doptimize=ReleaseSmall
 
-## Build with safety checks (for testing)
-release-safe:
-	zig build -Doptimize=ReleaseSafe
+## Fast type-check without code generation
+check:
+	zig build check
 
 # -----------------------------------------------------------------------------
 # Run Targets
@@ -47,15 +74,11 @@ release-safe:
 
 ## Build and run server (single-threaded, debug)
 run: build
-	./zig-out/bin/matching_engine
+	$(BIN)
 
-## Build and run server (release)
+## Build and run server (release, single-threaded)
 run-release: release
-	./zig-out/bin/matching_engine
-
-## Run in single-threaded mode (default)
-run-single:
-	ENGINE_THREADED=false zig build run
+	$(BIN)
 
 ## Run in dual-processor threaded mode
 run-threaded:
@@ -63,7 +86,7 @@ run-threaded:
 
 ## Run threaded with release build
 run-threaded-release: release
-	ENGINE_THREADED=true ./zig-out/bin/matching_engine
+	ENGINE_THREADED=true $(BIN)
 
 ## Run with TCP only
 run-tcp:
@@ -73,76 +96,114 @@ run-tcp:
 run-udp:
 	ENGINE_TCP_ENABLED=false ENGINE_MCAST_ENABLED=false zig build run
 
-## Run with all transports (default)
-run-all:
-	zig build run
-
 ## Run with custom ports
 run-custom:
-	ENGINE_TCP_PORT=8000 ENGINE_UDP_PORT=8001 zig build run
+	ENGINE_TCP_PORT=$(TCP_PORT) ENGINE_UDP_PORT=$(UDP_PORT) zig build run
+
+## Show help
+run-help: build
+	$(BIN) --help
+
+## Show version
+run-version: build
+	$(BIN) --version
 
 # -----------------------------------------------------------------------------
-# Test Targets (Unit Tests)
+# Test Targets
 # -----------------------------------------------------------------------------
 
-## Run all tests
+## Run all unit tests
 test:
 	zig build test
 
-## Run tests with verbose output
-test-verbose:
-	zig build test -- --verbose
+## Run tests with summary
+test-summary:
+	zig build test 2>&1 | tail -20
 
-## Run specific test module - codec
-test-codec:
+## Run specific test file
+test-file:
+	@test -n "$(FILE)" || (echo "Usage: make test-file FILE=src/path/to/file.zig" && exit 1)
+	zig test $(FILE)
+
+# --- Protocol Tests ---
+test-protocol:
+	zig test src/protocol/message_types.zig
 	zig test src/protocol/codec.zig
-
-## Run specific test module - binary codec
-test-binary-codec:
 	zig test src/protocol/binary_codec.zig
-
-## Run specific test module - csv codec
-test-csv-codec:
 	zig test src/protocol/csv_codec.zig
 
-## Run specific test module - order
-test-order:
+# --- Core Tests ---
+test-core:
 	zig test src/core/order.zig
-
-## Run specific test module - order book
-test-book:
+	zig test src/core/memory_pool.zig
 	zig test src/core/order_book.zig
+	zig test src/core/matching_engine.zig
 
-## Run specific test module - spsc queue
-test-spsc:
+# --- Collections Tests ---
+test-collections:
 	zig test src/collections/spsc_queue.zig
+	zig test src/collections/bounded_channel.zig
 
-## Run specific test module - processor routing
-test-processor:
+# --- Transport Tests ---
+test-transport:
+	zig test src/transport/config.zig
+	zig test src/transport/net_utils.zig
+	zig test src/transport/tcp_client.zig
+	zig test src/transport/tcp_server.zig
+	zig test src/transport/udp_server.zig
+	zig test src/transport/multicast.zig
+
+# --- Threading Tests ---
+test-threading:
 	zig test src/threading/processor.zig
+	zig test src/threading/threaded_server.zig
+
+# -----------------------------------------------------------------------------
+# Benchmarks
+# -----------------------------------------------------------------------------
+
+## Build and run benchmarks
+bench: release
+	zig build bench
+	$(BENCH_BIN)
+
+## Quick throughput test (requires running server)
+bench-quick:
+	@echo "Sending 1000 orders via UDP..."
+	@for i in $$(seq 1 1000); do \
+		echo "N, 1, IBM, 10000, 1, B, $$i"; \
+	done | nc -u -w1 localhost $(UDP_PORT)
+	@echo "Done"
+
+## Latency test placeholder
+bench-latency:
+	@echo "Latency benchmark not yet implemented"
+	@echo "Use: perf stat $(BIN) for CPU profiling"
 
 # -----------------------------------------------------------------------------
 # Integration Tests (Requires Running Server)
 # -----------------------------------------------------------------------------
 
-## Send test order via UDP (CSV)
+## Send test order via UDP (CSV format)
 send-udp:
-	@echo "Sending test order via UDP..."
-	echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
+	@echo "Sending test order via UDP to port $(UDP_PORT)..."
+	echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost $(UDP_PORT)
 
-## Send test order via TCP (requires Python for framing)
+## Send test order via TCP (with length framing)
 send-tcp:
-	@echo "Sending test order via TCP..."
+	@echo "Sending test order via TCP to port $(TCP_PORT)..."
 	@python3 -c "\
 import socket, struct; \
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); \
-s.connect(('localhost', 9000)); \
+s.connect(('localhost', $(TCP_PORT))); \
 msg = b'N, 1, IBM, 10000, 100, B, 1\n'; \
 s.send(struct.pack('>I', len(msg)) + msg); \
-print('Sent:', msg); \
+print('Sent:', msg.decode()); \
+resp = s.recv(1024); \
+print('Received:', resp.decode() if resp else '(none)'); \
 s.close()"
 
-## Send binary protocol test via UDP
+## Send binary protocol order via UDP
 send-binary:
 	@echo "Sending binary order via UDP..."
 	@python3 -c "\
@@ -150,71 +211,76 @@ import socket, struct; \
 msg = struct.pack('>BB I 8s I I B I', \
     0x4D, ord('N'), 1, b'IBM\x00\x00\x00\x00\x00', 10000, 100, ord('B'), 1); \
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); \
-sock.sendto(msg, ('localhost', 9001)); \
+sock.sendto(msg, ('localhost', $(UDP_PORT))); \
 print('Sent binary:', msg.hex())"
 
-## Send multiple test orders (buy, sell, cancel)
+## Send buy/sell/cancel sequence
 send-orders:
-	@echo "Sending buy order..."
-	echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
-	@sleep 0.1
-	@echo "Sending sell order (should match)..."
-	echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost 9001
-	@sleep 0.1
-	@echo "Sending cancel..."
-	echo "C, 1, 1" | nc -u -w1 localhost 9001
+	@echo "=== Order Sequence Test ==="
+	@echo "1. Sending buy order..."
+	@echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost $(UDP_PORT)
+	@sleep 0.2
+	@echo "2. Sending matching sell order..."
+	@echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost $(UDP_PORT)
+	@sleep 0.2
+	@echo "3. Sending cancel for remaining..."
+	@echo "C, 1, 1" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "=== Done ==="
 
 ## Flush all orders
 send-flush:
-	echo "F" | nc -u -w1 localhost 9001
+	@echo "Flushing all orders..."
+	echo "F" | nc -u -w1 localhost $(UDP_PORT)
 
 ## Test dual-processor routing (A-M vs N-Z)
 send-routing-test:
-	@echo "Sending to Processor 0 (A-M symbols)..."
-	echo "N, 1, AAPL, 15000, 100, B, 1" | nc -u -w1 localhost 9001
-	echo "N, 1, IBM, 10000, 100, B, 2" | nc -u -w1 localhost 9001
-	echo "N, 1, META, 30000, 100, B, 3" | nc -u -w1 localhost 9001
-	@echo "Sending to Processor 1 (N-Z symbols)..."
-	echo "N, 2, NVDA, 50000, 100, B, 1" | nc -u -w1 localhost 9001
-	echo "N, 2, TSLA, 25000, 100, B, 2" | nc -u -w1 localhost 9001
-	echo "N, 2, ZM, 8000, 100, B, 3" | nc -u -w1 localhost 9001
+	@echo "=== Symbol Routing Test ==="
+	@echo "Processor 0 (A-M):"
+	@echo "  AAPL..." && echo "N, 1, AAPL, 15000, 100, B, 1" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "  IBM..."  && echo "N, 1, IBM, 10000, 100, B, 2" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "  META..." && echo "N, 1, META, 30000, 100, B, 3" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "Processor 1 (N-Z):"
+	@echo "  NVDA..." && echo "N, 2, NVDA, 50000, 100, B, 1" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "  TSLA..." && echo "N, 2, TSLA, 25000, 100, B, 2" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "  ZM..."   && echo "N, 2, ZM, 8000, 100, B, 3" | nc -u -w1 localhost $(UDP_PORT)
+	@echo "=== Done ==="
 
 # -----------------------------------------------------------------------------
 # Docker Targets
 # -----------------------------------------------------------------------------
-
-DOCKER_IMAGE = zig-matching-engine
-DOCKER_TAG = latest
-DOCKER_CONTAINER = matching-engine
 
 ## Build Docker image
 docker:
 	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
 ## Build Docker image (no cache)
-docker-clean:
+docker-rebuild:
 	docker build --no-cache -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
 ## Run Docker container (single-threaded)
 docker-run: docker
 	docker run -d \
 		--name $(DOCKER_CONTAINER) \
-		-p 9000:9000 \
-		-p 9001:9001/udp \
+		-p $(TCP_PORT):$(TCP_PORT) \
+		-p $(UDP_PORT):$(UDP_PORT)/udp \
+		-p $(MCAST_PORT):$(MCAST_PORT)/udp \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
-	@echo "Container started. Logs: docker logs -f $(DOCKER_CONTAINER)"
+	@echo "Container started: $(DOCKER_CONTAINER)"
+	@echo "TCP:  localhost:$(TCP_PORT)"
+	@echo "UDP:  localhost:$(UDP_PORT)"
+	@echo "Logs: make docker-logs"
 
 ## Run Docker container (threaded mode)
 docker-run-threaded: docker
 	docker run -d \
 		--name $(DOCKER_CONTAINER) \
-		-p 9000:9000 \
-		-p 9001:9001/udp \
+		-p $(TCP_PORT):$(TCP_PORT) \
+		-p $(UDP_PORT):$(UDP_PORT)/udp \
 		-e ENGINE_THREADED=true \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
-	@echo "Container started (threaded). Logs: docker logs -f $(DOCKER_CONTAINER)"
+	@echo "Container started (threaded): $(DOCKER_CONTAINER)"
 
-## Run Docker container with host networking (for multicast)
+## Run with host networking (for multicast)
 docker-run-host: docker
 	docker run -d \
 		--name $(DOCKER_CONTAINER) \
@@ -222,19 +288,19 @@ docker-run-host: docker
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 	@echo "Container started with host networking"
 
-## Run Docker container interactively
+## Run interactively (foreground)
 docker-run-it: docker
 	docker run -it --rm \
-		-p 9000:9000 \
-		-p 9001:9001/udp \
+		-p $(TCP_PORT):$(TCP_PORT) \
+		-p $(UDP_PORT):$(UDP_PORT)/udp \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 
-## Stop Docker container
+## Stop and remove container
 docker-stop:
-	docker stop $(DOCKER_CONTAINER) || true
-	docker rm $(DOCKER_CONTAINER) || true
+	-docker stop $(DOCKER_CONTAINER)
+	-docker rm $(DOCKER_CONTAINER)
 
-## View Docker logs
+## View container logs
 docker-logs:
 	docker logs -f $(DOCKER_CONTAINER)
 
@@ -242,17 +308,21 @@ docker-logs:
 docker-shell:
 	docker exec -it $(DOCKER_CONTAINER) sh
 
-## Docker compose up
+## Show container status
+docker-status:
+	@docker ps -f name=$(DOCKER_CONTAINER) --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+## Docker Compose up
 compose-up:
-	docker-compose up -d
+	docker compose up -d
 
-## Docker compose down
+## Docker Compose down
 compose-down:
-	docker-compose down
+	docker compose down
 
-## Docker compose logs
+## Docker Compose logs
 compose-logs:
-	docker-compose logs -f
+	docker compose logs -f
 
 # -----------------------------------------------------------------------------
 # Clean Targets
@@ -260,67 +330,65 @@ compose-logs:
 
 ## Clean build artifacts
 clean:
-	rm -rf zig-out/
+	rm -rf $(BUILD_DIR)/
 	rm -rf .zig-cache/
 	rm -rf zig-cache/
 
 ## Clean everything including Docker
 clean-all: clean docker-stop
-	docker rmi $(DOCKER_IMAGE):$(DOCKER_TAG) || true
+	-docker rmi $(DOCKER_IMAGE):$(DOCKER_TAG)
 
 # -----------------------------------------------------------------------------
-# Development Helpers
+# Development Tools
 # -----------------------------------------------------------------------------
 
 ## Format source code
 fmt:
 	zig fmt src/
 
-## Check formatting (CI)
+## Check formatting (for CI)
 fmt-check:
 	zig fmt --check src/
 
 ## Watch and rebuild on changes (requires entr)
 watch:
+	@command -v entr >/dev/null 2>&1 || (echo "Install entr: apt install entr" && exit 1)
 	find src -name '*.zig' | entr -c make build
 
-## Watch and run tests on changes
+## Watch and test on changes
 watch-test:
+	@command -v entr >/dev/null 2>&1 || (echo "Install entr: apt install entr" && exit 1)
 	find src -name '*.zig' | entr -c make test
 
-# -----------------------------------------------------------------------------
-# Benchmarks
-# -----------------------------------------------------------------------------
+## Count lines of code
+loc:
+	@echo "Lines of Zig code:"
+	@find src -name '*.zig' | xargs wc -l | tail -1
 
-## Run simple throughput test
-bench:
-	@echo "Sending 1000 orders..."
-	@for i in $$(seq 1 1000); do \
-		echo "N, 1, IBM, 10000, 1, B, $$i"; \
-	done | nc -u -w1 localhost 9001
-	@echo "Done"
-
-## Run latency test (requires server running)
-bench-latency:
-	@echo "Latency test not yet implemented"
-	@echo "TODO: Implement round-trip latency measurement"
+## Show TODO/FIXME comments
+todos:
+	@grep -rn "TODO\|FIXME\|XXX\|HACK" src/ --include="*.zig" || echo "No TODOs found!"
 
 # -----------------------------------------------------------------------------
 # CI/CD
 # -----------------------------------------------------------------------------
 
-## CI build and test
+## Full CI check (format, test, build)
 ci: fmt-check test build
-	@echo "CI checks passed"
+	@echo "✓ CI checks passed"
 
-## Release build for distribution
+## Pre-commit hook (fast checks)
+pre-commit: fmt-check check
+	@echo "✓ Pre-commit checks passed"
+
+## Create release distribution
 dist: clean release
-	mkdir -p dist
-	cp zig-out/bin/matching_engine dist/
-	cp README.md dist/
-	cp QUICK_START.md dist/
-	tar -czvf dist/matching-engine-$$(uname -s)-$$(uname -m).tar.gz -C dist .
-	@echo "Distribution package created: dist/matching-engine-*.tar.gz"
+	@mkdir -p dist
+	@cp $(BIN) dist/
+	@cp README.md dist/ 2>/dev/null || true
+	@cp QUICK_START.md dist/ 2>/dev/null || true
+	@tar -czvf dist/matching-engine-$$(uname -s)-$$(uname -m).tar.gz -C dist .
+	@echo "Distribution: dist/matching-engine-$$(uname -s)-$$(uname -m).tar.gz"
 
 # -----------------------------------------------------------------------------
 # Help
@@ -328,46 +396,47 @@ dist: clean release
 
 ## Show this help
 help:
-	@echo "Zig Matching Engine - Available targets:"
+	@echo ""
+	@echo "Zig Matching Engine - Build System"
+	@echo "==================================="
 	@echo ""
 	@echo "Build:"
-	@echo "  make build            Build debug version"
-	@echo "  make release          Build optimized version"
-	@echo "  make clean            Clean build artifacts"
+	@echo "  make              Build debug version"
+	@echo "  make release      Build optimized version"
+	@echo "  make check        Fast type-check (no codegen)"
+	@echo "  make clean        Clean build artifacts"
 	@echo ""
 	@echo "Run:"
-	@echo "  make run              Build and run (single-threaded, debug)"
-	@echo "  make run-threaded     Build and run (dual-processor mode)"
-	@echo "  make run-release      Build and run (optimized)"
-	@echo "  make run-tcp          Run with TCP only"
-	@echo "  make run-udp          Run with UDP only"
+	@echo "  make run          Run single-threaded (debug)"
+	@echo "  make run-release  Run single-threaded (release)"
+	@echo "  make run-threaded Run dual-processor mode"
+	@echo "  make run-tcp      Run with TCP only"
+	@echo "  make run-udp      Run with UDP only"
 	@echo ""
-	@echo "Unit Tests:"
-	@echo "  make test             Run all unit tests"
-	@echo "  make test-spsc        Test SPSC queue"
-	@echo "  make test-processor   Test symbol routing"
-	@echo "  make test-binary-codec Test binary codec"
-	@echo "  make test-csv-codec   Test CSV codec"
+	@echo "Test:"
+	@echo "  make test         Run all unit tests"
+	@echo "  make test-core    Run core module tests"
+	@echo "  make test-protocol Run protocol tests"
+	@echo "  make bench        Run benchmarks"
 	@echo ""
-	@echo "Integration Tests (server must be running):"
-	@echo "  make send-udp         Send CSV order via UDP"
-	@echo "  make send-tcp         Send CSV order via TCP"
-	@echo "  make send-binary      Send binary order via UDP"
-	@echo "  make send-orders      Send buy/sell/cancel sequence"
-	@echo "  make send-routing-test Test dual-processor symbol routing"
-	@echo "  make send-flush       Flush all orders"
+	@echo "Integration (server must be running):"
+	@echo "  make send-udp     Send CSV order via UDP"
+	@echo "  make send-tcp     Send CSV order via TCP"
+	@echo "  make send-binary  Send binary order via UDP"
+	@echo "  make send-orders  Send buy/sell/cancel sequence"
 	@echo ""
 	@echo "Docker:"
-	@echo "  make docker           Build Docker image"
-	@echo "  make docker-run       Run container (single-threaded)"
-	@echo "  make docker-run-threaded Run container (dual-processor)"
-	@echo "  make docker-stop      Stop container"
-	@echo "  make docker-logs      View container logs"
+	@echo "  make docker       Build Docker image"
+	@echo "  make docker-run   Run container"
+	@echo "  make docker-stop  Stop container"
+	@echo "  make docker-logs  View logs"
 	@echo ""
 	@echo "Development:"
-	@echo "  make fmt              Format source code"
-	@echo "  make watch            Watch and rebuild on changes"
-	@echo "  make watch-test       Watch and test on changes"
+	@echo "  make fmt          Format code"
+	@echo "  make watch        Rebuild on changes"
+	@echo "  make watch-test   Test on changes"
+	@echo "  make ci           Run CI checks"
 	@echo ""
-	@echo "Benchmarks:"
-	@echo "  make bench            Simple throughput test"
+	@echo "Configuration (environment variables):"
+	@echo "  TCP_PORT=$(TCP_PORT)  UDP_PORT=$(UDP_PORT)  MCAST_PORT=$(MCAST_PORT)"
+	@echo ""
