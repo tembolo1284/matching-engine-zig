@@ -164,20 +164,25 @@ fn validateSystem() !void {
 // ============================================================================
 
 fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
+    std.debug.print("DEBUG 1: Entering runSingleThreaded\n", .{});
     std.log.info("Starting in SINGLE-THREADED mode", .{});
 
+    std.debug.print("DEBUG 2: About to init MemoryPools\n", .{});
     // Heap-allocate memory pools: no large stack frames.
     const pools = try MemoryPools.init(allocator);
     defer pools.deinit();
 
+    std.debug.print("DEBUG 3: MemoryPools done, creating engine\n", .{});
     // Heap-allocate matching engine (large hash tables inside).
     const engine = try allocator.create(MatchingEngine);
     defer {
         engine.deinit();
         allocator.destroy(engine);
     }
+    std.debug.print("DEBUG 4: Engine created, calling initInPlace\n", .{});
     engine.initInPlace(pools);
 
+    std.debug.print("DEBUG 5: Engine initialized, creating server\n", .{});
     // Heap-allocate server (contains sizable buffers).
     const server = try allocator.create(Server);
     defer {

@@ -18,7 +18,7 @@ const ORDER_ALIGNMENT = @import("order.zig").ORDER_ALIGNMENT;
 // ============================================================================
 /// Default pool capacity: 128K orders × 64 bytes = 8 MB
 /// Adjustable at runtime via OrderPool.init()
-pub const DEFAULT_ORDER_POOL_CAPACITY: u32 = 131_072;
+pub const DEFAULT_ORDER_POOL_CAPACITY: u32 = 1024;
 /// Type alias for order indices (enables future expansion to u64 if needed)
 pub const OrderIndex = u32;
 /// Maximum supported pool capacity
