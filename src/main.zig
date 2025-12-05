@@ -272,10 +272,12 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
 // ============================================================================
 
 pub fn main() !void {
+    std.debug.print("MAIN 1: Starting\n", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    std.debug.print("MAIN 2: Parsing Options\n", .{});
     const opts = parseOptions(allocator);
 
     switch (opts.mode) {
@@ -289,14 +291,19 @@ pub fn main() !void {
         },
         else => {},
     }
-
+    std.debug.print("MAIN 3: Setting up signal handlers\n", .{});
     setupSignalHandlers();
-
+    std.debug.print("MAIN 4: Validating system\n", .{});
     try validateSystem();
+
+    std.debug.print("MAIN 5: Validating config\n", .{});
     try validateConfig(&opts.config);
 
+    std.debug.print("MAIN 6: About to enter switch for mode\n", .{});
     switch (opts.mode) {
+        std.debug.print("MAIN 7: Calling runSingleThreaded\n", .{});
         .single_threaded => try runSingleThreaded(allocator, opts.config),
+        std.debug.print("MAIN 7: Calling runThreaded\n", .{});
         .threaded => try runThreaded(allocator, opts.config),
         else => unreachable,
     }
