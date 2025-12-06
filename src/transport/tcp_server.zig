@@ -1,40 +1,20 @@
-//! TCP server with epoll I/O multiplexing.
+//! TCP server with cross-platform I/O multiplexing.
+//!
+//! Uses epoll on Linux and kqueue on macOS/BSD for efficient event-driven I/O.
 //!
 //! Orchestrates:
 //! - Listening socket and connection acceptance
-//! - Epoll event loop for non-blocking I/O
+//! - Event loop for non-blocking I/O
 //! - Client lifecycle management
 //! - Message dispatch via callbacks
-//!
-//! Architecture:
-//! ```
-//!   ┌─────────────────────────────────────────────┐
-//!   │              TcpServer                       │
-//!   │  ┌─────────────────────────────────────┐   │
-//!   │  │         Listen Socket               │   │
-//!   │  └──────────────┬──────────────────────┘   │
-//!   │                 │ accept()                  │
-//!   │  ┌──────────────▼──────────────────────┐   │
-//!   │  │          Epoll FD                   │   │
-//!   │  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │   │
-//!   │  │  │ C0  │ │ C1  │ │ C2  │ │ ... │   │   │
-//!   │  │  └─────┘ └─────┘ └─────┘ └─────┘   │   │
-//!   │  └─────────────────────────────────────┘   │
-//!   │                 │                           │
-//!   │  ┌──────────────▼──────────────────────┐   │
-//!   │  │        ClientPool                   │   │
-//!   │  │  TcpClient[0..MAX_CLIENTS]          │   │
-//!   │  └─────────────────────────────────────┘   │
-//!   └─────────────────────────────────────────────┘
-//! ```
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Use from single I/O thread only.
 //! - Callbacks invoked synchronously during poll().
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
-const linux = std.os.linux;
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
 const config = @import("config.zig");
@@ -46,13 +26,218 @@ pub const ClientState = tcp_client.ClientState;
 pub const ClientStats = tcp_client.ClientStats;
 
 // ============================================================================
+// Platform Detection
+// ============================================================================
+
+const is_linux = builtin.os.tag == .linux;
+const is_darwin = builtin.os.tag.isDarwin();
+const is_bsd = builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .netbsd;
+
+// Import platform-specific modules
+const linux = if (is_linux) std.os.linux else struct {};
+
+// ============================================================================
+// Cross-Platform Event Poller
+// ============================================================================
+
+/// Cross-platform event types
+const EventType = struct {
+    readable: bool = false,
+    writable: bool = false,
+    error_or_hup: bool = false,
+};
+
+/// Cross-platform event poller abstraction
+const Poller = struct {
+    fd: posix.fd_t,
+
+    const Self = @This();
+
+    /// Create a new poller instance
+    pub fn init() !Self {
+        if (is_linux) {
+            const fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
+            return .{ .fd = fd };
+        } else if (is_darwin or is_bsd) {
+            const fd = try posix.kqueue();
+            return .{ .fd = fd };
+        } else {
+            @compileError("Unsupported platform for event polling");
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        posix.close(self.fd);
+    }
+
+    /// Add a file descriptor to watch for read events
+    pub fn addRead(self: *Self, fd: posix.fd_t) !void {
+        if (is_linux) {
+            var ev = linux.epoll_event{
+                .events = linux.EPOLL.IN,
+                .data = .{ .fd = fd },
+            };
+            try epollCtl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev);
+        } else if (is_darwin or is_bsd) {
+            var changelist = [_]posix.Kevent{
+                makeKEvent(fd, posix.system.EVFILT.READ, posix.system.EV.ADD, 0),
+            };
+            _ = try posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null);
+        }
+    }
+
+    /// Add a client fd with read + edge-triggered + hangup detection
+    pub fn addClient(self: *Self, fd: posix.fd_t) !void {
+        if (is_linux) {
+            var ev = linux.epoll_event{
+                .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP,
+                .data = .{ .fd = fd },
+            };
+            try epollCtl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev);
+        } else if (is_darwin or is_bsd) {
+            // kqueue uses separate filters for read and write
+            // EV_CLEAR gives edge-triggered-like behavior
+            var changelist = [_]posix.Kevent{
+                makeKEvent(fd, posix.system.EVFILT.READ, posix.system.EV.ADD | posix.system.EV.CLEAR, 0),
+            };
+            _ = try posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null);
+        }
+    }
+
+    /// Update client to enable/disable write events
+    pub fn updateClient(self: *Self, fd: posix.fd_t, want_write: bool) !void {
+        if (is_linux) {
+            var events: u32 = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP;
+            if (want_write) events |= linux.EPOLL.OUT;
+
+            var ev = linux.epoll_event{
+                .events = events,
+                .data = .{ .fd = fd },
+            };
+            try epollCtl(self.fd, linux.EPOLL.CTL_MOD, fd, &ev);
+        } else if (is_darwin or is_bsd) {
+            // For kqueue, we add/delete the write filter
+            if (want_write) {
+                var changelist = [_]posix.Kevent{
+                    makeKEvent(fd, posix.system.EVFILT.WRITE, posix.system.EV.ADD | posix.system.EV.CLEAR, 0),
+                };
+                _ = try posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null);
+            } else {
+                var changelist = [_]posix.Kevent{
+                    makeKEvent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0),
+                };
+                // Ignore error if filter wasn't registered
+                _ = posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null) catch {};
+            }
+        }
+    }
+
+    /// Remove fd from poller
+    pub fn remove(self: *Self, fd: posix.fd_t) void {
+        if (is_linux) {
+            epollCtl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+        } else if (is_darwin or is_bsd) {
+            // kqueue automatically removes events when fd is closed
+            // But we can explicitly remove if needed
+            var changelist = [_]posix.Kevent{
+                makeKEvent(fd, posix.system.EVFILT.READ, posix.system.EV.DELETE, 0),
+                makeKEvent(fd, posix.system.EVFILT.WRITE, posix.system.EV.DELETE, 0),
+            };
+            _ = posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null) catch {};
+        }
+    }
+
+    /// Wait for events. Returns slice of ready fds with their event types.
+    /// Caller must provide storage for results.
+    pub fn wait(
+        self: *Self,
+        results: []PollResult,
+        timeout_ms: i32,
+    ) ![]PollResult {
+        if (is_linux) {
+            var events: [MAX_EVENTS]linux.epoll_event = undefined;
+            const n = posix.epoll_wait(self.fd, &events, timeout_ms);
+
+            const count = @min(n, results.len);
+            for (0..count) |i| {
+                results[i] = .{
+                    .fd = events[i].data.fd,
+                    .events = .{
+                        .readable = (events[i].events & linux.EPOLL.IN) != 0,
+                        .writable = (events[i].events & linux.EPOLL.OUT) != 0,
+                        .error_or_hup = (events[i].events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0,
+                    },
+                };
+            }
+            return results[0..count];
+        } else if (is_darwin or is_bsd) {
+            var events: [MAX_EVENTS]posix.Kevent = undefined;
+
+            const timeout: ?posix.timespec = if (timeout_ms < 0)
+                null
+            else
+                .{
+                    .sec = @intCast(@divTrunc(timeout_ms, 1000)),
+                    .nsec = @intCast(@mod(timeout_ms, 1000) * 1_000_000),
+                };
+
+            const n = try posix.kevent(self.fd, &[_]posix.Kevent{}, &events, timeout);
+
+            const count = @min(n, results.len);
+            for (0..count) |i| {
+                const ev = &events[i];
+                const fd: posix.fd_t = @intCast(ev.ident);
+                results[i] = .{
+                    .fd = fd,
+                    .events = .{
+                        .readable = ev.filter == posix.system.EVFILT.READ,
+                        .writable = ev.filter == posix.system.EVFILT.WRITE,
+                        .error_or_hup = (ev.flags & posix.system.EV.EOF) != 0 or
+                            (ev.flags & posix.system.EV.ERROR) != 0,
+                    },
+                };
+            }
+            return results[0..count];
+        } else {
+            return &[_]PollResult{};
+        }
+    }
+
+    // Helper for Linux epoll_ctl with proper type handling
+    fn epollCtl(epfd: posix.fd_t, op: u32, fd: posix.fd_t, event: ?*linux.epoll_event) !void {
+        const rc = linux.epoll_ctl(epfd, op, fd, event);
+        if (rc != 0) {
+            return error.EpollCtlFailed;
+        }
+    }
+
+    // Helper to create kqueue kevent struct
+    fn makeKEvent(ident: posix.fd_t, filter: i16, flags: u16, fflags: u32) posix.Kevent {
+        return .{
+            .ident = @intCast(ident),
+            .filter = filter,
+            .flags = flags,
+            .fflags = fflags,
+            .data = 0,
+            .udata = 0,
+        };
+    }
+};
+
+/// Result from polling
+const PollResult = struct {
+    fd: posix.fd_t,
+    events: EventType,
+};
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
 /// Maximum concurrent clients.
 pub const MAX_CLIENTS: u32 = 64;
 
-/// Maximum epoll events per poll cycle.
+/// Maximum events per poll cycle.
 const MAX_EVENTS: u32 = 64;
 
 /// Listen backlog size.
@@ -105,14 +290,14 @@ pub const ServerStats = struct {
 // TCP Server
 // ============================================================================
 
-/// TCP server with epoll-based event loop.
+/// TCP server with cross-platform event loop.
 pub const TcpServer = struct {
     // === Sockets ===
     /// Listening socket (null if not started).
     listen_fd: ?posix.fd_t = null,
 
-    /// Epoll instance (null if not started).
-    epoll_fd: ?posix.fd_t = null,
+    /// Cross-platform event poller (null if not started).
+    poller: ?Poller = null,
 
     // === Clients ===
     /// Pre-allocated client pool.
@@ -163,7 +348,7 @@ pub const TcpServer = struct {
     /// Start listening on address:port.
     pub fn start(self: *Self, address: []const u8, port: u16) !void {
         std.debug.assert(self.listen_fd == null);
-        std.debug.assert(self.epoll_fd == null);
+        std.debug.assert(self.poller == null);
 
         // Create listening socket
         const listen_fd = try posix.socket(
@@ -183,25 +368,23 @@ pub const TcpServer = struct {
         // Start listening
         try posix.listen(listen_fd, LISTEN_BACKLOG);
 
-        // Create epoll instance
-        const epoll_fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
-        errdefer posix.close(epoll_fd);
+        // Create event poller
+        var poller = try Poller.init();
+        errdefer poller.deinit();
 
-        // Add listen socket to epoll
-        var ev = linux.epoll_event{
-            .events = linux.EPOLL.IN,
-            .data = .{ .fd = listen_fd },
-        };
-        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &ev);
+        // Add listen socket to poller
+        try poller.addRead(listen_fd);
 
         self.listen_fd = listen_fd;
-        self.epoll_fd = epoll_fd;
+        self.poller = poller;
 
-        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={})", .{
+        const platform = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
+        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={})", .{
             address,
             port,
             self.use_framing,
             MAX_CLIENTS,
+            platform,
         });
     }
 
@@ -213,10 +396,10 @@ pub const TcpServer = struct {
             self.disconnectClientInternal(client, false);
         }
 
-        // Close epoll
-        if (self.epoll_fd) |fd| {
-            posix.close(fd);
-            self.epoll_fd = null;
+        // Close poller
+        if (self.poller) |*poller| {
+            poller.deinit();
+            self.poller = null;
         }
 
         // Close listen socket
@@ -230,7 +413,7 @@ pub const TcpServer = struct {
 
     /// Check if server is running.
     pub fn isRunning(self: *const Self) bool {
-        return self.listen_fd != null and self.epoll_fd != null;
+        return self.listen_fd != null and self.poller != null;
     }
 
     // ========================================================================
@@ -240,22 +423,22 @@ pub const TcpServer = struct {
     /// Poll for events with timeout.
     /// Returns number of events processed.
     pub fn poll(self: *Self, timeout_ms: i32) !usize {
-        const epoll_fd = self.epoll_fd orelse return error.NotStarted;
+        var poller = self.poller orelse return error.NotStarted;
         const listen_fd = self.listen_fd orelse return error.NotStarted;
 
-        var events: [MAX_EVENTS]linux.epoll_event = undefined;
-        const n = posix.epoll_wait(epoll_fd, &events, timeout_ms);
+        var results: [MAX_EVENTS]PollResult = undefined;
+        const events = try poller.wait(&results, timeout_ms);
 
         var processed: usize = 0;
 
-        for (events[0..n]) |ev| {
-            if (ev.data.fd == listen_fd) {
+        for (events) |ev| {
+            if (ev.fd == listen_fd) {
                 // New connection(s) pending
                 self.acceptConnections();
                 processed += 1;
             } else {
                 // Client event
-                if (self.clients.findByFd(ev.data.fd)) |client| {
+                if (self.clients.findByFd(ev.fd)) |client| {
                     self.handleClientEvent(client, ev.events);
                     processed += 1;
                 }
@@ -289,7 +472,7 @@ pub const TcpServer = struct {
 
     /// Accept a single connection.
     fn acceptOne(self: *Self, listen_fd: posix.fd_t) !void {
-        const epoll_fd = self.epoll_fd orelse return error.NotStarted;
+        var poller = self.poller orelse return error.NotStarted;
 
         var client_addr: posix.sockaddr.in = undefined;
         var addr_len: posix.socklen_t = @sizeOf(@TypeOf(client_addr));
@@ -319,12 +502,8 @@ pub const TcpServer = struct {
         // Set socket options for low latency
         net_utils.setLowLatencyOptions(client_fd);
 
-        // Add to epoll (edge-triggered for efficiency)
-        var ev = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP,
-            .data = .{ .fd = client_fd },
-        };
-        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev);
+        // Add to poller
+        try poller.addClient(client_fd);
 
         std.log.info("Client {} connected (fd={}, active={})", .{
             client_id,
@@ -333,16 +512,16 @@ pub const TcpServer = struct {
         });
     }
 
-    /// Handle epoll event for a client.
-    fn handleClientEvent(self: *Self, client: *TcpClient, events: u32) void {
+    /// Handle event for a client.
+    fn handleClientEvent(self: *Self, client: *TcpClient, events: EventType) void {
         // Check for errors or hangup first
-        if (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP) != 0) {
+        if (events.error_or_hup) {
             self.disconnectClient(client);
             return;
         }
 
         // Handle readable
-        if (events & linux.EPOLL.IN != 0) {
+        if (events.readable) {
             self.handleClientRead(client) catch |err| {
                 if (err != error.WouldBlock) {
                     std.log.debug("Client {} read error: {}", .{ client.client_id, err });
@@ -353,7 +532,7 @@ pub const TcpServer = struct {
         }
 
         // Handle writable
-        if (events & linux.EPOLL.OUT != 0) {
+        if (events.writable) {
             client.flushSend() catch |err| {
                 std.log.debug("Client {} write error: {}", .{ client.client_id, err });
                 self.disconnectClient(client);
@@ -362,7 +541,7 @@ pub const TcpServer = struct {
 
             // If send buffer drained, disable write events
             if (!client.hasPendingSend()) {
-                self.updateClientEpoll(client, false) catch {};
+                self.updateClientPoller(client, false) catch {};
             }
         }
     }
@@ -486,7 +665,7 @@ pub const TcpServer = struct {
         client.recordMessageSent();
 
         // Enable write events to flush
-        self.updateClientEpoll(client, true) catch return false;
+        self.updateClientPoller(client, true) catch return false;
 
         return true;
     }
@@ -507,7 +686,7 @@ pub const TcpServer = struct {
             if (success) {
                 client.recordMessageSent();
                 sent_count += 1;
-                self.updateClientEpoll(client, true) catch {};
+                self.updateClientPoller(client, true) catch {};
             }
         }
 
@@ -532,9 +711,9 @@ pub const TcpServer = struct {
 
         std.log.info("Client {} disconnected (fd={})", .{ client_id, fd });
 
-        // Remove from epoll
-        if (self.epoll_fd) |epoll_fd| {
-            posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+        // Remove from poller
+        if (self.poller) |*poller| {
+            poller.remove(fd);
         }
 
         // Reset client slot
@@ -552,19 +731,10 @@ pub const TcpServer = struct {
         }
     }
 
-    /// Update epoll registration for client.
-    fn updateClientEpoll(self: *Self, client: *TcpClient, want_write: bool) !void {
-        const epoll_fd = self.epoll_fd orelse return error.NotStarted;
-
-        var events: u32 = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP;
-        if (want_write) events |= linux.EPOLL.OUT;
-
-        var ev = linux.epoll_event{
-            .events = events,
-            .data = .{ .fd = client.fd },
-        };
-
-        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, client.fd, &ev);
+    /// Update poller registration for client.
+    fn updateClientPoller(self: *Self, client: *TcpClient, want_write: bool) !void {
+        var poller = self.poller orelse return error.NotStarted;
+        try poller.updateClient(client.fd, want_write);
     }
 
     /// Allocate next client ID.
@@ -645,4 +815,9 @@ test "TcpServer statistics initialization" {
     try std.testing.expectEqual(@as(u32, 0), stats.current_clients);
     try std.testing.expectEqual(@as(u64, 0), stats.total_connections);
     try std.testing.expectEqual(@as(u64, 0), stats.total_messages_in);
+}
+
+test "Poller creation" {
+    var poller = try Poller.init();
+    defer poller.deinit();
 }

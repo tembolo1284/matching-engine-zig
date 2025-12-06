@@ -14,6 +14,13 @@ pub const VERSION = "0.1.0";
 pub const BUILD_MODE = @tagName(builtin.mode);
 
 // ============================================================================
+// Platform Detection
+// ============================================================================
+
+const is_linux = builtin.os.tag == .linux;
+const is_darwin = builtin.os.tag.isDarwin();
+
+// ============================================================================
 // Signal Handling
 // ============================================================================
 
@@ -26,26 +33,54 @@ fn signalHandler(sig: c_int) callconv(.C) void {
 }
 
 fn setupSignalHandlers() void {
-    const sigint_action = std.posix.Sigaction{
-        .handler = .{ .handler = signalHandler },
-        .mask = std.posix.empty_sigset,
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null) catch {};
+    // sigaction returns void on Darwin, error union on Linux
+    // Use platform-specific handling
 
-    const sigterm_action = std.posix.Sigaction{
-        .handler = .{ .handler = signalHandler },
-        .mask = std.posix.empty_sigset,
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null) catch {};
+    if (is_darwin) {
+        // macOS: sigaction returns void, no error handling needed
+        const sigint_action = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null);
 
-    const sigpipe_action = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.empty_sigset,
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null) catch {};
+        const sigterm_action = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null);
+
+        const sigpipe_action = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null);
+    } else {
+        // Linux: sigaction returns error union
+        const sigint_action = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null) catch {};
+
+        const sigterm_action = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null) catch {};
+
+        const sigpipe_action = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null) catch {};
+    }
 }
 
 // ============================================================================
@@ -147,14 +182,15 @@ fn validateConfig(config: *const cfg.Config) !void {
 }
 
 fn validateSystem() !void {
-    if (builtin.os.tag != .linux) {
-        std.log.warn("This engine is optimized for Linux. Performance may vary on {s}.", .{
+    if (!is_linux and !is_darwin) {
+        std.log.warn("This engine is optimized for Linux/macOS. Performance may vary on {s}.", .{
             @tagName(builtin.os.tag),
         });
     }
 
+    const platform_str = if (is_linux) "Linux" else if (is_darwin) "macOS" else @tagName(builtin.os.tag);
     std.log.info("System: {s} {s}", .{
-        @tagName(builtin.os.tag),
+        platform_str,
         @tagName(builtin.cpu.arch),
     });
 }
@@ -231,6 +267,8 @@ fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
 }
 
 fn printStartupBanner(config: cfg.Config, threaded: bool) void {
+    const backend = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
+    
     std.log.info("", .{});
     std.log.info("╔════════════════════════════════════════════╗", .{});
     std.log.info("║     Zig Matching Engine v{s}             ║", .{VERSION});
@@ -255,6 +293,7 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     }
     const protocol_str = if (config.use_binary_protocol) "Binary" else "CSV";
     std.log.info("║  Protocol:  {s:<30} ║", .{protocol_str});
+    std.log.info("║  I/O:       {s:<30} ║", .{backend});
     if (threaded) {
         std.log.info("║  Mode:      Dual-Processor                 ║", .{});
         std.log.info("║  Proc 0:    Symbols A-M                    ║", .{});
@@ -270,7 +309,7 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
 
 fn printThreadedStats(server: *ThreadedServer) void {
     const stats = server.getStats();
-    
+
     std.log.info("", .{});
     std.log.info("═══════════════ Session Statistics ═══════════════", .{});
     std.log.info("  Messages routed:    Proc0={d}, Proc1={d}", .{
@@ -281,7 +320,7 @@ fn printThreadedStats(server: *ThreadedServer) void {
     std.log.info("  Outputs dispatched: {d}", .{stats.outputs_dispatched});
     std.log.info("  Messages dropped:   {d}", .{stats.messages_dropped});
     std.log.info("  Disconnect cancels: {d}", .{stats.disconnect_cancels});
-    
+
     for (0..2) |i| {
         const ps = stats.processor_stats[i];
         std.log.info("  Processor {d}:", .{i});
@@ -344,4 +383,3 @@ pub fn main() !void {
 
     std.log.info("Shutdown complete", .{});
 }
-
