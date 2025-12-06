@@ -421,19 +421,33 @@ pub const ThreadedServer = struct {
 
     /// Drain output queues with message batching for UDP
     fn drainOutputQueues(self: *Self) void {
+        const batches_before = self.batches_sent.load(.monotonic);
         self.batch_mgr.clear();
 
+        var total_outputs: u32 = 0;
         for (self.output_queues) |queue| {
             var count: u32 = 0;
             while (count < OUTPUT_DRAIN_LIMIT) : (count += 1) {
                 const output = queue.pop() orelse break;
                 self.processOutput(&output.message);
                 _ = self.outputs_dispatched.fetchAdd(1, .monotonic);
+                total_outputs += 1;
             }
         }
 
         // Flush all remaining batches
         self.flushAllBatches();
+
+        // Log summary if we sent batches this cycle
+        const batches_after = self.batches_sent.load(.monotonic);
+        const batches_this_cycle = batches_after - batches_before;
+        if (batches_this_cycle > 0 and total_outputs >= 100) {
+            std.log.info("Drain cycle: {d} outputs -> {d} UDP batches (total: {d})", .{
+                total_outputs,
+                batches_this_cycle,
+                batches_after,
+            });
+        }
     }
 
     /// Process a single output message, batching UDP sends
