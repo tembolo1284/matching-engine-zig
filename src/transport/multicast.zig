@@ -15,6 +15,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -29,10 +30,18 @@ const net_utils = @import("net_utils.zig");
 const SEND_BUFFER_SIZE: u32 = 4096;
 const RECV_BUFFER_SIZE: u32 = 4096;
 
-// Linux socket option constants (from netinet/in.h)
-const IP_MULTICAST_TTL: u32 = 33;
-const IP_MULTICAST_LOOP: u32 = 34;
-const IP_ADD_MEMBERSHIP: u32 = 35;
+// ============================================================================
+// Platform-specific socket option constants
+// ============================================================================
+
+const is_darwin = builtin.os.tag.isDarwin();
+
+// IP multicast socket options differ between Linux and macOS/BSD
+// Linux: from /usr/include/linux/in.h
+// macOS: from /usr/include/netinet/in.h
+const IP_MULTICAST_TTL: u32 = if (is_darwin) 10 else 33;
+const IP_MULTICAST_LOOP: u32 = if (is_darwin) 11 else 34;
+const IP_ADD_MEMBERSHIP: u32 = if (is_darwin) 12 else 35;
 
 // ============================================================================
 // Publisher Statistics
