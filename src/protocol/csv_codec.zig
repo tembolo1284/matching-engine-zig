@@ -119,19 +119,14 @@ fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
 }
 
 fn parseCancel(fields: [][]const u8) codec.CodecError!msg.InputMsg {
-    // C, userId, userOrderId [, symbol]
-    if (fields.len < 3) return codec.CodecError.IncompleteMessage;
+    // C, userId, symbol, userOrderId
+    if (fields.len < 4) return codec.CodecError.IncompleteMessage;
 
     const user_id = codec.parseU32(codec.trim(fields[1])) orelse return codec.CodecError.InvalidField;
-    const order_id = codec.parseU32(codec.trim(fields[2])) orelse return codec.CodecError.InvalidField;
+    const symbol_str = codec.trim(fields[2]);
+    const order_id = codec.parseU32(codec.trim(fields[3])) orelse return codec.CodecError.InvalidField;
 
-    // Optional symbol hint
-    if (fields.len >= 4) {
-        const symbol_str = codec.trim(fields[3]);
-        if (symbol_str.len > 0) {
-            return msg.InputMsg.cancel(user_id, msg.makeSymbol(symbol_str), order_id);
-        }
-    }
+    if (symbol_str.len == 0) return codec.CodecError.InvalidField;
 
     return msg.InputMsg.cancel(user_id, msg.makeSymbol(symbol_str), order_id);
 }
