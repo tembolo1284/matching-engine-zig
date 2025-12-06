@@ -276,18 +276,7 @@ pub const InputMsg = struct {
     }
 
     /// Create cancel message.
-    pub fn cancel(user_id: u32, user_order_id: u32) Self {
-        return .{
-            .msg_type = .cancel,
-            .data = .{ .cancel = .{
-                .user_id = user_id,
-                .user_order_id = user_order_id,
-            } },
-        };
-    }
-
-    /// Create cancel message with symbol hint.
-    pub fn cancelWithSymbol(user_id: u32, user_order_id: u32, symbol: Symbol) Self {
+    pub fn cancel(user_id: u32, symbol: Symbol, user_order_id: u32) Self {
         return .{
             .msg_type = .cancel,
             .data = .{ .cancel = .{

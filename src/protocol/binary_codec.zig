@@ -48,8 +48,8 @@ pub const MSG_REJECT: u8 = 'R'; // 0x52
 /// New Order: magic(1) + type(1) + user_id(4) + symbol(8) + price(4) + qty(4) + side(1) + order_id(4) = 27
 pub const NEW_ORDER_WIRE_SIZE: usize = 27;
 
-/// Cancel: magic(1) + type(1) + user_id(4) + order_id(4) = 10
-pub const CANCEL_WIRE_SIZE: usize = 10;
+/// Cancel: magic(1) + type(1) + user_id(4) + symbol(8) + order_id(4) = 18
+pub const CANCEL_WIRE_SIZE: usize = 18;
 
 /// Flush: magic(1) + type(1) = 2
 pub const FLUSH_WIRE_SIZE: usize = 2;
@@ -72,7 +72,7 @@ pub const REJECT_WIRE_SIZE: usize = 19;
 // Compile-time validation
 comptime {
     std.debug.assert(NEW_ORDER_WIRE_SIZE == HEADER_SIZE + 4 + msg.MAX_SYMBOL_LENGTH + 4 + 4 + 1 + 4);
-    std.debug.assert(CANCEL_WIRE_SIZE == HEADER_SIZE + 4 + 4);
+    std.debug.assert(CANCEL_WIRE_SIZE == HEADER_SIZE + 4 + msg.MAX_SYMBOL_LENGTH + 4);
     std.debug.assert(FLUSH_WIRE_SIZE == HEADER_SIZE);
     std.debug.assert(ACK_WIRE_SIZE == HEADER_SIZE + msg.MAX_SYMBOL_LENGTH + 4 + 4);
     std.debug.assert(TRADE_WIRE_SIZE == HEADER_SIZE + msg.MAX_SYMBOL_LENGTH + 4 + 4 + 4 + 4 + 4 + 4);
@@ -142,6 +142,9 @@ fn encodeCancel(cancel: *const msg.CancelMsg, buf: []u8) codec.CodecError!usize 
 
     writeU32Big(buf[pos..][0..4], cancel.user_id);
     pos += 4;
+
+    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &cancel.symbol);
+    pos += msg.MAX_SYMBOL_LENGTH;
 
     writeU32Big(buf[pos..][0..4], cancel.user_order_id);
     pos += 4;
@@ -243,6 +246,10 @@ fn decodeCancel(data: []const u8) msg.InputMsg {
 
     const user_id = readU32Big(data[pos..][0..4]);
     pos += 4;
+ 
+    var symbol: msg.Symbol = undefined;
+    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
+    pos += msg.MAX_SYMBOL_LENGTH;
 
     const user_order_id = readU32Big(data[pos..][0..4]);
 
@@ -251,6 +258,7 @@ fn decodeCancel(data: []const u8) msg.InputMsg {
         .data = .{ .cancel = .{
             .user_id = user_id,
             .user_order_id = user_order_id,
+            .symbol = symbol,
         } },
     };
 }
@@ -585,7 +593,7 @@ test "binary roundtrip - new order" {
 }
 
 test "binary roundtrip - cancel" {
-    const input = msg.InputMsg.cancel(42, 100);
+    const input = msg.InputMsg.cancel(42, msg.makeSymbol("IBM"), 100);
 
     var buf: [256]u8 = undefined;
     const encoded_len = try encode(&input, &buf);
@@ -596,6 +604,7 @@ test "binary roundtrip - cancel" {
     try std.testing.expectEqual(msg.InputMsgType.cancel, result.message.msg_type);
     try std.testing.expectEqual(@as(u32, 42), result.message.data.cancel.user_id);
     try std.testing.expectEqual(@as(u32, 100), result.message.data.cancel.user_order_id);
+    try std.testing.expect(std.mem.eql(u8, "IBM", msg.symbolSlice(&result.message.data.cancel.symbol)));
 }
 
 test "binary roundtrip - trade" {

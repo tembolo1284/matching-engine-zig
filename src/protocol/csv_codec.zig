@@ -129,11 +129,11 @@ fn parseCancel(fields: [][]const u8) codec.CodecError!msg.InputMsg {
     if (fields.len >= 4) {
         const symbol_str = codec.trim(fields[3]);
         if (symbol_str.len > 0) {
-            return msg.InputMsg.cancelWithSymbol(user_id, order_id, msg.makeSymbol(symbol_str));
+            return msg.InputMsg.cancel(user_id, msg.makeSymbol(symbol_str), order_id);
         }
     }
 
-    return msg.InputMsg.cancel(user_id, order_id);
+    return msg.InputMsg.cancel(user_id, msg.makeSymbol(symbol_str), order_id);
 }
 
 // ============================================================================
