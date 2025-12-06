@@ -301,10 +301,14 @@ pub fn main() !void {
 
     std.debug.print("MAIN 6: About to enter switch for mode\n", .{});
     switch (opts.mode) {
-        std.debug.print("MAIN 7: Calling runSingleThreaded\n", .{});
-        .single_threaded => try runSingleThreaded(allocator, opts.config),
-        std.debug.print("MAIN 7: Calling runThreaded\n", .{});
-        .threaded => try runThreaded(allocator, opts.config),
+        .single_threaded => {
+            std.debug.print("MAIN 7: Calling runSingleThreaded\n", .{});
+            try runSingleThreaded(allocator, opts.config);
+        },
+        .threaded => {
+            std.debug.print("MAIN 7: Calling runThreaded\n", .{});
+            try runThreaded(allocator, opts.config);
+        },
         else => unreachable,
     }
 
