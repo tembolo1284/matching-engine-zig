@@ -65,15 +65,49 @@ pub fn setLowLatencyOptions(fd: posix.fd_t) void {
     // Disable Nagle's algorithm
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
-    // Enable quick ack
+    // Enable quick ack (Linux only, ignored on macOS)
     const TCP_QUICKACK = 12;
     posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_QUICKACK, &std.mem.toBytes(@as(c_int, 1))) catch {};
 }
 
-/// Set socket buffer sizes.
-pub fn setBufferSizes(fd: posix.fd_t, recv_size: u32, send_size: u32) void {
+/// Set socket buffer sizes and return actual receive buffer size achieved.
+/// Note: OS may cap the requested size. macOS default max is ~8MB, Linux varies.
+/// Returns the actual receive buffer size (which may be less than requested).
+pub fn setBufferSizes(fd: posix.fd_t, recv_size: u32, send_size: u32) u32 {
+    // Set receive buffer
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, @intCast(recv_size)))) catch {};
+    
+    // Set send buffer
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, @intCast(send_size)))) catch {};
+
+    // Query actual receive buffer size
+    return getSocketRecvBufSize(fd);
+}
+
+/// Get current socket receive buffer size.
+pub fn getSocketRecvBufSize(fd: posix.fd_t) u32 {
+    var buf: [@sizeOf(c_int)]u8 = undefined;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    
+    const rc = std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf, &len);
+    if (rc == 0 and len == @sizeOf(c_int)) {
+        const val: c_int = @bitCast(buf);
+        return if (val > 0) @intCast(val) else 0;
+    }
+    return 0;
+}
+
+/// Get current socket send buffer size.
+pub fn getSocketSendBufSize(fd: posix.fd_t) u32 {
+    var buf: [@sizeOf(c_int)]u8 = undefined;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    
+    const rc = std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf, &len);
+    if (rc == 0 and len == @sizeOf(c_int)) {
+        const val: c_int = @bitCast(buf);
+        return if (val > 0) @intCast(val) else 0;
+    }
+    return 0;
 }
 
 /// Enable address reuse.

@@ -5,11 +5,13 @@
 //! - Client address tracking for response routing
 //! - Protocol auto-detection per packet
 //! - LRU eviction for client table
+//! - Large kernel buffers to prevent packet loss
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Use from I/O thread only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -22,6 +24,12 @@ const net_utils = @import("net_utils.zig");
 
 const RECV_BUFFER_SIZE: u32 = 65536;
 const MAX_UDP_CLIENTS: u32 = 4096;
+
+/// Kernel socket buffer sizes
+/// macOS default is ~256KB, Linux default varies
+/// We request 8MB to handle burst traffic without drops
+const SOCKET_RECV_BUF_SIZE: u32 = 8 * 1024 * 1024; // 8MB
+const SOCKET_SEND_BUF_SIZE: u32 = 4 * 1024 * 1024; // 4MB
 
 // ============================================================================
 // Client Tracking
@@ -191,7 +199,14 @@ pub const UdpServer = struct {
 
         // Set socket options
         try net_utils.setReuseAddr(fd);
-        net_utils.setBufferSizes(fd, 1024 * 1024, 1024 * 1024);
+        
+        // Set large kernel buffers to prevent packet loss under load
+        const actual_recv = net_utils.setBufferSizes(fd, SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE);
+        
+        std.log.info("UDP socket buffers: requested recv={d}KB, actual={d}KB", .{
+            SOCKET_RECV_BUF_SIZE / 1024,
+            actual_recv / 1024,
+        });
 
         // Bind
         const addr = try net_utils.parseSockAddr(address, port);

@@ -19,7 +19,13 @@ const proc = @import("processor.zig");
 // ============================================================================
 
 pub const NUM_PROCESSORS: usize = 2;
-const OUTPUT_DRAIN_LIMIT: u32 = 256;
+
+/// Output drain limit per poll cycle - increased from 256!
+/// At 200K orders/sec generating 2 outputs each = 400K outputs/sec
+/// At 1000 polls/sec, need to drain 400 outputs per poll minimum
+/// Set high to ensure we keep up with processor output rate
+const OUTPUT_DRAIN_LIMIT: u32 = 8192;
+
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 1;
 
 // ============================================================================
@@ -135,6 +141,10 @@ pub const ThreadedServer = struct {
         std.debug.assert(!self.running.load(.acquire));
 
         std.log.info("Starting threaded server...", .{});
+        std.log.info("Channel capacity: {d}, Output drain limit: {d}", .{
+            proc.CHANNEL_CAPACITY,
+            OUTPUT_DRAIN_LIMIT,
+        });
 
         for (0..NUM_PROCESSORS) |i| {
             const id: proc.ProcessorId = @enumFromInt(i);
@@ -183,6 +193,7 @@ pub const ThreadedServer = struct {
         self.udp.stop();
         self.multicast.stop();
 
+        // Final drain of output queues
         self.drainOutputQueues();
 
         for (&self.processors) |*p| {
@@ -210,6 +221,10 @@ pub const ThreadedServer = struct {
     }
 
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
+        // IMPORTANT: Drain outputs FIRST to make room for new outputs
+        // This reduces backpressure on processors
+        self.drainOutputQueues();
+
         if (self.cfg.tcp_enabled) {
             _ = try self.tcp.poll(timeout_ms);
         }
@@ -221,6 +236,7 @@ pub const ThreadedServer = struct {
             };
         }
 
+        // Drain again after receiving new messages
         self.drainOutputQueues();
     }
 
@@ -273,6 +289,7 @@ pub const ThreadedServer = struct {
     }
 
     fn drainOutputQueues(self: *Self) void {
+        // Drain more aggressively - process all available outputs up to limit
         for (self.output_queues) |queue| {
             var count: u32 = 0;
             while (count < OUTPUT_DRAIN_LIMIT) : (count += 1) {
@@ -406,6 +423,7 @@ test "ServerStats total processed" {
                 .min_latency_ns = 0,
                 .max_latency_ns = 0,
                 .output_backpressure_count = 0,
+                .output_spin_waits = 0,
                 .idle_cycles = 0,
             },
             .{
@@ -417,6 +435,7 @@ test "ServerStats total processed" {
                 .min_latency_ns = 0,
                 .max_latency_ns = 0,
                 .output_backpressure_count = 0,
+                .output_spin_waits = 0,
                 .idle_cycles = 0,
             },
         },
