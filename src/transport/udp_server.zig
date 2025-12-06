@@ -6,6 +6,7 @@
 //! - Protocol auto-detection per packet
 //! - LRU eviction for client table
 //! - Large kernel buffers to prevent packet loss
+//! - sendmmsg batching on Linux for reduced syscall overhead
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Use from I/O thread only.
@@ -19,6 +20,12 @@ const config = @import("config.zig");
 const net_utils = @import("net_utils.zig");
 
 // ============================================================================
+// Platform Detection
+// ============================================================================
+
+const is_linux = builtin.os.tag == .linux;
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -30,6 +37,9 @@ const MAX_UDP_CLIENTS: u32 = 4096;
 /// We request 8MB to handle burst traffic without drops
 const SOCKET_RECV_BUF_SIZE: u32 = 8 * 1024 * 1024; // 8MB
 const SOCKET_SEND_BUF_SIZE: u32 = 4 * 1024 * 1024; // 4MB
+
+/// Maximum packets to batch in sendmmsg (Linux only)
+const MAX_SENDMMSG_BATCH: usize = 64;
 
 // ============================================================================
 // Client Tracking
@@ -136,6 +146,7 @@ pub const UdpServerStats = struct {
     decode_errors: u64,
     send_errors: u64,
     active_clients: u32,
+    sendmmsg_calls: u64,
 };
 
 // ============================================================================
@@ -174,6 +185,7 @@ pub const UdpServer = struct {
     bytes_sent: u64 = 0,
     decode_errors: u64 = 0,
     send_errors: u64 = 0,
+    sendmmsg_calls: u64 = 0,
 
     const Self = @This();
 
@@ -199,10 +211,10 @@ pub const UdpServer = struct {
 
         // Set socket options
         try net_utils.setReuseAddr(fd);
-        
+
         // Set large kernel buffers to prevent packet loss under load
         const actual_recv = net_utils.setBufferSizes(fd, SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE);
-        
+
         std.log.info("UDP socket buffers: requested recv={d}KB, actual={d}KB", .{
             SOCKET_RECV_BUF_SIZE / 1024,
             actual_recv / 1024,
@@ -356,7 +368,124 @@ pub const UdpServer = struct {
             .decode_errors = self.decode_errors,
             .send_errors = self.send_errors,
             .active_clients = self.clients.count,
+            .sendmmsg_calls = self.sendmmsg_calls,
         };
+    }
+};
+
+// ============================================================================
+// Batch Sender (for future sendmmsg optimization)
+// ============================================================================
+
+/// Batch sender for sending multiple packets efficiently.
+/// On Linux, uses sendmmsg to reduce syscall overhead.
+/// On other platforms, falls back to individual sendto calls.
+pub const BatchSender = struct {
+    server: *UdpServer,
+
+    // Batch buffers (Linux sendmmsg)
+    addrs: [MAX_SENDMMSG_BATCH]posix.sockaddr.in,
+    iovecs: [MAX_SENDMMSG_BATCH]std.posix.iovec_const,
+    count: usize,
+
+    const Self = @This();
+
+    pub fn init(server: *UdpServer) Self {
+        return .{
+            .server = server,
+            .addrs = undefined,
+            .iovecs = undefined,
+            .count = 0,
+        };
+    }
+
+    /// Add a packet to the batch.
+    pub fn add(self: *Self, client_id: config.ClientId, data: []const u8) void {
+        const addr = self.server.clients.findAddr(client_id) orelse return;
+
+        if (self.count >= MAX_SENDMMSG_BATCH) {
+            self.flush();
+        }
+
+        self.addrs[self.count] = .{
+            .family = posix.AF.INET,
+            .port = addr.port,
+            .addr = addr.addr,
+        };
+        self.iovecs[self.count] = .{
+            .base = data.ptr,
+            .len = data.len,
+        };
+        self.count += 1;
+    }
+
+    /// Flush all pending packets.
+    pub fn flush(self: *Self) void {
+        if (self.count == 0) return;
+
+        const fd = self.server.fd orelse return;
+
+        if (is_linux) {
+            self.flushLinux(fd);
+        } else {
+            self.flushFallback(fd);
+        }
+
+        self.count = 0;
+    }
+
+    fn flushLinux(self: *Self, fd: posix.fd_t) void {
+        // Build mmsghdr array
+        var msghdrs: [MAX_SENDMMSG_BATCH]std.os.linux.mmsghdr_const = undefined;
+
+        for (0..self.count) |i| {
+            msghdrs[i] = .{
+                .msg_hdr = .{
+                    .name = @ptrCast(&self.addrs[i]),
+                    .namelen = @sizeOf(posix.sockaddr.in),
+                    .iov = @ptrCast(&self.iovecs[i]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .msg_len = 0,
+            };
+        }
+
+        const sent = std.os.linux.sendmmsg(fd, &msghdrs, self.count, 0);
+        if (sent > 0) {
+            self.server.packets_sent += sent;
+            self.server.sendmmsg_calls += 1;
+
+            // Count bytes sent
+            for (0..sent) |i| {
+                self.server.bytes_sent += msghdrs[i].msg_len;
+            }
+        }
+
+        // Count errors for unsent packets
+        if (sent < self.count) {
+            self.server.send_errors += self.count - sent;
+        }
+    }
+
+    fn flushFallback(self: *Self, fd: posix.fd_t) void {
+        for (0..self.count) |i| {
+            const sent = posix.sendto(
+                fd,
+                @ptrCast(self.iovecs[i].base),
+                0,
+                @ptrCast(&self.addrs[i]),
+                @sizeOf(posix.sockaddr.in),
+            ) catch {
+                self.server.send_errors += 1;
+                continue;
+            };
+
+            self.server.packets_sent += 1;
+            self.server.bytes_sent += sent;
+        }
     }
 };
 
