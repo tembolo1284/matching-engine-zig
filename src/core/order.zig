@@ -18,18 +18,13 @@ const builtin = @import("builtin");
 const msg = @import("../protocol/message_types.zig");
 
 // ============================================================================
-// Platform Verification
+// Platform Detection
 // ============================================================================
 
 /// We only support x86_64 Linux for production - other platforms may work
 /// but haven't been validated for latency characteristics.
+/// On non-x86_64-linux platforms, timestamps use std.time which may syscall.
 const SUPPORTED_PLATFORM = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
-
-comptime {
-    if (!SUPPORTED_PLATFORM) {
-        @compileLog("WARNING: Non-x86_64-linux platform detected. Timestamp fallback will use std.time which may syscall.");
-    }
-}
 
 // ============================================================================
 // Constants
@@ -54,6 +49,9 @@ pub const ORDER_ALIGNMENT = CACHE_LINE_SIZE;
 ///
 /// For strict ordering within a single-threaded matching engine,
 /// RDTSC provides sufficient monotonicity guarantees.
+///
+/// WARNING: On non-x86_64-linux platforms, this uses std.time.nanoTimestamp()
+/// which may syscall and add microseconds of latency.
 pub inline fn getCurrentTimestamp() u64 {
     if (comptime SUPPORTED_PLATFORM) {
         // RDTSC: Read Time Stamp Counter
@@ -521,16 +519,12 @@ test "Order priority" {
     try std.testing.expect(low_ask.getPriority(false) < high_ask.getPriority(false));
 }
 
-test "RDTSC timestamp monotonicity" {
-    if (!SUPPORTED_PLATFORM) {
-        return error.SkipZigTest;
-    }
-
+test "Timestamp generation" {
     const t1 = getCurrentTimestamp();
     const t2 = getCurrentTimestamp();
     const t3 = getCurrentTimestamp();
 
-    // Timestamps should be monotonically increasing
+    // Timestamps should be monotonically increasing (or equal for very fast calls)
     try std.testing.expect(t2 >= t1);
     try std.testing.expect(t3 >= t2);
 }

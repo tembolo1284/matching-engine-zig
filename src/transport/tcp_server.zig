@@ -173,15 +173,14 @@ const Poller = struct {
         } else if (is_darwin or is_bsd) {
             var events: [MAX_EVENTS]posix.Kevent = undefined;
 
-            const timeout: ?posix.timespec = if (timeout_ms < 0)
-                null
-            else
-                .{
-                    .sec = @intCast(@divTrunc(timeout_ms, 1000)),
-                    .nsec = @intCast(@mod(timeout_ms, 1000) * 1_000_000),
-                };
+            // kevent expects a pointer to timespec, not an optional value
+            var timeout_val: posix.timespec = .{
+                .sec = @intCast(@divTrunc(timeout_ms, 1000)),
+                .nsec = @intCast(@mod(timeout_ms, 1000) * 1_000_000),
+            };
+            const timeout_ptr: ?*const posix.timespec = if (timeout_ms < 0) null else &timeout_val;
 
-            const n = try posix.kevent(self.fd, &[_]posix.Kevent{}, &events, timeout);
+            const n = try posix.kevent(self.fd, &[_]posix.Kevent{}, &events, timeout_ptr);
 
             const count = @min(n, results.len);
             for (0..count) |i| {
@@ -379,7 +378,7 @@ pub const TcpServer = struct {
         self.poller = poller;
 
         const platform = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
-        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={})", .{
+        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={s})", .{
             address,
             port,
             self.use_framing,

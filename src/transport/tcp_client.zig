@@ -21,10 +21,20 @@
 //! - NOT thread-safe. Each client owned by single I/O thread.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const config = @import("config.zig");
 const codec = @import("../protocol/codec.zig");
 const net_utils = @import("net_utils.zig");
+
+// ============================================================================
+// Platform Detection
+// ============================================================================
+
+const is_linux = builtin.os.tag == .linux;
+
+// MSG.NOSIGNAL doesn't exist on macOS - we ignore SIGPIPE at process level instead
+const SEND_FLAGS: u32 = if (is_linux) posix.MSG.NOSIGNAL else 0;
 
 // ============================================================================
 // Configuration
@@ -410,7 +420,7 @@ pub const TcpClient = struct {
             const sent = posix.send(
                 self.fd,
                 self.send_buf[self.send_pos..self.send_len],
-                posix.MSG.NOSIGNAL, // Don't SIGPIPE on closed connection
+                SEND_FLAGS, // MSG.NOSIGNAL on Linux, 0 on macOS (SIGPIPE ignored at process level)
             ) catch |err| {
                 if (net_utils.isWouldBlock(err)) return;
                 return err;
