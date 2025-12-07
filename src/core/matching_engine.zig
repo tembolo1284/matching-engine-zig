@@ -194,7 +194,10 @@ pub const MatchingEngine = struct {
         client_id: config.ClientId,
         output: *OutputBuffer,
     ) void {
-        std.debug.assert(order.quantity > 0);
+        if (order.quantity == 0) {
+            std.log.warn("Rejecting order with zero quantity from client {d}", .{client_id});
+            return;
+        }
 
         self.total_orders += 1;
 
