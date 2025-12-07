@@ -11,16 +11,19 @@ Wire-compatible with the C matching engine implementation.
 - **Cache-optimized** — 64-byte aligned structures, sequential memory access
 - **Lock-free queues** — SPSC queues for inter-thread communication
 - **Dual-processor mode** — Parallel matching with symbol-based routing (A-M / N-Z)
+- **UDP batching** — Multiple messages per packet for high throughput (~77 msgs/packet)
 
 ### Networking
 - **TCP** — Multi-client with epoll, 4-byte length-prefix framing
-- **UDP** — Bidirectional request/response, no framing needed
+- **UDP** — Bidirectional request/response with message batching
 - **Multicast** — Market data broadcast for unlimited subscribers
+- **Large buffers** — 8MB kernel buffers for burst handling
 
 ### Protocols
 - **Binary** — High-performance, network byte order, magic byte `0x4D`
 - **CSV** — Human-readable, newline-delimited
 - **Auto-detection** — Protocol detected from first byte
+- **Protocol-aware responses** — Server responds in client's detected protocol
 
 ### Architecture
 - **Single-threaded mode** — Simple, low-latency for moderate load
@@ -56,6 +59,7 @@ ENGINE_THREADED=true zig build run
 # Or use make
 make run            # Single-threaded
 make run-threaded   # Dual-processor
+make run-threaded-csv  # Dual-processor with CSV banner
 ```
 
 ### Test with Orders
@@ -74,6 +78,26 @@ echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost 1235
 # T, IBM, 1, 1, 2, 1, 10000, 50  <- Trade executed!
 # B, IBM, B, 10000, 50   <- Remaining quantity
 ```
+
+## Linux Kernel Tuning (Important!)
+
+For high-throughput UDP scenarios (10K+ orders), increase kernel buffer limits:
+
+```bash
+# Check current limits
+cat /proc/sys/net/core/rmem_max
+cat /proc/sys/net/core/wmem_max
+
+# Increase to 8MB (required for stress tests)
+sudo sysctl -w net.core.rmem_max=8388608
+sudo sysctl -w net.core.wmem_max=8388608
+
+# Make permanent (add to /etc/sysctl.conf)
+echo "net.core.rmem_max=8388608" | sudo tee -a /etc/sysctl.conf
+echo "net.core.wmem_max=8388608" | sudo tee -a /etc/sysctl.conf
+```
+
+Without this tuning, the server will only get ~208KB buffers instead of the requested 8MB, causing packet loss under load.
 
 ## Protocol Formats
 
@@ -119,6 +143,17 @@ TCP uses 4-byte big-endian length prefix:
 ```
 
 UDP packets contain raw messages (no framing).
+
+### Protocol-Aware Encoding
+
+The server automatically detects each client's protocol from their first message and responds in the same format:
+
+| Client Sends | Server Responds |
+|--------------|-----------------|
+| Binary (0x4D magic) | Binary |
+| CSV (text) | CSV |
+
+**UDP Batching**: CSV responses are batched into ~1400-byte packets (multiple messages per packet, newline-delimited). Binary responses are sent one message per packet (fixed-size, no delimiter).
 
 ## Configuration
 
@@ -174,7 +209,7 @@ matching-engine-zig/
     │   ├── net_utils.zig           # Shared network utilities
     │   ├── tcp_client.zig          # Per-connection state
     │   ├── tcp_server.zig          # Multi-client TCP with epoll
-    │   ├── udp_server.zig          # Bidirectional UDP
+    │   ├── udp_server.zig          # Bidirectional UDP with batching
     │   ├── multicast.zig           # Market data multicast
     │   └── server.zig              # Single-threaded server
     │
@@ -249,12 +284,17 @@ matching-engine-zig/
               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 I/O Thread (dispatch)                        │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              UDP Batch Manager                       │   │
+│  │  Accumulates messages per client, flushes at 1400B  │   │
+│  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 - I/O isolated from matching
 - Parallel matching by symbol range
 - Lock-free SPSC queues (65,536 capacity)
+- UDP batching reduces packet count by ~98%
 - Best for > 100K messages/sec
 
 ### Symbol Routing
@@ -287,12 +327,32 @@ Cancel and Flush messages are sent to **both** processors.
 | Message encode | ~15 ns | ~15 ns |
 | **Total** | **~100 ns** | **~150 ns** |
 
-### Throughput
+Measured in threaded mode: **~932ns average** (includes I/O overhead)
 
-| Mode | Messages/sec |
-|------|--------------|
-| Single-threaded | 5-10 M |
-| Dual-processor | 8-15 M |
+### Throughput Results
+
+| Scenario | Orders | ACK Rate | Notes |
+|----------|--------|----------|-------|
+| Stress 1K | 1,000 | 100% | Baseline |
+| Stress 10K | 10,000 | 100% | With client throttling |
+| Stress 100K | 100,000 | 100% | 1,304 UDP batches, 16MB kernel buffer |
+| Stress 1M | 1,000,000 | 34% | Needs architectural changes |
+
+**100K Test Details:**
+- Client send rate: 62K orders/sec
+- Server processed: 100,002 messages
+- Server outputs: 109,700 (ACKs + Top of Book)
+- UDP batches: 1,304 packets (~77 msgs/packet)
+- Client received: 100% ACKs
+
+### Client Requirements for Stress Tests
+
+For reliable high-throughput testing, clients should:
+
+1. **Throttle sends** — Small batches (200-500 orders) with delays (10-45ms)
+2. **Large recv buffers** — 8MB kernel buffer to handle bursts
+3. **Parse batched responses** — Loop through newline-delimited messages
+4. **Settle time** — Wait 500-2000ms after sending before draining responses
 
 ## Make Targets
 ```bash
@@ -300,6 +360,7 @@ make                  # Build debug
 make release          # Build optimized
 make run              # Run single-threaded
 make run-threaded     # Run dual-processor
+make run-threaded-csv # Run dual-processor (CSV banner)
 make test             # Run all tests
 make bench            # Run benchmarks
 make clean            # Clean build artifacts
@@ -335,9 +396,33 @@ This implementation is wire-compatible with the C matching engine:
 | CSV format | Identical field order |
 | Symbol routing | A-M → P0, N-Z → P1 |
 
+## Troubleshooting
+
+### UDP Packet Loss at High Volume
+
+**Symptoms:** Client receives fewer ACKs than orders sent (e.g., 55% instead of 100%)
+
+**Solutions:**
+1. Increase kernel buffer limits (see Linux Kernel Tuning section)
+2. Ensure client throttles sends appropriately
+3. Check server logs for "Messages dropped" or "Backpressure" counts
+
+### Binary Client Gets CSV Responses
+
+**Cause:** Protocol detection happens on first packet. Ensure first message uses binary format.
+
+**Solution:** Server now tracks protocol per client and responds accordingly.
+
+### TCP Client Disconnects Early
+
+**Symptoms:** Missing responses, client shows fewer ACKs than server sent
+
+**Cause:** Client drain timeout too short
+
+**Solution:** Increase client's drain timeout (5-10 seconds for 100K+ orders)
+
 ## Documentation
 
 - [QUICK_START.md](docs/QUICK_START.md) — Get running in 5 minutes
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Deep dive into system design
 - [DOCKER.md](docs/DOCKER.md) — Container deployment guide
-
