@@ -3,7 +3,7 @@
 //! Features:
 //! - Connectionless request/response
 //! - Client address tracking for response routing
-//! - Protocol auto-detection per packet
+//! - Protocol auto-detection per client (binary vs CSV)
 //! - LRU eviction for client table
 //! - Large kernel buffers to prevent packet loss
 //! - sendmmsg batching on Linux for reduced syscall overhead
@@ -42,6 +42,17 @@ const SOCKET_SEND_BUF_SIZE: u32 = 4 * 1024 * 1024; // 4MB
 const MAX_SENDMMSG_BATCH: usize = 64;
 
 // ============================================================================
+// Protocol Detection
+// ============================================================================
+
+/// Protocol type for client communication
+pub const Protocol = enum {
+    binary,
+    csv,
+    unknown,
+};
+
+// ============================================================================
 // Client Tracking
 // ============================================================================
 
@@ -49,6 +60,7 @@ const UdpClientEntry = struct {
     addr: config.UdpClientAddr,
     client_id: config.ClientId,
     last_seen: i64,
+    protocol: Protocol = .unknown,
     active: bool = false,
 };
 
@@ -88,6 +100,7 @@ const UdpClientMap = struct {
                     .addr = addr,
                     .client_id = self.allocateId(),
                     .last_seen = now,
+                    .protocol = .unknown,
                     .active = true,
                 };
                 self.count += 1;
@@ -109,6 +122,7 @@ const UdpClientMap = struct {
             .addr = addr,
             .client_id = self.allocateId(),
             .last_seen = now,
+            .protocol = .unknown,
             .active = true,
         };
         return self.entries[oldest_idx].client_id;
@@ -122,6 +136,29 @@ const UdpClientMap = struct {
             }
         }
         return null;
+    }
+
+    /// Get protocol for client ID.
+    fn getProtocol(self: *const Self, client_id: config.ClientId) Protocol {
+        for (self.entries) |entry| {
+            if (entry.active and entry.client_id == client_id) {
+                return entry.protocol;
+            }
+        }
+        return .unknown;
+    }
+
+    /// Set protocol for client ID.
+    fn setProtocol(self: *Self, client_id: config.ClientId, protocol: Protocol) void {
+        for (&self.entries) |*entry| {
+            if (entry.active and entry.client_id == client_id) {
+                // Only set if unknown (first packet determines protocol)
+                if (entry.protocol == .unknown) {
+                    entry.protocol = protocol;
+                }
+                return;
+            }
+        }
     }
 
     fn allocateId(self: *Self) config.ClientId {
@@ -274,11 +311,16 @@ pub const UdpServer = struct {
             };
             const client_id = self.clients.getOrCreate(client_addr);
 
-            // Process packet
+            // Process packet (also detects and stores protocol)
             self.processPacket(self.recv_buf[0..n], client_id);
         }
 
         return count;
+    }
+
+    /// Get protocol for a client.
+    pub fn getClientProtocol(self: *const Self, client_id: config.ClientId) Protocol {
+        return self.clients.getProtocol(client_id);
     }
 
     /// Send to client by ID.
@@ -347,6 +389,15 @@ pub const UdpServer = struct {
     }
 
     fn processPacket(self: *Self, data: []const u8, client_id: config.ClientId) void {
+        // Detect protocol from raw data BEFORE decoding using codec's detection
+        const codec_protocol = codec.detectProtocol(data);
+        const detected_protocol: Protocol = switch (codec_protocol) {
+            .binary => .binary,
+            .csv => .csv,
+            else => .unknown,
+        };
+        self.clients.setProtocol(client_id, detected_protocol);
+
         const result = codec.Codec.decodeInput(data) catch |err| {
             self.decode_errors += 1;
             std.log.debug("UDP decode error: {}", .{err});
@@ -521,4 +572,22 @@ test "UdpClientMap find addr" {
 
     // Unknown ID
     try std.testing.expect(map.findAddr(99999) == null);
+}
+
+test "UdpClientMap protocol tracking" {
+    var map = UdpClientMap.init();
+
+    const addr = config.UdpClientAddr.init(0x0100007F, 8080);
+    const id = map.getOrCreate(addr);
+
+    // Initially unknown
+    try std.testing.expectEqual(Protocol.unknown, map.getProtocol(id));
+
+    // Set to binary
+    map.setProtocol(id, .binary);
+    try std.testing.expectEqual(Protocol.binary, map.getProtocol(id));
+
+    // Can't change once set
+    map.setProtocol(id, .csv);
+    try std.testing.expectEqual(Protocol.binary, map.getProtocol(id));
 }

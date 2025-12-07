@@ -5,6 +5,7 @@
 //!
 //! Optimizations:
 //! - Message batching: Multiple CSV messages packed into single UDP packet
+//! - Protocol-aware encoding: Binary clients get binary responses, CSV clients get CSV
 //! - Aggressive output draining: Process up to 8192 outputs per poll cycle
 
 const std = @import("std");
@@ -13,7 +14,9 @@ const codec = @import("../protocol/codec.zig");
 const csv_codec = @import("../protocol/csv_codec.zig");
 const binary_codec = @import("../protocol/binary_codec.zig");
 const TcpServer = @import("../transport/tcp_server.zig").TcpServer;
-const UdpServer = @import("../transport/udp_server.zig").UdpServer;
+const udp_server = @import("../transport/udp_server.zig");
+const UdpServer = udp_server.UdpServer;
+const UdpProtocol = udp_server.Protocol;
 const MulticastPublisher = @import("../transport/multicast.zig").MulticastPublisher;
 const config = @import("../transport/config.zig");
 const proc = @import("processor.zig");
@@ -452,27 +455,39 @@ pub const ThreadedServer = struct {
 
     /// Process a single output message, batching UDP sends
     fn processOutput(self: *Self, out_msg: *const msg.OutputMsg) void {
-        // Encode message
-        const len = csv_codec.encodeOutput(out_msg, &self.encode_buf) catch |err| {
-            std.log.err("Failed to encode output message: {any}", .{err});
-            return;
-        };
+        // Determine client protocol for UDP clients
+        const use_binary = if (config.isUdpClient(out_msg.client_id))
+            self.udp.getClientProtocol(out_msg.client_id) == .binary
+        else
+            false; // TCP always uses CSV for now
+
+        // Encode message based on client protocol
+        const len = if (use_binary)
+            binary_codec.encodeOutput(out_msg, &self.encode_buf) catch |err| {
+                std.log.err("Failed to encode binary output: {any}", .{err});
+                return;
+            }
+        else
+            csv_codec.encodeOutput(out_msg, &self.encode_buf) catch |err| {
+                std.log.err("Failed to encode CSV output: {any}", .{err});
+                return;
+            };
         const data = self.encode_buf[0..len];
 
         // Handle based on message type
         switch (out_msg.msg_type) {
             .ack, .cancel_ack, .reject => {
-                self.batchedSendToClient(out_msg.client_id, data);
+                self.batchedSendToClient(out_msg.client_id, data, use_binary);
             },
             .trade => {
-                self.batchedSendToClient(out_msg.client_id, data);
+                self.batchedSendToClient(out_msg.client_id, data, use_binary);
                 if (self.cfg.mcast_enabled) {
                     _ = self.multicast.publish(out_msg);
                 }
             },
             .top_of_book => {
                 if (out_msg.client_id != 0) {
-                    self.batchedSendToClient(out_msg.client_id, data);
+                    self.batchedSendToClient(out_msg.client_id, data, use_binary);
                 }
                 if (self.cfg.mcast_enabled) {
                     _ = self.multicast.publish(out_msg);
@@ -482,7 +497,7 @@ pub const ThreadedServer = struct {
     }
 
     /// Add message to batch, flushing if needed
-    fn batchedSendToClient(self: *Self, client_id: config.ClientId, data: []const u8) void {
+    fn batchedSendToClient(self: *Self, client_id: config.ClientId, data: []const u8, is_binary: bool) void {
         if (client_id == 0) return;
 
         // TCP messages are not batched (TCP handles its own buffering)
@@ -491,7 +506,15 @@ pub const ThreadedServer = struct {
             return;
         }
 
-        // Try to add to batch
+        // Binary protocol: send immediately (fixed-size messages, no newline delimiter)
+        // CSV protocol: batch multiple messages into single UDP packet
+        if (is_binary) {
+            _ = self.udp.send(client_id, data);
+            _ = self.batches_sent.fetchAdd(1, .monotonic);
+            return;
+        }
+
+        // CSV: Try to add to batch
         while (true) {
             if (self.batch_mgr.addOrFlush(client_id, data)) |full_batch| {
                 // Batch is full, flush it
@@ -512,7 +535,7 @@ pub const ThreadedServer = struct {
         const data = batch.getData();
         const sent = self.udp.send(batch.client_id, data);
         _ = self.batches_sent.fetchAdd(1, .monotonic);
-        
+
         // Debug: log first few batches
         const batches_so_far = self.batches_sent.load(.monotonic);
         if (batches_so_far <= 3) {
