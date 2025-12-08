@@ -2,14 +2,16 @@
 //!
 //! Design principles:
 //! - Price-time priority: best price first, then FIFO at each level
-//! - O(1) order lookup via hash map
+//! - O(1) order lookup via OrderMap
 //! - O(n) price level operations (acceptable for typical 10-100 levels)
 //! - Zero allocation in hot path (uses pre-allocated pools)
-//! - Bounded iterations prevent runaway matching
+//! - Bounded iterations prevent runaway matching (NASA Rule 2)
+//! - All output buffer writes are checked (NASA Rule 7)
 //!
-//! Memory model:
-//! - Uses initInPlace pattern for large structs to avoid stack overflow
-//! - No compile-time array initializers for large arrays
+//! Output Message Routing:
+//! - client_id > 0: unicast to specific TCP client
+//! - client_id = 0: multicast to market data feed
+//! TopOfBook updates emit TWO messages: one to originator, one to multicast.
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Single-threaded access only.
@@ -20,281 +22,36 @@ const Order = @import("order.zig").Order;
 const getCurrentTimestamp = @import("order.zig").getCurrentTimestamp;
 const MemoryPools = @import("memory_pool.zig").MemoryPools;
 
+// Import from sibling modules
+const order_map = @import("order_map.zig");
+pub const OrderMap = order_map.OrderMap;
+pub const OrderLocation = order_map.OrderLocation;
+
+const output_buffer = @import("output_buffer.zig");
+pub const OutputBuffer = output_buffer.OutputBuffer;
+pub const MAX_OUTPUT_MESSAGES = output_buffer.MAX_OUTPUT_MESSAGES;
+
 // ============================================================================
 // Configuration
 // ============================================================================
 
+/// Maximum price levels per side. With O(n) operations, keep this reasonable.
+/// For high-frequency scenarios with many price levels, consider a skip list.
 pub const MAX_PRICE_LEVELS: u32 = 10_000;
-pub const MAX_OUTPUT_MESSAGES: u32 = 8_192;
-pub const ORDER_MAP_SIZE: u32 = 262_144;
-pub const ORDER_MAP_MASK: u32 = ORDER_MAP_SIZE - 1;
-pub const MAX_PROBE_LENGTH: u32 = 128;
+
+/// Safety bound on matching iterations per incoming order.
+/// Prevents runaway matching if book is corrupted.
 pub const MAX_MATCH_ITERATIONS: u32 = 200_000;
 
-const TOMBSTONE_COMPACT_THRESHOLD: u32 = 25;
-const LOAD_FACTOR_WARNING: u32 = 75;
-
-const HASH_SLOT_EMPTY: u64 = 0;
-const HASH_SLOT_TOMBSTONE: u64 = std.math.maxInt(u64);
-
-// ============================================================================
-// Order Location
-// ============================================================================
-
-pub const OrderLocation = struct {
-    side: msg.Side,
-    price: u32,
-    order_ptr: *Order,
-
-    pub fn isValid(self: *const OrderLocation) bool {
-        if (self.order_ptr.price != self.price) return false;
-        if (self.order_ptr.side != self.side) return false;
-        return true;
-    }
-};
-
-// ============================================================================
-// Order Hash Map
-// ============================================================================
-
-const OrderMapSlot = struct {
-    key: u64,
-    location: OrderLocation,
-};
-
-pub const OrderMap = struct {
-    // NOTE: No default value! Must use initInPlace.
-    slots: [ORDER_MAP_SIZE]OrderMapSlot,
-    count: u32,
-    tombstone_count: u32,
-    total_inserts: u64,
-    total_removes: u64,
-    total_lookups: u64,
-    probe_total: u64,
-    max_probe: u32,
-    compactions: u32,
-
-    const Self = @This();
-
-    /// Initialize in-place (required for large struct).
-    pub fn initInPlace(self: *Self) void {
-        self.count = 0;
-        self.tombstone_count = 0;
-        self.total_inserts = 0;
-        self.total_removes = 0;
-        self.total_lookups = 0;
-        self.probe_total = 0;
-        self.max_probe = 0;
-        self.compactions = 0;
-
-        // Initialize all slots at runtime
-        for (&self.slots) |*slot| {
-            slot.key = HASH_SLOT_EMPTY;
-        }
-    }
-
-    /// Legacy init for small test cases only.
-    pub fn init() Self {
-        var self: Self = undefined;
-        self.initInPlace();
-        return self;
-    }
-
-    pub inline fn makeKey(user_id: u32, user_order_id: u32) u64 {
-        const raw = (@as(u64, user_id) << 32) | user_order_id;
-        std.debug.assert(raw != HASH_SLOT_EMPTY);
-        std.debug.assert(raw != HASH_SLOT_TOMBSTONE);
-        return raw;
-    }
-
-    inline fn hash(key: u64) u32 {
-        std.debug.assert(key != HASH_SLOT_EMPTY);
-        std.debug.assert(key != HASH_SLOT_TOMBSTONE);
-
-        const GOLDEN_RATIO: u64 = 0x9E3779B97F4A7C15;
-        var k = key;
-        k ^= k >> 33;
-        k *%= GOLDEN_RATIO;
-        k ^= k >> 29;
-        return @intCast(k & ORDER_MAP_MASK);
-    }
-
-    pub fn insert(self: *Self, key: u64, location: OrderLocation) bool {
-        std.debug.assert(key != HASH_SLOT_EMPTY);
-        std.debug.assert(key != HASH_SLOT_TOMBSTONE);
-        std.debug.assert(location.order_ptr.remaining_qty > 0);
-
-        if (self.shouldCompact()) {
-            self.compact();
-        }
-
-        var idx = hash(key);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot_key = self.slots[idx].key;
-
-            if (slot_key == HASH_SLOT_EMPTY or slot_key == HASH_SLOT_TOMBSTONE) {
-                const was_tombstone = (slot_key == HASH_SLOT_TOMBSTONE);
-
-                self.slots[idx] = .{ .key = key, .location = location };
-                self.count += 1;
-
-                if (was_tombstone) {
-                    std.debug.assert(self.tombstone_count > 0);
-                    self.tombstone_count -= 1;
-                }
-
-                self.recordProbe(probe);
-                self.total_inserts += 1;
-                std.debug.assert(self.count <= ORDER_MAP_SIZE);
-                return true;
-            }
-
-            if (slot_key == key) {
-                std.debug.panic("OrderMap.insert: duplicate key {d}", .{key});
-            }
-
-            idx = (idx + 1) & ORDER_MAP_MASK;
-        }
-
-        self.recordProbe(MAX_PROBE_LENGTH);
-        return false;
-    }
-
-    pub fn find(self: *Self, key: u64) ?*const OrderLocation {
-        std.debug.assert(key != HASH_SLOT_EMPTY);
-        std.debug.assert(key != HASH_SLOT_TOMBSTONE);
-
-        var idx = hash(key);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot = &self.slots[idx];
-
-            if (slot.key == HASH_SLOT_EMPTY) {
-                self.recordProbe(probe);
-                self.total_lookups += 1;
-                return null;
-            }
-
-            if (slot.key == key) {
-                self.recordProbe(probe);
-                self.total_lookups += 1;
-                return &slot.location;
-            }
-
-            idx = (idx + 1) & ORDER_MAP_MASK;
-        }
-
-        self.recordProbe(MAX_PROBE_LENGTH);
-        self.total_lookups += 1;
-        return null;
-    }
-
-    pub fn remove(self: *Self, key: u64) bool {
-        std.debug.assert(key != HASH_SLOT_EMPTY);
-        std.debug.assert(key != HASH_SLOT_TOMBSTONE);
-
-        var idx = hash(key);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot = &self.slots[idx];
-
-            if (slot.key == HASH_SLOT_EMPTY) {
-                self.recordProbe(probe);
-                return false;
-            }
-
-            if (slot.key == key) {
-                slot.key = HASH_SLOT_TOMBSTONE;
-                std.debug.assert(self.count > 0);
-                self.count -= 1;
-                self.tombstone_count += 1;
-                self.recordProbe(probe);
-                self.total_removes += 1;
-                return true;
-            }
-
-            idx = (idx + 1) & ORDER_MAP_MASK;
-        }
-
-        self.recordProbe(MAX_PROBE_LENGTH);
-        return false;
-    }
-
-    fn shouldCompact(self: *const Self) bool {
-        const threshold = ORDER_MAP_SIZE * TOMBSTONE_COMPACT_THRESHOLD / 100;
-        return self.tombstone_count > threshold;
-    }
-
-    fn compact(self: *Self) void {
-        var entries: [ORDER_MAP_SIZE]OrderMapSlot = undefined;
-        var entry_count: u32 = 0;
-
-        for (&self.slots) |*slot| {
-            if (slot.key != HASH_SLOT_EMPTY and slot.key != HASH_SLOT_TOMBSTONE) {
-                entries[entry_count] = slot.*;
-                entry_count += 1;
-            }
-        }
-
-        std.debug.assert(entry_count == self.count);
-
-        for (&self.slots) |*slot| {
-            slot.key = HASH_SLOT_EMPTY;
-        }
-
-        const old_count = self.count;
-        self.count = 0;
-        self.tombstone_count = 0;
-
-        for (entries[0..entry_count]) |entry| {
-            const success = self.insertInternal(entry.key, entry.location);
-            std.debug.assert(success);
-        }
-
-        std.debug.assert(self.count == old_count);
-        self.compactions += 1;
-    }
-
-    fn insertInternal(self: *Self, key: u64, location: OrderLocation) bool {
-        var idx = hash(key);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            if (self.slots[idx].key == HASH_SLOT_EMPTY) {
-                self.slots[idx] = .{ .key = key, .location = location };
-                self.count += 1;
-                return true;
-            }
-            idx = (idx + 1) & ORDER_MAP_MASK;
-        }
-        return false;
-    }
-
-    fn recordProbe(self: *Self, probe_length: u32) void {
-        self.probe_total += probe_length;
-        self.max_probe = @max(self.max_probe, probe_length);
-    }
-
-    pub fn getLoadFactor(self: *const Self) u32 {
-        return (self.count * 100) / ORDER_MAP_SIZE;
-    }
-
-    pub fn isValid(self: *const Self) bool {
-        if (self.count > ORDER_MAP_SIZE) return false;
-        if (self.tombstone_count > ORDER_MAP_SIZE) return false;
-        if (self.count + self.tombstone_count > ORDER_MAP_SIZE) return false;
-        return true;
-    }
-};
+/// Threshold for lazy price level cleanup (number of inactive levels).
+const LAZY_CLEANUP_THRESHOLD: u32 = 100;
 
 // ============================================================================
 // Price Level
 // ============================================================================
 
+/// A single price level containing orders at that price.
+/// Exactly 64 bytes (one cache line) for optimal memory access.
 pub const PriceLevel = extern struct {
     price: u32,
     total_quantity: u32,
@@ -322,6 +79,7 @@ pub const PriceLevel = extern struct {
         };
     }
 
+    /// Validate price level invariants.
     pub fn isValid(self: *const Self) bool {
         const head_null = (self.orders_head == null);
         const tail_null = (self.orders_tail == null);
@@ -336,6 +94,7 @@ pub const PriceLevel = extern struct {
         return true;
     }
 
+    /// Add order to tail of this price level (FIFO).
     pub fn addOrder(self: *Self, order: *Order) void {
         std.debug.assert(order.price == self.price);
         std.debug.assert(order.remaining_qty > 0);
@@ -360,6 +119,7 @@ pub const PriceLevel = extern struct {
         std.debug.assert(self.isValid());
     }
 
+    /// Remove order from this price level.
     pub fn removeOrder(self: *Self, order: *Order) void {
         std.debug.assert(self.active);
         std.debug.assert(self.order_count > 0);
@@ -395,67 +155,10 @@ pub const PriceLevel = extern struct {
         std.debug.assert(self.isValid());
     }
 
+    /// Reduce total quantity (called during partial fills).
     pub fn reduceQuantity(self: *Self, amount: u32) void {
         std.debug.assert(self.total_quantity >= amount);
         self.total_quantity -= amount;
-    }
-};
-
-// ============================================================================
-// Output Buffer
-// ============================================================================
-
-pub const OutputBuffer = struct {
-    // NOTE: No default value! Must use init() or initInPlace().
-    messages: [MAX_OUTPUT_MESSAGES]msg.OutputMsg,
-    count: u32,
-    overflow_count: u64,
-    peak_count: u32,
-
-    const Self = @This();
-
-    /// Initialize (small enough to return by value in most cases).
-    pub fn init() Self {
-        return .{
-            .messages = undefined,
-            .count = 0,
-            .overflow_count = 0,
-            .peak_count = 0,
-        };
-    }
-
-    pub fn hasSpace(self: *const Self, needed: u32) bool {
-        return (self.count + needed) <= MAX_OUTPUT_MESSAGES;
-    }
-
-    pub fn add(self: *Self, message: msg.OutputMsg) bool {
-        if (self.count >= MAX_OUTPUT_MESSAGES) {
-            self.overflow_count += 1;
-            return false;
-        }
-
-        self.messages[self.count] = message;
-        self.count += 1;
-        self.peak_count = @max(self.peak_count, self.count);
-
-        return true;
-    }
-
-    pub fn addChecked(self: *Self, message: msg.OutputMsg) void {
-        const success = self.add(message);
-        std.debug.assert(success);
-    }
-
-    pub fn clear(self: *Self) void {
-        self.count = 0;
-    }
-
-    pub fn slice(self: *const Self) []const msg.OutputMsg {
-        return self.messages[0..self.count];
-    }
-
-    pub fn hasOverflowed(self: *const Self) bool {
-        return self.overflow_count > 0;
     }
 };
 
@@ -483,21 +186,29 @@ pub const OrderBookStats = struct {
 pub const OrderBook = struct {
     symbol: msg.Symbol,
 
-    // NOTE: No default values! Must use initInPlace.
+    // Price levels (NOTE: No default values! Must use initInPlace)
     bids: [MAX_PRICE_LEVELS]PriceLevel,
     asks: [MAX_PRICE_LEVELS]PriceLevel,
     num_bid_levels: u32,
     num_ask_levels: u32,
 
+    // Count of inactive levels (for lazy cleanup)
+    inactive_bid_levels: u32,
+    inactive_ask_levels: u32,
+
+    // Order lookup
     order_map: OrderMap,
 
+    // Previous best prices (for TOB change detection)
     prev_best_bid_price: u32,
     prev_best_bid_qty: u32,
     prev_best_ask_price: u32,
     prev_best_ask_qty: u32,
 
+    // Memory pools (external, managed by caller)
     pools: *MemoryPools,
 
+    // Statistics
     total_orders: u64,
     total_cancels: u64,
     total_trades: u64,
@@ -520,6 +231,8 @@ pub const OrderBook = struct {
         self.pools = pools;
         self.num_bid_levels = 0;
         self.num_ask_levels = 0;
+        self.inactive_bid_levels = 0;
+        self.inactive_ask_levels = 0;
         self.prev_best_bid_price = 0;
         self.prev_best_bid_qty = 0;
         self.prev_best_ask_price = 0;
@@ -531,8 +244,8 @@ pub const OrderBook = struct {
         self.total_fills = 0;
         self.volume_traded = 0;
 
-        // Initialize order map
-        self.order_map.initInPlace();
+        // Initialize order map with allocator for compaction
+        self.order_map.initInPlace(pools.order_pool.allocator);
 
         // Initialize price levels at runtime (NOT compile-time!)
         for (&self.bids) |*level| {
@@ -569,6 +282,10 @@ pub const OrderBook = struct {
     // Order Entry
     // ========================================================================
 
+    /// Process a new order.
+    ///
+    /// Generates: Ack (always), Trade(s) (if matched), TopOfBook (if changed),
+    /// or Reject (on error).
     pub fn addOrder(
         self: *Self,
         order_msg: *const msg.NewOrderMsg,
@@ -579,9 +296,23 @@ pub const OrderBook = struct {
 
         self.total_orders += 1;
 
+        // Validate order ID is not a reserved sentinel value
+        if (!OrderMap.isValidKey(order_msg.user_id, order_msg.user_order_id)) {
+            self.total_rejects += 1;
+            output.addChecked(msg.OutputMsg.makeReject(
+                order_msg.user_id,
+                order_msg.user_order_id,
+                .invalid_order_id,
+                self.symbol,
+                client_id,
+            ));
+            return;
+        }
+
+        // Validate quantity
         if (order_msg.quantity == 0) {
             self.total_rejects += 1;
-            _ = output.add(msg.OutputMsg.makeReject(
+            output.addChecked(msg.OutputMsg.makeReject(
                 order_msg.user_id,
                 order_msg.user_order_id,
                 .invalid_quantity,
@@ -591,9 +322,10 @@ pub const OrderBook = struct {
             return;
         }
 
+        // Acquire order from pool
         const order = self.pools.order_pool.acquire() orelse {
             self.total_rejects += 1;
-            _ = output.add(msg.OutputMsg.makeReject(
+            output.addChecked(msg.OutputMsg.makeReject(
                 order_msg.user_id,
                 order_msg.user_order_id,
                 .pool_exhausted,
@@ -608,21 +340,24 @@ pub const OrderBook = struct {
 
         std.debug.assert(order.isValid());
 
-        _ = output.add(msg.OutputMsg.makeAck(
+        // Send acknowledgment
+        output.addChecked(msg.OutputMsg.makeAck(
             order.user_id,
             order.user_order_id,
             self.symbol,
             client_id,
         ));
 
+        // Attempt matching
         self.matchOrder(order, client_id, output);
 
+        // If not fully filled, add to book
         if (!order.isFilled()) {
             const inserted = self.insertOrder(order);
             if (!inserted) {
                 std.log.err("Order book full, rejecting order", .{});
                 self.total_rejects += 1;
-                _ = output.add(msg.OutputMsg.makeReject(
+                output.addChecked(msg.OutputMsg.makeReject(
                     order.user_id,
                     order.user_order_id,
                     .book_full,
@@ -634,6 +369,7 @@ pub const OrderBook = struct {
             }
             self.checkTopOfBookChange(output, client_id);
         } else {
+            // Fully filled - release back to pool
             self.checkTopOfBookChange(output, client_id);
             self.pools.order_pool.release(order);
         }
@@ -645,6 +381,9 @@ pub const OrderBook = struct {
     // Order Cancellation
     // ========================================================================
 
+    /// Cancel an existing order.
+    ///
+    /// Generates: CancelAck (if found) or Reject (if not found).
     pub fn cancelOrder(
         self: *Self,
         user_id: u32,
@@ -656,6 +395,19 @@ pub const OrderBook = struct {
 
         self.total_cancels += 1;
 
+        // Validate key
+        if (!OrderMap.isValidKey(user_id, user_order_id)) {
+            self.total_rejects += 1;
+            output.addChecked(msg.OutputMsg.makeReject(
+                user_id,
+                user_order_id,
+                .invalid_order_id,
+                self.symbol,
+                client_id,
+            ));
+            return;
+        }
+
         const key = OrderMap.makeKey(user_id, user_order_id);
 
         if (self.order_map.find(key)) |loc| {
@@ -665,6 +417,7 @@ pub const OrderBook = struct {
 
             if (self.findLevel(loc.side, loc.price)) |level| {
                 level.removeOrder(order);
+                self.markLevelMaybeInactive(loc.side);
             } else {
                 std.debug.panic("Order in map but level not found: price={d}", .{loc.price});
             }
@@ -674,18 +427,18 @@ pub const OrderBook = struct {
 
             self.pools.order_pool.release(order);
 
-            _ = output.add(msg.OutputMsg.makeCancelAck(
+            output.addChecked(msg.OutputMsg.makeCancelAck(
                 user_id,
                 user_order_id,
                 self.symbol,
                 client_id,
             ));
 
-            self.cleanupEmptyLevels(loc.side);
+            self.maybeCleanupLevels();
             self.checkTopOfBookChange(output, client_id);
         } else {
             self.total_rejects += 1;
-            _ = output.add(msg.OutputMsg.makeReject(
+            output.addChecked(msg.OutputMsg.makeReject(
                 user_id,
                 user_order_id,
                 .order_not_found,
@@ -697,6 +450,7 @@ pub const OrderBook = struct {
         std.debug.assert(self.isValid());
     }
 
+    /// Cancel all orders for a specific client (e.g., on disconnect).
     pub fn cancelClientOrders(self: *Self, client_id: u32, output: *OutputBuffer) usize {
         std.debug.assert(client_id > 0);
         std.debug.assert(self.isValid());
@@ -707,8 +461,7 @@ pub const OrderBook = struct {
         cancelled += self.cancelClientOrdersOnSide(&self.asks, self.num_ask_levels, client_id, output);
 
         if (cancelled > 0) {
-            self.cleanupEmptyLevels(.buy);
-            self.cleanupEmptyLevels(.sell);
+            self.maybeCleanupLevels();
             self.checkTopOfBookChange(output, client_id);
         }
 
@@ -739,7 +492,7 @@ pub const OrderBook = struct {
                     const removed = self.order_map.remove(key);
                     std.debug.assert(removed);
 
-                    _ = output.add(msg.OutputMsg.makeCancelAck(
+                    output.addChecked(msg.OutputMsg.makeCancelAck(
                         o.user_id,
                         o.user_order_id,
                         self.symbol,
@@ -808,15 +561,29 @@ pub const OrderBook = struct {
                 const seller_oid = if (!is_incoming_buyer) incoming.user_order_id else rest_order.user_order_id;
                 const seller_client = if (!is_incoming_buyer) client_id else rest_order.client_id;
 
-                _ = output.add(msg.OutputMsg.makeTrade(
-                    buyer_uid, buyer_oid, seller_uid, seller_oid,
-                    fill_price, fill_qty, self.symbol, buyer_client,
+                // Trade to buyer (CRITICAL - must not drop)
+                output.addChecked(msg.OutputMsg.makeTrade(
+                    buyer_uid,
+                    buyer_oid,
+                    seller_uid,
+                    seller_oid,
+                    fill_price,
+                    fill_qty,
+                    self.symbol,
+                    buyer_client,
                 ));
 
+                // Trade to seller if different client (CRITICAL - must not drop)
                 if (seller_client != buyer_client) {
-                    _ = output.add(msg.OutputMsg.makeTrade(
-                        buyer_uid, buyer_oid, seller_uid, seller_oid,
-                        fill_price, fill_qty, self.symbol, seller_client,
+                    output.addChecked(msg.OutputMsg.makeTrade(
+                        buyer_uid,
+                        buyer_oid,
+                        seller_uid,
+                        seller_oid,
+                        fill_price,
+                        fill_qty,
+                        self.symbol,
+                        seller_client,
                     ));
                 }
 
@@ -837,12 +604,12 @@ pub const OrderBook = struct {
             }
 
             if (!best_level.active or best_level.orders_head == null) {
-                self.cleanupEmptyLevels(opposite_side);
+                self.markLevelMaybeInactive(opposite_side);
             }
         }
 
         if (iterations >= MAX_MATCH_ITERATIONS) {
-            std.log.warn("Match iteration limit reached", .{});
+            std.log.warn("Match iteration limit reached: {d}", .{iterations});
         }
     }
 
@@ -850,18 +617,26 @@ pub const OrderBook = struct {
     // Flush
     // ========================================================================
 
+    /// Remove all orders from the book.
+    ///
+    /// Generates: CancelAck for each order, TopOfBook (empty) for both sides.
     pub fn flush(self: *Self, output: *OutputBuffer, client_id: u32) void {
         std.debug.assert(self.isValid());
 
         self.flushSide(&self.bids, &self.num_bid_levels, output);
         self.flushSide(&self.asks, &self.num_ask_levels, output);
 
-        self.order_map.initInPlace();
+        self.order_map.initInPlace(self.pools.order_pool.allocator);
+        self.inactive_bid_levels = 0;
+        self.inactive_ask_levels = 0;
 
-        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, client_id));
-        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
-        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, client_id));
-        _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
+        // Emit empty book state
+        // - client_id: to originator
+        // - 0: to multicast feed
+        output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, client_id));
+        output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
+        output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, client_id));
+        output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
 
         self.prev_best_bid_price = 0;
         self.prev_best_bid_qty = 0;
@@ -884,7 +659,7 @@ pub const OrderBook = struct {
             while (order) |o| {
                 const next = o.next;
 
-                _ = output.add(msg.OutputMsg.makeCancelAck(
+                output.addChecked(msg.OutputMsg.makeCancelAck(
                     o.user_id,
                     o.user_order_id,
                     self.symbol,
@@ -997,6 +772,7 @@ pub const OrderBook = struct {
             return null;
         }
 
+        // Shift levels to make room (O(n) but rare for well-distributed prices)
         if (insert_idx < count_ptr.*) {
             var i = count_ptr.*;
             while (i > insert_idx) : (i -= 1) {
@@ -1023,6 +799,27 @@ pub const OrderBook = struct {
         return null;
     }
 
+    /// Mark that a side may have inactive levels (for lazy cleanup).
+    fn markLevelMaybeInactive(self: *Self, side: msg.Side) void {
+        if (side == .buy) {
+            self.inactive_bid_levels += 1;
+        } else {
+            self.inactive_ask_levels += 1;
+        }
+    }
+
+    /// Perform lazy cleanup if inactive level count exceeds threshold.
+    fn maybeCleanupLevels(self: *Self) void {
+        if (self.inactive_bid_levels > LAZY_CLEANUP_THRESHOLD) {
+            self.cleanupEmptyLevels(.buy);
+            self.inactive_bid_levels = 0;
+        }
+        if (self.inactive_ask_levels > LAZY_CLEANUP_THRESHOLD) {
+            self.cleanupEmptyLevels(.sell);
+            self.inactive_ask_levels = 0;
+        }
+    }
+
     fn cleanupEmptyLevels(self: *Self, side: msg.Side) void {
         const levels = if (side == .buy) &self.bids else &self.asks;
         const count_ptr = if (side == .buy) &self.num_bid_levels else &self.num_ask_levels;
@@ -1043,43 +840,72 @@ pub const OrderBook = struct {
     // Top of Book
     // ========================================================================
 
+    /// Check if best bid/ask changed and emit TopOfBook updates.
+    ///
+    /// Emits TWO messages per side when changed:
+    /// - One to client_id (originator of the action)
+    /// - One to client_id=0 (multicast market data feed)
     fn checkTopOfBookChange(self: *Self, output: *OutputBuffer, client_id: u32) void {
+        // Check bid side
         if (self.getBestLevel(.buy)) |bid| {
             if (bid.price != self.prev_best_bid_price or
                 bid.total_quantity != self.prev_best_bid_qty)
             {
-                _ = output.add(msg.OutputMsg.makeTopOfBook(
-                    self.symbol, .buy, bid.price, bid.total_quantity, client_id,
+                // To originator
+                output.addChecked(msg.OutputMsg.makeTopOfBook(
+                    self.symbol,
+                    .buy,
+                    bid.price,
+                    bid.total_quantity,
+                    client_id,
                 ));
-                _ = output.add(msg.OutputMsg.makeTopOfBook(
-                    self.symbol, .buy, bid.price, bid.total_quantity, 0, 
+                // To multicast feed
+                output.addChecked(msg.OutputMsg.makeTopOfBook(
+                    self.symbol,
+                    .buy,
+                    bid.price,
+                    bid.total_quantity,
+                    0,
                 ));
                 self.prev_best_bid_price = bid.price;
                 self.prev_best_bid_qty = bid.total_quantity;
             }
         } else if (self.prev_best_bid_price != 0) {
-            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, client_id));
-            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
+            // Book went empty on bid side
+            output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, client_id));
+            output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
             self.prev_best_bid_price = 0;
             self.prev_best_bid_qty = 0;
         }
 
+        // Check ask side
         if (self.getBestLevel(.sell)) |ask| {
             if (ask.price != self.prev_best_ask_price or
                 ask.total_quantity != self.prev_best_ask_qty)
             {
-                _ = output.add(msg.OutputMsg.makeTopOfBook(
-                    self.symbol, .sell, ask.price, ask.total_quantity, client_id,
+                // To originator
+                output.addChecked(msg.OutputMsg.makeTopOfBook(
+                    self.symbol,
+                    .sell,
+                    ask.price,
+                    ask.total_quantity,
+                    client_id,
                 ));
-                _ = output.add(msg.OutputMsg.makeTopOfBook(
-                    self.symbol, .sell, ask.price, ask.total_quantity, 0,
-            ));                
+                // To multicast feed
+                output.addChecked(msg.OutputMsg.makeTopOfBook(
+                    self.symbol,
+                    .sell,
+                    ask.price,
+                    ask.total_quantity,
+                    0,
+                ));
                 self.prev_best_ask_price = ask.price;
                 self.prev_best_ask_qty = ask.total_quantity;
             }
         } else if (self.prev_best_ask_price != 0) {
-            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, client_id));
-            _ = output.add(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
+            // Book went empty on ask side
+            output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, client_id));
+            output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
             self.prev_best_ask_price = 0;
             self.prev_best_ask_qty = 0;
         }
@@ -1137,30 +963,7 @@ pub const OrderBook = struct {
 // Tests
 // ============================================================================
 
-test "OrderMap basic operations" {
-    var map = OrderMap.init();
-
-    const key1 = OrderMap.makeKey(1, 100);
-
-    var order1 = std.mem.zeroes(Order);
-    order1.price = 5000;
-    order1.side = .buy;
-    order1.remaining_qty = 10;
-
-    const loc1 = OrderLocation{ .side = .buy, .price = 5000, .order_ptr = &order1 };
-
-    try std.testing.expect(map.insert(key1, loc1));
-    try std.testing.expectEqual(@as(u32, 1), map.count);
-
-    const found = map.find(key1);
-    try std.testing.expect(found != null);
-    try std.testing.expectEqual(@as(u32, 5000), found.?.price);
-
-    try std.testing.expect(map.remove(key1));
-    try std.testing.expectEqual(@as(u32, 0), map.count);
-}
-
-test "PriceLevel order management" {
+test "PriceLevel basic operations" {
     var level = PriceLevel.init(5000);
 
     var order1 = std.mem.zeroes(Order);
@@ -1170,19 +973,55 @@ test "PriceLevel order management" {
     level.addOrder(&order1);
     try std.testing.expect(level.active);
     try std.testing.expectEqual(@as(u32, 100), level.total_quantity);
+    try std.testing.expectEqual(@as(u32, 1), level.order_count);
 
     level.removeOrder(&order1);
     try std.testing.expect(!level.active);
+    try std.testing.expectEqual(@as(u32, 0), level.total_quantity);
+    try std.testing.expectEqual(@as(u32, 0), level.order_count);
 }
 
-test "OutputBuffer overflow tracking" {
-    var buf = OutputBuffer.init();
+test "PriceLevel FIFO ordering" {
+    var level = PriceLevel.init(5000);
 
-    var i: u32 = 0;
-    while (i < MAX_OUTPUT_MESSAGES) : (i += 1) {
-        try std.testing.expect(buf.add(std.mem.zeroes(msg.OutputMsg)));
-    }
+    var order1 = std.mem.zeroes(Order);
+    order1.price = 5000;
+    order1.remaining_qty = 10;
+    order1.user_id = 1;
 
-    try std.testing.expect(!buf.add(std.mem.zeroes(msg.OutputMsg)));
-    try std.testing.expect(buf.hasOverflowed());
+    var order2 = std.mem.zeroes(Order);
+    order2.price = 5000;
+    order2.remaining_qty = 20;
+    order2.user_id = 2;
+
+    var order3 = std.mem.zeroes(Order);
+    order3.price = 5000;
+    order3.remaining_qty = 30;
+    order3.user_id = 3;
+
+    level.addOrder(&order1);
+    level.addOrder(&order2);
+    level.addOrder(&order3);
+
+    // Head should be first order (oldest)
+    try std.testing.expectEqual(@as(u32, 1), level.orders_head.?.user_id);
+    // Tail should be last order (newest)
+    try std.testing.expectEqual(@as(u32, 3), level.orders_tail.?.user_id);
+
+    try std.testing.expectEqual(@as(u32, 60), level.total_quantity);
+    try std.testing.expectEqual(@as(u32, 3), level.order_count);
+}
+
+test "PriceLevel reduce quantity" {
+    var level = PriceLevel.init(5000);
+
+    var order = std.mem.zeroes(Order);
+    order.price = 5000;
+    order.remaining_qty = 100;
+
+    level.addOrder(&order);
+    try std.testing.expectEqual(@as(u32, 100), level.total_quantity);
+
+    level.reduceQuantity(30);
+    try std.testing.expectEqual(@as(u32, 70), level.total_quantity);
 }

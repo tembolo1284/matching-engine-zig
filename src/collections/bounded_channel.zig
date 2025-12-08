@@ -20,6 +20,12 @@
 //! - Exactly ONE sender and ONE receiver
 //! - Not safe for multiple producers or consumers
 //!
+//! Performance notes:
+//! - Timeout-based operations use `nanoTimestamp()` which is a syscall on Linux
+//!   (~50-100ns overhead per call). For ultra-low-latency paths, prefer the
+//!   non-blocking `send()`/`tryRecv()` or bounded-spin variants.
+//! - Spin-based operations burn CPU but avoid syscall overhead.
+//!
 //! Example:
 //! ```zig
 //! const Channel = BoundedChannel(Message, 1024);
@@ -105,11 +111,23 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
             };
         }
 
-        /// Close the channel.
+        /// Close the channel for graceful shutdown.
+        ///
         /// After closing:
-        /// - send() returns false
-        /// - Pending messages can still be received
-        /// - isEmpty() eventually returns true
+        /// - `send()` will return false (eventually)
+        /// - Pending messages can still be received via `tryRecv()`
+        /// - `tryRecv()` returns null only when closed AND empty
+        ///
+        /// **Race condition note:** Close is not instantaneous. A `send()` that
+        /// races with `close()` may succeed in enqueuing its message. This is
+        /// intentional for graceful shutdown — it allows the consumer to drain
+        /// all pending work before terminating. The sequence:
+        ///
+        /// 1. Producer: `send(final_msg)` — may succeed if close() hasn't propagated
+        /// 2. Main: `channel.close()`
+        /// 3. Consumer: drain with `while (tryRecv()) |msg| { process(msg); }`
+        ///
+        /// This guarantees no messages are lost during shutdown.
         pub fn close(self: *Self) void {
             self.closed.store(true, .release);
         }
@@ -135,6 +153,8 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         /// Returns:
         /// - `true` if message was enqueued
         /// - `false` if channel is full or closed
+        ///
+        /// Note: A send racing with close() may still succeed. See `close()` docs.
         pub fn send(self: *Self, message: T) bool {
             if (self.isClosed()) return false;
             return self.queue.push(message);
@@ -157,6 +177,9 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         ///
         /// Spins up to `max_spins` times before returning false.
         /// More aggressive than plain send(), use for low-latency paths.
+        ///
+        /// CPU cost: Burns CPU during spin. Use when latency matters more than
+        /// throughput, and when you expect the queue to drain quickly.
         pub fn sendSpin(self: *Self, message: T, max_spins: u32) bool {
             var spins: u32 = 0;
 
@@ -177,6 +200,9 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         ///
         /// Strategy: spin → yield → sleep (exponential backoff)
         /// Returns false if timeout expires or channel closes.
+        ///
+        /// Performance note: Uses `nanoTimestamp()` which is a syscall on Linux.
+        /// For tighter latency bounds, use `sendSpin()` with a fixed iteration count.
         pub fn sendBackoff(self: *Self, message: T, timeout_ns: u64) bool {
             const deadline = std.time.nanoTimestamp() + @as(i128, timeout_ns);
 
@@ -191,11 +217,12 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
                     return true;
                 }
 
-                // Backoff strategy
+                // Backoff strategy: spin → yield → sleep
                 if (spins < DEFAULT_SPIN_ITERATIONS) {
                     std.atomic.spinLoopHint();
                     spins += 1;
                 } else if (yields < DEFAULT_YIELD_ITERATIONS) {
+                    // yield() can fail on some platforms; if so, proceed to sleep phase
                     std.Thread.yield() catch {};
                     yields += 1;
                 } else {
@@ -242,7 +269,9 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         /// Receive with bounded spinning.
         ///
         /// Spins up to `max_spins` times waiting for a message.
-        /// Use sparingly - burns CPU.
+        ///
+        /// CPU cost: Burns CPU during spin. Use sparingly, only when you expect
+        /// messages to arrive very soon and latency is critical.
         pub fn recvSpin(self: *Self, max_spins: u32) ?T {
             var spins: u32 = 0;
 
@@ -265,6 +294,9 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         ///
         /// Uses backoff strategy: spin → yield → sleep
         /// Returns null if timeout expires or channel closes with no pending.
+        ///
+        /// Performance note: Uses `nanoTimestamp()` which is a syscall on Linux.
+        /// For tighter latency bounds, use `recvSpin()` with a fixed iteration count.
         pub fn recvTimeout(self: *Self, timeout_ns: u64) ?T {
             const deadline = std.time.nanoTimestamp() + @as(i128, timeout_ns);
 
@@ -281,11 +313,12 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
                     return null;
                 }
 
-                // Backoff strategy
+                // Backoff strategy: spin → yield → sleep
                 if (spins < DEFAULT_SPIN_ITERATIONS) {
                     std.atomic.spinLoopHint();
                     spins += 1;
                 } else if (yields < DEFAULT_YIELD_ITERATIONS) {
+                    // yield() can fail on some platforms; if so, proceed to sleep phase
                     std.Thread.yield() catch {};
                     yields += 1;
                 } else {

@@ -65,8 +65,10 @@ pub const QueueStats = struct {
     /// Total successful pops.
     popped: u64,
     /// Push attempts that failed (queue full).
+    /// Note: pushBatch increments by 1 per failed batch, not per item.
     push_failures: u64,
     /// Pop attempts that failed (queue empty).
+    /// Note: popBatch increments by 1 per failed batch, not per item.
     pop_failures: u64,
     /// High water mark (max observed size).
     high_water_mark: u64,
@@ -159,21 +161,34 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             }
         };
 
-        /// Statistics block (only present when TRACK_STATS is true).
+        /// Statistics block with cache-line separation to prevent false sharing.
+        ///
+        /// Producer and consumer stats are on separate cache lines since they're
+        /// written by different threads.
         const StatsBlock = struct {
+            // === Producer stats (cache line 1) ===
             pushed: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
-            popped: std.atomic.Value(u64),
             push_failures: std.atomic.Value(u64),
-            pop_failures: std.atomic.Value(u64),
             high_water_mark: std.atomic.Value(u64),
+            _pad_producer: [CACHE_LINE_SIZE - 24]u8 = undefined,
+
+            // === Consumer stats (cache line 2) ===
+            popped: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
+            pop_failures: std.atomic.Value(u64),
+            _pad_consumer: [CACHE_LINE_SIZE - 16]u8 = undefined,
+
+            comptime {
+                // Verify cache line alignment
+                std.debug.assert(@offsetOf(StatsBlock, "popped") == CACHE_LINE_SIZE);
+            }
 
             fn init() StatsBlock {
                 return .{
                     .pushed = std.atomic.Value(u64).init(0),
-                    .popped = std.atomic.Value(u64).init(0),
                     .push_failures = std.atomic.Value(u64).init(0),
-                    .pop_failures = std.atomic.Value(u64).init(0),
                     .high_water_mark = std.atomic.Value(u64).init(0),
+                    .popped = std.atomic.Value(u64).init(0),
+                    .pop_failures = std.atomic.Value(u64).init(0),
                 };
             }
         };
@@ -254,6 +269,10 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         /// Returns number of items successfully pushed.
         ///
         /// More efficient than individual pushes when sending bursts.
+        ///
+        /// Statistics note: If the batch partially fits, only successfully pushed
+        /// items are counted in `pushed`. If zero items fit, `push_failures` is
+        /// incremented by 1 (not by `items.len`).
         pub fn pushBatch(self: *Self, items: []const T) usize {
             const tail = self.tail.value.load(.monotonic);
             const head = self.head.value.load(.acquire);
@@ -326,9 +345,30 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         }
 
         /// Peek at front item without removing.
+        ///
         /// Returns null if empty.
         ///
-        /// Note: Item may be consumed between peek and pop.
+        /// **WARNING: Pointer lifetime is limited!**
+        /// The returned pointer points directly into the ring buffer.
+        /// It is only valid until the next call to `pop()`, `popBatch()`,
+        /// or `drain()`. After popping, the producer may overwrite the slot
+        /// on wraparound, causing the pointer to reference stale or corrupt data.
+        ///
+        /// Safe usage:
+        /// ```zig
+        /// if (queue.peek()) |item| {
+        ///     // Use item immediately
+        ///     process(item.*);
+        /// }
+        /// // Do NOT hold the pointer across pop()
+        /// ```
+        ///
+        /// Unsafe usage:
+        /// ```zig
+        /// const ptr = queue.peek().?;  // Get pointer
+        /// _ = queue.pop();              // Slot now available to producer
+        /// use(ptr.*);                   // DANGER: may be overwritten!
+        /// ```
         pub fn peek(self: *Self) ?*const T {
             const head = self.head.value.load(.monotonic);
             const tail = self.tail.value.load(.acquire);
@@ -344,6 +384,9 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         /// Returns slice of items popped (up to `out.len`).
         ///
         /// More efficient than individual pops when draining.
+        ///
+        /// Statistics note: If queue is empty, `pop_failures` is incremented
+        /// by 1 (not by `out.len`).
         pub fn popBatch(self: *Self, out: []T) usize {
             const head = self.head.value.load(.monotonic);
             const tail = self.tail.value.load(.acquire);
@@ -688,6 +731,15 @@ test "SpscQueue - cache line alignment" {
     // Verify cache line alignment
     try std.testing.expectEqual(@as(usize, 64), @alignOf(Queue.CacheLineAtomic));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Queue.CacheLineAtomic));
+}
+
+test "SpscQueue - stats block cache line separation" {
+    if (!TRACK_STATS) return;
+
+    const Queue = SpscQueue(u64, 64);
+
+    // Verify producer and consumer stats are on separate cache lines
+    try std.testing.expectEqual(@as(usize, CACHE_LINE_SIZE), @offsetOf(Queue.StatsBlock, "popped"));
 }
 
 test "SpscQueue - fill percent" {

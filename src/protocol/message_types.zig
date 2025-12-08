@@ -164,6 +164,8 @@ pub const RejectReason = enum(u8) {
     throttled = 8,
     /// Order book full (too many price levels).
     book_full = 9,
+    /// Invalid order ID (reserved key space: user_id=0 AND order_id=0).
+    invalid_order_id = 10,
 
     /// Get human-readable description.
     pub fn description(self: RejectReason) []const u8 {
@@ -177,6 +179,7 @@ pub const RejectReason = enum(u8) {
             .unauthorized => "Unauthorized",
             .throttled => "Rate limit exceeded",
             .book_full => "Order book full",
+            .invalid_order_id => "Invalid order ID",
         };
     }
 };
@@ -405,7 +408,7 @@ pub const RejectMsg = extern struct {
 pub const OutputMsg = struct {
     /// Message type tag.
     msg_type: OutputMsgType,
-    /// Destination client ID (0 = broadcast).
+    /// Destination client ID (0 = broadcast/multicast).
     client_id: u32,
     /// Trading symbol.
     symbol: Symbol,
@@ -608,8 +611,8 @@ test "InputMsg factories" {
     try std.testing.expectEqual(InputMsgType.new_order, order.msg_type);
     try std.testing.expectEqual(@as(u32, 1), order.getUserId());
 
-    const cancel = InputMsg.cancel(1, 100);
-    try std.testing.expectEqual(InputMsgType.cancel, cancel.msg_type);
+    const cancel_msg = InputMsg.cancel(1, makeSymbol("IBM"), 100);
+    try std.testing.expectEqual(InputMsgType.cancel, cancel_msg.msg_type);
 
     const flush_msg = InputMsg.flush();
     try std.testing.expectEqual(InputMsgType.flush, flush_msg.msg_type);
@@ -631,6 +634,7 @@ test "OutputMsg factories" {
 test "RejectReason descriptions" {
     try std.testing.expectEqualStrings("Order book full", RejectReason.book_full.description());
     try std.testing.expectEqualStrings("Order pool exhausted", RejectReason.pool_exhausted.description());
+    try std.testing.expectEqualStrings("Invalid order ID", RejectReason.invalid_order_id.description());
 }
 
 test "Struct sizes" {

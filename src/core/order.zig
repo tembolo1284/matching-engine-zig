@@ -4,7 +4,7 @@
 //! - Aligned to 64-byte cache line to prevent false sharing
 //! - No symbol field - order book is single-symbol
 //! - Hot fields (accessed during matching) packed first
-//! - Uses RDTSC timestamp for time priority on x86_64
+//! - Uses RDTSCP timestamp for time priority on x86_64 (serializing)
 //!
 //! Linked list rationale:
 //! We use intrusive prev/next pointers despite "avoid lists in hot path"
@@ -40,28 +40,37 @@ pub const ORDER_ALIGNMENT = CACHE_LINE_SIZE;
 // Timestamp Implementation
 // ============================================================================
 
-/// Get current timestamp using RDTSC on x86_64, fallback elsewhere.
-/// 
-/// RDTSC characteristics:
-/// - ~20-30 cycles on modern CPUs (with RDTSCP serialization)
-/// - Monotonic within a core (may need adjustment for cross-core)
-/// - No syscall overhead
+/// Get current timestamp using RDTSCP on x86_64, fallback elsewhere.
 ///
-/// For strict ordering within a single-threaded matching engine,
-/// RDTSC provides sufficient monotonicity guarantees.
+/// Why RDTSCP (not RDTSC):
+/// RDTSC can be reordered by out-of-order execution, potentially causing
+/// FIFO violations where two orders submitted in sequence receive inverted
+/// timestamps. RDTSCP is a serializing instruction that guarantees all prior
+/// instructions complete before reading the TSC.
+///
+/// RDTSCP characteristics:
+/// - ~25-35 cycles on modern CPUs (serializing adds ~5 cycles over RDTSC)
+/// - Monotonic within a core
+/// - No syscall overhead
+/// - Clobbers ECX with processor ID (unused but must be declared)
+///
+/// For strict FIFO ordering within a single-threaded matching engine,
+/// RDTSCP provides the necessary monotonicity guarantees.
 ///
 /// WARNING: On non-x86_64-linux platforms, this uses std.time.nanoTimestamp()
 /// which may syscall and add microseconds of latency.
 pub inline fn getCurrentTimestamp() u64 {
     if (comptime SUPPORTED_PLATFORM) {
-        // RDTSC: Read Time Stamp Counter
-        // We use RDTSC (not RDTSCP) for lower latency - ordering is
-        // guaranteed by the surrounding code structure in our engine.
+        // RDTSCP: Read Time Stamp Counter and Processor ID (serializing)
+        // Guarantees all prior instructions complete before reading TSC,
+        // preventing FIFO violations from out-of-order execution.
         var lo: u32 = undefined;
         var hi: u32 = undefined;
-        asm volatile ("rdtsc"
+        asm volatile ("rdtscp"
             : [lo] "={eax}" (lo),
               [hi] "={edx}" (hi)
+            :
+            : "ecx", "memory" // ECX clobbered with processor ID; memory barrier
         );
         return (@as(u64, hi) << 32) | lo;
     } else {
@@ -95,31 +104,31 @@ pub inline fn getCurrentTimestamp() u64 {
 /// - Padding ensures the struct is exactly one cache line
 pub const Order = extern struct {
     // === HOT PATH FIELDS === (bytes 0-19, accessed every match check)
-    user_id: u32,           // 0-3:   Owner identification
-    user_order_id: u32,     // 4-7:   Client's order reference
-    price: u32,             // 8-11:  Price in ticks (0 = market order)
-    quantity: u32,          // 12-15: Original quantity (immutable after init)
-    remaining_qty: u32,     // 16-19: Remaining unfilled quantity
+    user_id: u32,              // 0-3:   Owner identification
+    user_order_id: u32,        // 4-7:   Client's order reference
+    price: u32,                // 8-11:  Price in ticks (0 = market order)
+    quantity: u32,             // 12-15: Original quantity (immutable after init)
+    remaining_qty: u32,        // 16-19: Remaining unfilled quantity
 
     // === METADATA === (bytes 20-31)
-    side: msg.Side,         // 20:    Buy or Sell
-    order_type: msg.OrderType, // 21: Market or Limit
-    _pad1: [2]u8 = .{ 0, 0 }, // 22-23: Explicit zero padding
-    client_id: u32,         // 24-27: TCP client ID (0 for UDP)
-    _pad2: u32 = 0,         // 28-31: Align timestamp to 8-byte boundary
+    side: msg.Side,            // 20:    Buy or Sell
+    order_type: msg.OrderType, // 21:    Market or Limit
+    _pad1: [2]u8 = .{ 0, 0 },  // 22-23: Explicit zero padding
+    client_id: u32,            // 24-27: TCP client ID (0 = UDP origin)
+    _pad2: u32 = 0,            // 28-31: Align timestamp to 8-byte boundary
 
     // === TIME PRIORITY === (bytes 32-39)
-    timestamp: u64,         // 32-39: RDTSC timestamp for FIFO ordering
+    timestamp: u64,            // 32-39: RDTSCP timestamp for FIFO ordering
 
     // === LINKED LIST POINTERS === (bytes 40-55)
     /// Next order at same price level (toward tail, newer orders)
-    next: ?*Order,          // 40-47
+    next: ?*Order,             // 40-47
     /// Previous order at same price level (toward head, older orders)
-    prev: ?*Order,          // 48-55
+    prev: ?*Order,             // 48-55
 
     // === RESERVED === (bytes 56-63)
     /// Reserved for future use (e.g., order flags, sequence number)
-    _reserved: u64 = 0,     // 56-63
+    _reserved: u64 = 0,        // 56-63
 
     const Self = @This();
 
@@ -158,9 +167,13 @@ pub const Order = extern struct {
     // ========================================================================
 
     /// Initialize order from new order message.
-    /// 
+    ///
     /// Caller must provide timestamp from getCurrentTimestamp().
     /// This separation allows batching timestamp reads.
+    ///
+    /// Preconditions (enforced by assertions):
+    /// - quantity > 0 and <= 1 billion
+    /// - timestamp > 0
     pub fn init(order_msg: *const msg.NewOrderMsg, client_id: u32, ts: u64) Self {
         // Rule 7: Validate all parameters
         std.debug.assert(order_msg.quantity > 0);
@@ -191,6 +204,13 @@ pub const Order = extern struct {
     // ========================================================================
 
     /// Check all order invariants. Use in debug assertions.
+    ///
+    /// Invariants:
+    /// - remaining_qty <= quantity
+    /// - quantity > 0
+    /// - Market orders have price == 0
+    /// - Limit orders have price > 0
+    /// - timestamp > 0
     pub inline fn isValid(self: *const Self) bool {
         // Remaining can't exceed original
         if (self.remaining_qty > self.quantity) return false;
@@ -224,6 +244,11 @@ pub const Order = extern struct {
         return self.remaining_qty > 0;
     }
 
+    /// Check if this order is currently linked into a price level list.
+    pub inline fn isLinked(self: *const Self) bool {
+        return self.prev != null or self.next != null;
+    }
+
     // ========================================================================
     // Order Modification
     // ========================================================================
@@ -233,7 +258,11 @@ pub const Order = extern struct {
     /// Guarantees:
     /// - Never fills more than remaining
     /// - Never underflows remaining_qty
-    /// - Returns exact amount filled
+    /// - Returns exact amount filled (may be less than requested)
+    ///
+    /// Preconditions:
+    /// - qty > 0
+    /// - remaining_qty > 0
     pub inline fn fill(self: *Self, qty: u32) u32 {
         // Pre-conditions
         std.debug.assert(qty > 0);
@@ -245,7 +274,7 @@ pub const Order = extern struct {
         // This subtraction is safe: filled <= remaining_qty by construction
         self.remaining_qty -= filled;
 
-        // Post-condition: invariants preserved
+        // Post-conditions
         std.debug.assert(self.remaining_qty <= self.quantity);
         std.debug.assert(filled > 0);
         std.debug.assert(filled <= qty);
@@ -254,31 +283,8 @@ pub const Order = extern struct {
     }
 
     // ========================================================================
-    // Price-Time Priority
+    // Price Crossing
     // ========================================================================
-
-    /// Get order priority for comparison (price-time priority).
-    ///
-    /// Returns a value where LOWER = HIGHER PRIORITY.
-    /// This allows using min-heap semantics uniformly.
-    ///
-    /// For bids: higher price is better → negate price
-    /// For asks: lower price is better → use price directly
-    ///
-    /// Time priority (FIFO) is handled separately by linked list ordering.
-    pub inline fn getPriority(self: *const Self, is_bid: bool) i64 {
-        // Pre-conditions
-        std.debug.assert(self.isActive()); // Only prioritize live orders
-        std.debug.assert(self.price > 0 or self.order_type == .market);
-
-        if (is_bid) {
-            // Bids: higher price = higher priority = lower sort value
-            return -@as(i64, @intCast(self.price));
-        } else {
-            // Asks: lower price = higher priority = lower sort value
-            return @as(i64, @intCast(self.price));
-        }
-    }
 
     /// Check if this order's price crosses (can trade with) the given price.
     ///
@@ -286,10 +292,14 @@ pub const Order = extern struct {
     /// - For buys:  our bid >= their ask (we're willing to pay enough)
     /// - For sells: our ask <= their bid (we're willing to sell cheap enough)
     /// - Market orders (price=0) cross any price
+    ///
+    /// Preconditions:
+    /// - Order must be active
+    /// - resting_price > 0 (resting orders are always limit orders)
     pub inline fn pricesCross(self: *const Self, resting_price: u32) bool {
         // Pre-conditions
         std.debug.assert(self.isActive());
-        std.debug.assert(resting_price > 0); // Resting orders should have real prices
+        std.debug.assert(resting_price > 0); // Resting orders must have real prices
 
         // Market orders always cross
         if (self.price == 0) {
@@ -308,11 +318,13 @@ pub const Order = extern struct {
     // ========================================================================
 
     /// Unlink this order from its doubly-linked list.
-    /// Does not modify the order's own next/prev pointers.
-    /// Returns true if the order was linked, false if already unlinked.
-    pub inline fn unlink(self: *Self) bool {
-        const was_linked = (self.prev != null or self.next != null);
-
+    ///
+    /// Updates neighbors' pointers to bypass this order, then clears
+    /// this order's own prev/next pointers.
+    ///
+    /// Note: This does NOT update PriceLevel head/tail pointers.
+    /// Use PriceLevel.removeOrder() for complete removal from a price level.
+    pub inline fn unlink(self: *Self) void {
         if (self.prev) |prev| {
             prev.next = self.next;
         }
@@ -322,8 +334,6 @@ pub const Order = extern struct {
 
         self.prev = null;
         self.next = null;
-
-        return was_linked;
     }
 };
 
@@ -368,6 +378,7 @@ test "Order init and validation" {
     try std.testing.expect(order.isValid());
     try std.testing.expect(order.isActive());
     try std.testing.expect(!order.isFilled());
+    try std.testing.expect(!order.isLinked());
 }
 
 test "Order fill mechanics" {
@@ -420,7 +431,7 @@ test "Order fill clamping" {
     try std.testing.expect(order.isFilled());
 }
 
-test "Order price crossing" {
+test "Order price crossing - limit orders" {
     const buy_order_msg = msg.NewOrderMsg{
         .user_id = 1,
         .user_order_id = 1,
@@ -432,9 +443,9 @@ test "Order price crossing" {
     const buy = Order.init(&buy_order_msg, 0, 1);
 
     // Buy at 100 crosses sell at 100 or below
-    try std.testing.expect(buy.pricesCross(100)); // Equal
-    try std.testing.expect(buy.pricesCross(99));  // Below
-    try std.testing.expect(!buy.pricesCross(101)); // Above
+    try std.testing.expect(buy.pricesCross(100)); // Equal - crosses
+    try std.testing.expect(buy.pricesCross(99));  // Below - crosses
+    try std.testing.expect(!buy.pricesCross(101)); // Above - no cross
 
     const sell_order_msg = msg.NewOrderMsg{
         .user_id = 2,
@@ -447,12 +458,12 @@ test "Order price crossing" {
     const sell = Order.init(&sell_order_msg, 0, 2);
 
     // Sell at 100 crosses buy at 100 or above
-    try std.testing.expect(sell.pricesCross(100)); // Equal
-    try std.testing.expect(sell.pricesCross(101)); // Above
-    try std.testing.expect(!sell.pricesCross(99)); // Below
+    try std.testing.expect(sell.pricesCross(100)); // Equal - crosses
+    try std.testing.expect(sell.pricesCross(101)); // Above - crosses
+    try std.testing.expect(!sell.pricesCross(99)); // Below - no cross
 }
 
-test "Market order crossing" {
+test "Order price crossing - market orders" {
     const market_buy_msg = msg.NewOrderMsg{
         .user_id = 1,
         .user_order_id = 1,
@@ -471,8 +482,8 @@ test "Market order crossing" {
     try std.testing.expect(market.pricesCross(999999));
 }
 
-test "Order priority" {
-    const bid_msg = msg.NewOrderMsg{
+test "Order linking and unlinking" {
+    const msg1 = msg.NewOrderMsg{
         .user_id = 1,
         .user_order_id = 1,
         .price = 100,
@@ -480,46 +491,59 @@ test "Order priority" {
         .side = .buy,
         .symbol = msg.makeSymbol("TEST"),
     };
-    const low_bid = Order.init(&bid_msg, 0, 1);
-
-    const high_bid_msg = msg.NewOrderMsg{
+    const msg2 = msg.NewOrderMsg{
         .user_id = 2,
         .user_order_id = 2,
-        .price = 110,
+        .price = 100,
         .quantity = 10,
         .side = .buy,
         .symbol = msg.makeSymbol("TEST"),
     };
-    const high_bid = Order.init(&high_bid_msg, 0, 2);
-
-    // Higher bid should have lower (better) priority value
-    try std.testing.expect(high_bid.getPriority(true) < low_bid.getPriority(true));
-
-    const ask_msg = msg.NewOrderMsg{
+    const msg3 = msg.NewOrderMsg{
         .user_id = 3,
         .user_order_id = 3,
         .price = 100,
         .quantity = 10,
-        .side = .sell,
+        .side = .buy,
         .symbol = msg.makeSymbol("TEST"),
     };
-    const low_ask = Order.init(&ask_msg, 0, 3);
 
-    const high_ask_msg = msg.NewOrderMsg{
-        .user_id = 4,
-        .user_order_id = 4,
-        .price = 110,
-        .quantity = 10,
-        .side = .sell,
-        .symbol = msg.makeSymbol("TEST"),
-    };
-    const high_ask = Order.init(&high_ask_msg, 0, 4);
+    var order1 = Order.init(&msg1, 0, 1);
+    var order2 = Order.init(&msg2, 0, 2);
+    var order3 = Order.init(&msg3, 0, 3);
 
-    // Lower ask should have lower (better) priority value
-    try std.testing.expect(low_ask.getPriority(false) < high_ask.getPriority(false));
+    // Initially not linked
+    try std.testing.expect(!order1.isLinked());
+    try std.testing.expect(!order2.isLinked());
+    try std.testing.expect(!order3.isLinked());
+
+    // Link them: order1 <-> order2 <-> order3
+    order1.next = &order2;
+    order2.prev = &order1;
+    order2.next = &order3;
+    order3.prev = &order2;
+
+    try std.testing.expect(order1.isLinked());
+    try std.testing.expect(order2.isLinked());
+    try std.testing.expect(order3.isLinked());
+
+    // Unlink middle order
+    order2.unlink();
+
+    try std.testing.expect(!order2.isLinked());
+    try std.testing.expect(order2.prev == null);
+    try std.testing.expect(order2.next == null);
+
+    // Neighbors should be connected
+    try std.testing.expectEqual(&order3, order1.next);
+    try std.testing.expectEqual(&order1, order3.prev);
+
+    // First and last still linked
+    try std.testing.expect(order1.isLinked());
+    try std.testing.expect(order3.isLinked());
 }
 
-test "Timestamp generation" {
+test "Timestamp monotonicity" {
     const t1 = getCurrentTimestamp();
     const t2 = getCurrentTimestamp();
     const t3 = getCurrentTimestamp();
@@ -527,4 +551,27 @@ test "Timestamp generation" {
     // Timestamps should be monotonically increasing (or equal for very fast calls)
     try std.testing.expect(t2 >= t1);
     try std.testing.expect(t3 >= t2);
+}
+
+test "Timestamp non-zero" {
+    // Ensure we never get a zero timestamp (which would fail isValid)
+    const t = getCurrentTimestamp();
+    try std.testing.expect(t > 0);
+}
+
+test "Market order initialization" {
+    const market_order = msg.NewOrderMsg{
+        .user_id = 5,
+        .user_order_id = 42,
+        .price = 0, // Market order indicator
+        .quantity = 500,
+        .side = .sell,
+        .symbol = msg.makeSymbol("AAPL"),
+    };
+
+    const order = Order.init(&market_order, 100, 999999);
+
+    try std.testing.expectEqual(@as(u32, 0), order.price);
+    try std.testing.expectEqual(msg.OrderType.market, order.order_type);
+    try std.testing.expect(order.isValid());
 }
