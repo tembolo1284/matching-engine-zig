@@ -31,10 +31,10 @@ pub const SYMBOL_MAP_MASK: u32 = SYMBOL_MAP_SIZE - 1;
 
 /// Order tracking table size - must be power of 2
 /// Increased from 16K to 524K to handle high-volume scenarios
-pub const ORDER_SYMBOL_MAP_SIZE: u32 = 1048576;  // 1mm entries
+pub const ORDER_SYMBOL_MAP_SIZE: u32 = 2 * 1024 * 1024;  // 1mm entries
 pub const ORDER_SYMBOL_MAP_MASK: u32 = ORDER_SYMBOL_MAP_SIZE - 1;
 
-pub const MAX_PROBE_LENGTH: u32 = 128;
+pub const MAX_PROBE_LENGTH: u32 = 256;
 
 const LOAD_FACTOR_WARNING: u32 = 75;
 
