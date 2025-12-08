@@ -61,12 +61,6 @@ pub const BoundedChannel = @import("bounded_channel.zig").BoundedChannel;
 /// Receive result type.
 pub const RecvResult = @import("bounded_channel.zig").RecvResult;
 
-/// Type alias for input channels (semantic clarity).
-pub const InputChannel = @import("bounded_channel.zig").InputChannel;
-
-/// Type alias for output channels (semantic clarity).
-pub const OutputChannel = @import("bounded_channel.zig").OutputChannel;
-
 // ============================================================================
 // Convenience Functions
 // ============================================================================
