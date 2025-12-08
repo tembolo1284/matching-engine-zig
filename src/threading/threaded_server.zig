@@ -6,7 +6,7 @@
 //! Optimizations:
 //! - Message batching: Multiple CSV messages packed into single UDP packet
 //! - Protocol-aware encoding: Binary clients get binary responses, CSV clients get CSV
-//! - Aggressive output draining: Process up to 8192 outputs per poll cycle
+//! - Aggressive output draining: Process up to 16384 outputs per poll cycle
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -30,7 +30,7 @@ pub const NUM_PROCESSORS: usize = 2;
 /// Output drain limit per poll cycle
 /// At 200K orders/sec generating 2 outputs each = 400K outputs/sec
 /// At 1000 polls/sec, need to drain 400 outputs per poll minimum
-const OUTPUT_DRAIN_LIMIT: u32 = 8192;
+const OUTPUT_DRAIN_LIMIT: u32 = 16384;
 
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 1;
 

@@ -1,6 +1,5 @@
 .{
-    .fingerprint = 0xcc049b74ba1a5250,
-    .name = .matching_engine_zig,
+    .name = "matching_engine_zig",
     .version = "0.1.0",
     .paths = .{
         "build.zig",
