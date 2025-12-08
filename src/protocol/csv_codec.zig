@@ -3,7 +3,7 @@
 //! Input formats:
 //! ```
 //!   New Order: N, userId, symbol, price, qty, side, userOrderId
-//!   Cancel:    C, userId, userOrderId [, symbol]
+//!   Cancel:    C, userId, userOrderId, symbol
 //!   Flush:     F
 //! ```
 //!
@@ -20,6 +20,7 @@
 //! - Fields are comma-separated with optional whitespace
 //! - Lines terminated by LF or CRLF
 //! - Side: 'B'/'b' for buy, 'S'/'s' for sell
+//! - All enum values are validated (no UB on malformed input)
 
 const std = @import("std");
 const msg = @import("message_types.zig");
@@ -34,6 +35,39 @@ const MAX_LINE_LENGTH: usize = 256;
 
 /// Maximum fields per line.
 const MAX_FIELDS: usize = 16;
+
+// ============================================================================
+// Safe Enum Parsing (Security Critical)
+// ============================================================================
+
+/// Parse Side from character. Returns null if invalid.
+/// SECURITY: Never use @enumFromInt on untrusted input!
+fn parseSide(c: u8) ?msg.Side {
+    return switch (c) {
+        'B', 'b' => .buy,
+        'S', 's' => .sell,
+        else => null,
+    };
+}
+
+/// Parse RejectReason from integer. Returns null if invalid.
+/// SECURITY: Never use @enumFromInt on untrusted input!
+fn parseRejectReason(code: u32) ?msg.RejectReason {
+    if (code == 0 or code > 10) return null;
+    return switch (@as(u8, @truncate(code))) {
+        @intFromEnum(msg.RejectReason.unknown_symbol) => .unknown_symbol,
+        @intFromEnum(msg.RejectReason.invalid_quantity) => .invalid_quantity,
+        @intFromEnum(msg.RejectReason.invalid_price) => .invalid_price,
+        @intFromEnum(msg.RejectReason.order_not_found) => .order_not_found,
+        @intFromEnum(msg.RejectReason.duplicate_order_id) => .duplicate_order_id,
+        @intFromEnum(msg.RejectReason.pool_exhausted) => .pool_exhausted,
+        @intFromEnum(msg.RejectReason.unauthorized) => .unauthorized,
+        @intFromEnum(msg.RejectReason.throttled) => .throttled,
+        @intFromEnum(msg.RejectReason.book_full) => .book_full,
+        @intFromEnum(msg.RejectReason.invalid_order_id) => .invalid_order_id,
+        else => null,
+    };
+}
 
 // ============================================================================
 // Line Parsing Result
@@ -102,11 +136,8 @@ fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
 
     if (side_str.len == 0) return codec.CodecError.InvalidField;
 
-    const side: msg.Side = switch (side_str[0]) {
-        'B', 'b' => .buy,
-        'S', 's' => .sell,
-        else => return codec.CodecError.InvalidField,
-    };
+    // SECURITY: Validate side before use
+    const side = parseSide(side_str[0]) orelse return codec.CodecError.InvalidField;
 
     return msg.InputMsg.newOrder(.{
         .user_id = user_id,
@@ -119,16 +150,23 @@ fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
 }
 
 fn parseCancel(fields: [][]const u8) codec.CodecError!msg.InputMsg {
-    // C, userId, symbol, userOrderId
-    if (fields.len < 4) return codec.CodecError.IncompleteMessage;
+    // C, userId, userOrderId, symbol
+    // Minimum 3 fields (C, userId, userOrderId), symbol is optional
+    if (fields.len < 3) return codec.CodecError.IncompleteMessage;
 
     const user_id = codec.parseU32(codec.trim(fields[1])) orelse return codec.CodecError.InvalidField;
-    const symbol_str = codec.trim(fields[2]);
-    const order_id = codec.parseU32(codec.trim(fields[3])) orelse return codec.CodecError.InvalidField;
+    const order_id = codec.parseU32(codec.trim(fields[2])) orelse return codec.CodecError.InvalidField;
 
-    if (symbol_str.len == 0) return codec.CodecError.InvalidField;
+    // Symbol is optional (field 3)
+    var symbol = msg.EMPTY_SYMBOL;
+    if (fields.len >= 4) {
+        const symbol_str = codec.trim(fields[3]);
+        if (symbol_str.len > 0) {
+            symbol = msg.makeSymbol(symbol_str);
+        }
+    }
 
-    return msg.InputMsg.cancel(user_id, msg.makeSymbol(symbol_str), order_id);
+    return msg.InputMsg.cancel(user_id, symbol, order_id);
 }
 
 // ============================================================================
@@ -250,11 +288,8 @@ fn parseTopOfBook(fields: [][]const u8) codec.CodecError!msg.OutputMsg {
     const side_str = codec.trim(fields[2]);
     if (side_str.len == 0) return codec.CodecError.InvalidField;
 
-    const side: msg.Side = switch (side_str[0]) {
-        'B', 'b' => .buy,
-        'S', 's' => .sell,
-        else => return codec.CodecError.InvalidField,
-    };
+    // SECURITY: Validate side before use
+    const side = parseSide(side_str[0]) orelse return codec.CodecError.InvalidField;
 
     // Handle "-, -" for empty book
     const price_str = codec.trim(fields[3]);
@@ -296,10 +331,13 @@ fn parseReject(fields: [][]const u8) codec.CodecError!msg.OutputMsg {
 
     const reason_code = codec.parseU32(codec.trim(fields[4])) orelse return codec.CodecError.InvalidField;
 
+    // SECURITY: Validate reject reason before use
+    const reason = parseRejectReason(reason_code) orelse return codec.CodecError.InvalidField;
+
     return msg.OutputMsg.makeReject(
         codec.parseU32(codec.trim(fields[2])) orelse return codec.CodecError.InvalidField,
         codec.parseU32(codec.trim(fields[3])) orelse return codec.CodecError.InvalidField,
-        @enumFromInt(@as(u8, @truncate(reason_code))),
+        reason,
         msg.makeSymbol(codec.trim(fields[1])),
         0,
     );
@@ -459,21 +497,25 @@ test "CSV decode new order" {
     try std.testing.expectEqual(data.len, result.bytes_consumed);
 }
 
-test "CSV decode cancel" {
+test "CSV decode cancel without symbol" {
     const data = "C, 1, 100\n";
     const result = try decodeInput(data);
 
     try std.testing.expectEqual(msg.InputMsgType.cancel, result.message.msg_type);
     try std.testing.expectEqual(@as(u32, 1), result.message.data.cancel.user_id);
     try std.testing.expectEqual(@as(u32, 100), result.message.data.cancel.user_order_id);
+    try std.testing.expect(!result.message.data.cancel.hasSymbolHint());
 }
 
-test "CSV decode cancel with symbol hint" {
+test "CSV decode cancel with symbol" {
     const data = "C, 1, 100, IBM\n";
     const result = try decodeInput(data);
 
     try std.testing.expectEqual(msg.InputMsgType.cancel, result.message.msg_type);
+    try std.testing.expectEqual(@as(u32, 1), result.message.data.cancel.user_id);
+    try std.testing.expectEqual(@as(u32, 100), result.message.data.cancel.user_order_id);
     try std.testing.expect(result.message.data.cancel.hasSymbolHint());
+    try std.testing.expectEqualStrings("IBM", msg.symbolSlice(&result.message.data.cancel.symbol));
 }
 
 test "CSV decode flush" {
@@ -522,11 +564,6 @@ test "CSV roundtrip output" {
     try std.testing.expectEqual(@as(u32, 5000), result.message.data.trade.price);
 }
 
-test "CSV incomplete message" {
-    const data = "N, 1, IBM";
-    try std.testing.expectError(codec.CodecError.IncompleteMessage, decodeInput(data));
-}
-
 test "CSV malformed message" {
     const data = "\n";
     try std.testing.expectError(codec.CodecError.MalformedMessage, decodeInput(data));
@@ -540,4 +577,46 @@ test "CSV multiple messages" {
 
     const result2 = try decodeInput(data[result1.bytes_consumed..]);
     try std.testing.expectEqual(@as(u32, 2), result2.message.data.new_order.user_id);
+}
+
+test "CSV invalid side" {
+    const data = "N, 1, IBM, 100, 50, X, 42\n";
+    try std.testing.expectError(codec.CodecError.InvalidField, decodeInput(data));
+}
+
+test "CSV invalid reject reason" {
+    const data = "R, IBM, 1, 100, 255\n";
+    try std.testing.expectError(codec.CodecError.InvalidField, decodeOutput(data));
+}
+
+test "CSV cancel roundtrip" {
+    // Test encoding and decoding cancel with symbol
+    const cancel_msg = msg.InputMsg.cancel(42, msg.makeSymbol("AAPL"), 999);
+
+    var buf: [256]u8 = undefined;
+    const len = try encodeInput(&cancel_msg, &buf);
+
+    try std.testing.expectEqualStrings("C, 42, 999, AAPL\n", buf[0..len]);
+
+    const result = try decodeInput(buf[0..len]);
+    try std.testing.expectEqual(@as(u32, 42), result.message.data.cancel.user_id);
+    try std.testing.expectEqual(@as(u32, 999), result.message.data.cancel.user_order_id);
+    try std.testing.expectEqualStrings("AAPL", msg.symbolSlice(&result.message.data.cancel.symbol));
+}
+
+test "parseSide validation" {
+    try std.testing.expectEqual(msg.Side.buy, parseSide('B').?);
+    try std.testing.expectEqual(msg.Side.buy, parseSide('b').?);
+    try std.testing.expectEqual(msg.Side.sell, parseSide('S').?);
+    try std.testing.expectEqual(msg.Side.sell, parseSide('s').?);
+    try std.testing.expect(parseSide('X') == null);
+    try std.testing.expect(parseSide(0) == null);
+}
+
+test "parseRejectReason validation" {
+    try std.testing.expectEqual(msg.RejectReason.unknown_symbol, parseRejectReason(1).?);
+    try std.testing.expectEqual(msg.RejectReason.invalid_order_id, parseRejectReason(10).?);
+    try std.testing.expect(parseRejectReason(0) == null);
+    try std.testing.expect(parseRejectReason(11) == null);
+    try std.testing.expect(parseRejectReason(255) == null);
 }

@@ -6,7 +6,12 @@
 //! Optimizations:
 //! - Message batching: Multiple CSV messages packed into single UDP packet
 //! - Protocol-aware encoding: Binary clients get binary responses, CSV clients get CSV
-//! - Aggressive output draining: Process up to 16384 outputs per poll cycle
+//! - Aggressive output draining: Process up to OUTPUT_DRAIN_LIMIT outputs per poll cycle
+//!
+//! UDP Batching:
+//! - CSV messages are batched into single UDP packets (up to MTU limit)
+//! - Binary messages sent immediately (fixed-size, more efficient individually)
+//! - Batches flushed at end of each drain cycle
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -27,24 +32,35 @@ const proc = @import("processor.zig");
 
 pub const NUM_PROCESSORS: usize = 2;
 
-/// Output drain limit per poll cycle
-/// At 200K orders/sec generating 2 outputs each = 400K outputs/sec
-/// At 1000 polls/sec, need to drain 400 outputs per poll minimum
+/// Output drain limit per poll cycle.
+/// At 200K orders/sec generating 2 outputs each = 400K outputs/sec.
+/// At 1000 polls/sec, need to drain 400 outputs per poll minimum.
+/// We use 128K to handle burst scenarios with margin.
 const OUTPUT_DRAIN_LIMIT: u32 = 131072;
 
+/// Default poll timeout in milliseconds.
+/// Short timeout ensures responsive output draining.
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 2;
 
-/// Maximum UDP payload size (stay under typical MTU of 1500)
-const MAX_UDP_BATCH_SIZE: usize = 10000;
+/// Maximum UDP payload size.
+/// Derived from: MTU (1500) - IP header (20) - UDP header (8) = 1472 bytes.
+/// Using 1400 for safety margin with various network configurations.
+const MAX_UDP_PAYLOAD: usize = 1400;
 
-/// Maximum number of client batches to track simultaneously
-const MAX_CLIENT_BATCHES: usize = 16;
+/// Maximum batch size for CSV message batching.
+/// Slightly under MAX_UDP_PAYLOAD to ensure we never exceed MTU.
+const MAX_UDP_BATCH_SIZE: usize = MAX_UDP_PAYLOAD;
+
+/// Maximum number of client batches to track simultaneously.
+/// Each active UDP client gets a batch slot.
+const MAX_CLIENT_BATCHES: usize = 64;
 
 // ============================================================================
 // Output Batching
 // ============================================================================
 
-/// Batch buffer for accumulating messages to same client
+/// Batch buffer for accumulating CSV messages to same UDP client.
+/// Binary protocol messages are sent immediately (not batched).
 const ClientBatch = struct {
     client_id: config.ClientId,
     buf: [MAX_UDP_BATCH_SIZE]u8,
@@ -85,7 +101,8 @@ const ClientBatch = struct {
     }
 };
 
-/// Multi-client batch manager
+/// Multi-client batch manager.
+/// Tracks active batches for multiple UDP clients simultaneously.
 const BatchManager = struct {
     batches: [MAX_CLIENT_BATCHES]ClientBatch,
     active_count: usize,
@@ -101,41 +118,50 @@ const BatchManager = struct {
         return self;
     }
 
-    /// Add data for a client, returns batch if it needs flushing
-    fn addOrFlush(self: *BatchManager, client_id: config.ClientId, data: []const u8) ?*const ClientBatch {
-        // Find existing batch for this client
+    /// Find existing batch for client, or return null if not found.
+    fn findBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
         for (self.batches[0..self.active_count]) |*batch| {
             if (batch.client_id == client_id) {
-                if (batch.canFit(data.len)) {
-                    batch.add(data);
-                    return null;
-                } else {
-                    // Return full batch, will be flushed, then retry
-                    return batch;
-                }
+                return batch;
             }
         }
+        return null;
+    }
 
-        // No existing batch, create new one
+    /// Get or create a batch for client.
+    /// Returns null if all slots are full (caller should flush oldest).
+    fn getOrCreateBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
+        // Find existing
+        if (self.findBatch(client_id)) |batch| {
+            return batch;
+        }
+
+        // Create new if space available
         if (self.active_count < MAX_CLIENT_BATCHES) {
             const batch = &self.batches[self.active_count];
             batch.reset(client_id);
-            batch.add(data);
             self.active_count += 1;
-            return null;
+            return batch;
         }
 
-        // All slots full, flush oldest (first) batch
-        return &self.batches[0];
+        return null;
     }
 
-    /// Mark a batch as flushed and ready for reuse
-    fn markFlushed(self: *BatchManager, batch: *const ClientBatch) void {
-        // Find the batch index
+    /// Get the oldest (first) batch for flushing when slots are full.
+    fn getOldestBatch(self: *BatchManager) ?*ClientBatch {
+        if (self.active_count > 0) {
+            return &self.batches[0];
+        }
+        return null;
+    }
+
+    /// Remove a batch after flushing (swap with last to maintain density).
+    fn removeBatch(self: *BatchManager, batch: *ClientBatch) void {
+        // Find index of this batch
         const batch_ptr = @intFromPtr(batch);
         for (self.batches[0..self.active_count], 0..) |*b, i| {
             if (@intFromPtr(b) == batch_ptr) {
-                // Move last active batch to this slot
+                // Swap with last active batch
                 if (i < self.active_count - 1) {
                     self.batches[i] = self.batches[self.active_count - 1];
                 }
@@ -145,11 +171,12 @@ const BatchManager = struct {
         }
     }
 
-    /// Get all active batches for final flush
+    /// Get all active batches (for final flush).
     fn getActiveBatches(self: *BatchManager) []ClientBatch {
         return self.batches[0..self.active_count];
     }
 
+    /// Clear all batches (only after flushing!).
     fn clear(self: *BatchManager) void {
         self.active_count = 0;
     }
@@ -173,6 +200,18 @@ pub const ServerStats = struct {
         }
         return total;
     }
+
+    pub fn totalCriticalDrops(self: ServerStats) u64 {
+        var total: u64 = 0;
+        for (self.processor_stats) |ps| {
+            total += ps.critical_drops;
+        }
+        return total;
+    }
+
+    pub fn isHealthy(self: ServerStats) bool {
+        return self.totalCriticalDrops() == 0;
+    }
 };
 
 // ============================================================================
@@ -189,10 +228,10 @@ pub const ThreadedServer = struct {
 
     processors: [NUM_PROCESSORS]?proc.Processor,
 
-    /// Per-message encode buffer
+    /// Per-message encode buffer.
     encode_buf: [512]u8,
 
-    /// Batch manager for output batching
+    /// Batch manager for UDP output batching.
     batch_mgr: BatchManager,
 
     cfg: config.Config,
@@ -200,6 +239,7 @@ pub const ThreadedServer = struct {
 
     running: std.atomic.Value(bool),
 
+    // Statistics (atomics for thread-safe access)
     messages_routed: [NUM_PROCESSORS]std.atomic.Value(u64),
     outputs_dispatched: std.atomic.Value(u64),
     messages_dropped: std.atomic.Value(u64),
@@ -274,10 +314,11 @@ pub const ThreadedServer = struct {
         std.debug.assert(!self.running.load(.acquire));
 
         std.log.info("Starting threaded server...", .{});
-        std.log.info("Channel capacity: {d}, Output drain limit: {d}, Batch size: {d}", .{
+        std.log.info("Config: channel_capacity={d}, drain_limit={d}, batch_size={d}, max_batches={d}", .{
             proc.CHANNEL_CAPACITY,
             OUTPUT_DRAIN_LIMIT,
             MAX_UDP_BATCH_SIZE,
+            MAX_CLIENT_BATCHES,
         });
 
         for (0..NUM_PROCESSORS) |i| {
@@ -321,7 +362,11 @@ pub const ThreadedServer = struct {
         }
 
         std.log.info("Stopping threaded server...", .{});
-        std.log.info("Batches sent: {d}", .{self.batches_sent.load(.monotonic)});
+        std.log.info("Stats: batches_sent={d}, outputs_dispatched={d}, messages_dropped={d}", .{
+            self.batches_sent.load(.monotonic),
+            self.outputs_dispatched.load(.monotonic),
+            self.messages_dropped.load(.monotonic),
+        });
         self.running.store(false, .release);
 
         self.tcp.stop();
@@ -380,7 +425,10 @@ pub const ThreadedServer = struct {
         const input = proc.ProcessorInput{
             .message = message.*,
             .client_id = client_id,
-            .enqueue_time_ns = @truncate(std.time.nanoTimestamp()),
+            .enqueue_time_ns = if (proc.TRACK_LATENCY)
+                @truncate(std.time.nanoTimestamp())
+            else
+                0,
         };
 
         switch (message.msg_type) {
@@ -422,12 +470,11 @@ pub const ThreadedServer = struct {
         }
     }
 
-    /// Drain output queues with message batching for UDP
+    /// Drain output queues with message batching for UDP.
+    /// CSV messages are batched; binary messages sent immediately.
     fn drainOutputQueues(self: *Self) void {
-        const batches_before = self.batches_sent.load(.monotonic);
-        self.batch_mgr.clear();
-
         var total_outputs: u32 = 0;
+
         for (self.output_queues) |queue| {
             var count: u32 = 0;
             while (count < OUTPUT_DRAIN_LIMIT) : (count += 1) {
@@ -438,22 +485,12 @@ pub const ThreadedServer = struct {
             }
         }
 
-        // Flush all remaining batches
+        // Flush all batches at end of drain cycle
+        // IMPORTANT: Always flush after processing to ensure no messages stuck in batches
         self.flushAllBatches();
-
-        // Log summary if we sent batches this cycle
-        const batches_after = self.batches_sent.load(.monotonic);
-        const batches_this_cycle = batches_after - batches_before;
-        if (batches_this_cycle > 0 and total_outputs >= 100) {
-            std.log.info("Drain cycle: {d} outputs -> {d} UDP batches (total: {d})", .{
-                total_outputs,
-                batches_this_cycle,
-                batches_after,
-            });
-        }
     }
 
-    /// Process a single output message, batching UDP sends
+    /// Process a single output message, batching UDP sends.
     fn processOutput(self: *Self, out_msg: *const msg.OutputMsg) void {
         // Determine client protocol for UDP clients
         const use_binary = if (config.isUdpClient(out_msg.client_id))
@@ -477,17 +514,17 @@ pub const ThreadedServer = struct {
         // Handle based on message type
         switch (out_msg.msg_type) {
             .ack, .cancel_ack, .reject => {
-                self.batchedSendToClient(out_msg.client_id, data, use_binary);
+                self.sendToClient(out_msg.client_id, data, use_binary);
             },
             .trade => {
-                self.batchedSendToClient(out_msg.client_id, data, use_binary);
+                self.sendToClient(out_msg.client_id, data, use_binary);
                 if (self.cfg.mcast_enabled) {
                     _ = self.multicast.publish(out_msg);
                 }
             },
             .top_of_book => {
                 if (out_msg.client_id != 0) {
-                    self.batchedSendToClient(out_msg.client_id, data, use_binary);
+                    self.sendToClient(out_msg.client_id, data, use_binary);
                 }
                 if (self.cfg.mcast_enabled) {
                     _ = self.multicast.publish(out_msg);
@@ -496,60 +533,75 @@ pub const ThreadedServer = struct {
         }
     }
 
-    /// Add message to batch, flushing if needed
-    fn batchedSendToClient(self: *Self, client_id: config.ClientId, data: []const u8, is_binary: bool) void {
+    /// Send message to client, using batching for CSV over UDP.
+    fn sendToClient(self: *Self, client_id: config.ClientId, data: []const u8, is_binary: bool) void {
         if (client_id == 0) return;
 
-        // TCP messages are not batched (TCP handles its own buffering)
+        // TCP messages sent directly (TCP handles its own buffering via Nagle/cork)
         if (!config.isUdpClient(client_id)) {
             _ = self.tcp.send(client_id, data);
             return;
         }
 
-        // Binary protocol: send immediately (fixed-size messages, no newline delimiter)
-        // CSV protocol: batch multiple messages into single UDP packet
+        // Binary UDP: send immediately (fixed-size messages, no batching benefit)
         if (is_binary) {
             _ = self.udp.send(client_id, data);
             _ = self.batches_sent.fetchAdd(1, .monotonic);
             return;
         }
 
-        // CSV: Try to add to batch
-        while (true) {
-            if (self.batch_mgr.addOrFlush(client_id, data)) |full_batch| {
-                // Batch is full, flush it
-                self.flushBatch(full_batch);
-                self.batch_mgr.markFlushed(full_batch);
-                // Retry adding to a new/different batch
-            } else {
-                // Successfully added to batch
-                break;
-            }
-        }
+        // CSV UDP: batch multiple messages into single packet
+        self.batchCsvMessage(client_id, data);
     }
 
-    /// Flush a single batch
+    /// Add CSV message to batch for client.
+    fn batchCsvMessage(self: *Self, client_id: config.ClientId, data: []const u8) void {
+        // Try to get or create batch for this client
+        if (self.batch_mgr.getOrCreateBatch(client_id)) |batch| {
+            if (batch.canFit(data.len)) {
+                batch.add(data);
+                return;
+            }
+
+            // Batch is full, flush it first
+            self.flushBatch(batch);
+            batch.reset(client_id);
+            batch.add(data);
+            return;
+        }
+
+        // All batch slots full - flush oldest and retry
+        if (self.batch_mgr.getOldestBatch()) |oldest| {
+            self.flushBatch(oldest);
+            self.batch_mgr.removeBatch(oldest);
+
+            // Now create new batch
+            if (self.batch_mgr.getOrCreateBatch(client_id)) |batch| {
+                batch.add(data);
+                return;
+            }
+        }
+
+        // Fallback: send directly without batching
+        _ = self.udp.send(client_id, data);
+        _ = self.batches_sent.fetchAdd(1, .monotonic);
+    }
+
+    /// Flush a single batch to UDP.
     fn flushBatch(self: *Self, batch: *const ClientBatch) void {
         if (batch.isEmpty()) return;
 
         const data = batch.getData();
-        const sent = self.udp.send(batch.client_id, data);
+        _ = self.udp.send(batch.client_id, data);
         _ = self.batches_sent.fetchAdd(1, .monotonic);
-
-        // Debug: log first few batches
-        const batches_so_far = self.batches_sent.load(.monotonic);
-        if (batches_so_far <= 3) {
-            std.log.info("Batch {d}: client={d}, len={d}, msgs={d}, sent={}", .{
-                batches_so_far, batch.client_id, data.len, batch.msg_count, sent,
-            });
-        }
     }
 
-    /// Flush all active batches
+    /// Flush all active batches.
     fn flushAllBatches(self: *Self) void {
         for (self.batch_mgr.getActiveBatches()) |*batch| {
             self.flushBatch(batch);
         }
+        // Clear only AFTER flushing to prevent data loss
         self.batch_mgr.clear();
     }
 
@@ -563,7 +615,10 @@ pub const ThreadedServer = struct {
         const input = proc.ProcessorInput{
             .message = cancel_msg,
             .client_id = client_id,
-            .enqueue_time_ns = @truncate(std.time.nanoTimestamp()),
+            .enqueue_time_ns = if (proc.TRACK_LATENCY)
+                @truncate(std.time.nanoTimestamp())
+            else
+                0,
         };
 
         for (0..NUM_PROCESSORS) |i| {
@@ -612,9 +667,14 @@ pub const ThreadedServer = struct {
         return stats;
     }
 
-    /// Get batches sent count (for diagnostics)
+    /// Get batches sent count (for diagnostics).
     pub fn getBatchesSent(self: *const Self) u64 {
         return self.batches_sent.load(.monotonic);
+    }
+
+    /// Check if server is healthy (no critical drops).
+    pub fn isHealthy(self: *const Self) bool {
+        return self.getStats().isHealthy();
     }
 };
 
@@ -643,21 +703,42 @@ test "ClientBatch overflow detection" {
     const big_msg = "X" ** 1300;
     batch.add(big_msg);
 
-    // Should not fit another 200 bytes
+    // Should not fit another 200 bytes (1300 + 200 > 1400)
     try std.testing.expect(!batch.canFit(200));
-    // Should fit 100 bytes
+    // Should fit 100 bytes (1300 + 100 = 1400)
     try std.testing.expect(batch.canFit(100));
 }
 
 test "BatchManager multi-client" {
     var mgr = BatchManager.init();
 
-    // Add messages for different clients
-    try std.testing.expect(mgr.addOrFlush(100, "msg1\n") == null);
-    try std.testing.expect(mgr.addOrFlush(200, "msg2\n") == null);
-    try std.testing.expect(mgr.addOrFlush(100, "msg3\n") == null); // Same client
+    // Add batches for different clients
+    const batch1 = mgr.getOrCreateBatch(100);
+    try std.testing.expect(batch1 != null);
+    batch1.?.add("msg1\n");
+
+    const batch2 = mgr.getOrCreateBatch(200);
+    try std.testing.expect(batch2 != null);
+    batch2.?.add("msg2\n");
+
+    // Same client should return same batch
+    const batch1_again = mgr.getOrCreateBatch(100);
+    try std.testing.expect(batch1_again == batch1);
 
     try std.testing.expectEqual(@as(usize, 2), mgr.active_count);
+}
+
+test "BatchManager flush and clear" {
+    var mgr = BatchManager.init();
+
+    _ = mgr.getOrCreateBatch(100);
+    _ = mgr.getOrCreateBatch(200);
+
+    try std.testing.expectEqual(@as(usize, 2), mgr.active_count);
+
+    // Clear should reset count
+    mgr.clear();
+    try std.testing.expectEqual(@as(usize, 0), mgr.active_count);
 }
 
 test "ServerStats total processed" {
@@ -677,6 +758,9 @@ test "ServerStats total processed" {
                 .max_latency_ns = 0,
                 .output_backpressure_count = 0,
                 .output_spin_waits = 0,
+                .output_yield_waits = 0,
+                .critical_drops = 0,
+                .non_critical_drops = 0,
                 .idle_cycles = 0,
             },
             .{
@@ -689,10 +773,65 @@ test "ServerStats total processed" {
                 .max_latency_ns = 0,
                 .output_backpressure_count = 0,
                 .output_spin_waits = 0,
+                .output_yield_waits = 0,
+                .critical_drops = 0,
+                .non_critical_drops = 0,
                 .idle_cycles = 0,
             },
         },
     };
 
     try std.testing.expectEqual(@as(u64, 300), stats.totalProcessed());
+    try std.testing.expectEqual(@as(u64, 0), stats.totalCriticalDrops());
+    try std.testing.expect(stats.isHealthy());
+}
+
+test "ServerStats unhealthy with critical drops" {
+    var stats = ServerStats{
+        .messages_routed = .{ 100, 200 },
+        .outputs_dispatched = 150,
+        .messages_dropped = 0,
+        .disconnect_cancels = 0,
+        .processor_stats = .{
+            .{
+                .messages_processed = 100,
+                .outputs_generated = 50,
+                .input_queue_depth = 0,
+                .output_queue_depth = 0,
+                .total_processing_time_ns = 0,
+                .min_latency_ns = 0,
+                .max_latency_ns = 0,
+                .output_backpressure_count = 0,
+                .output_spin_waits = 0,
+                .output_yield_waits = 0,
+                .critical_drops = 5, // Critical drops!
+                .non_critical_drops = 0,
+                .idle_cycles = 0,
+            },
+            .{
+                .messages_processed = 200,
+                .outputs_generated = 100,
+                .input_queue_depth = 0,
+                .output_queue_depth = 0,
+                .total_processing_time_ns = 0,
+                .min_latency_ns = 0,
+                .max_latency_ns = 0,
+                .output_backpressure_count = 0,
+                .output_spin_waits = 0,
+                .output_yield_waits = 0,
+                .critical_drops = 0,
+                .non_critical_drops = 0,
+                .idle_cycles = 0,
+            },
+        },
+    };
+
+    try std.testing.expectEqual(@as(u64, 5), stats.totalCriticalDrops());
+    try std.testing.expect(!stats.isHealthy());
+}
+
+test "MAX_UDP_BATCH_SIZE within MTU" {
+    // Verify our batch size is safe for UDP
+    try std.testing.expect(MAX_UDP_BATCH_SIZE <= 1472); // MTU - headers
+    try std.testing.expect(MAX_UDP_BATCH_SIZE <= MAX_UDP_PAYLOAD);
 }

@@ -62,6 +62,22 @@ pub const BoundedChannel = @import("bounded_channel.zig").BoundedChannel;
 pub const RecvResult = @import("bounded_channel.zig").RecvResult;
 
 // ============================================================================
+// Type Aliases for Semantic Clarity
+// ============================================================================
+
+/// Type alias for input channels (orders flowing into processor).
+/// Usage: `const InputChannel = collections.InputChannelType(msg.InputMsg);`
+pub fn InputChannelType(comptime T: type) type {
+    return BoundedChannel(T, 65536);
+}
+
+/// Type alias for output channels (responses flowing out of processor).
+/// Usage: `const OutputChannel = collections.OutputChannelType(msg.OutputMsg);`
+pub fn OutputChannelType(comptime T: type) type {
+    return BoundedChannel(T, 65536);
+}
+
+// ============================================================================
 // Convenience Functions
 // ============================================================================
 
@@ -75,6 +91,12 @@ pub fn createInputChannel(comptime T: type) BoundedChannel(T, 65536) {
 /// Default capacity: 64K messages.
 pub fn createOutputChannel(comptime T: type) BoundedChannel(T, 65536) {
     return BoundedChannel(T, 65536).init();
+}
+
+/// Create a channel with custom capacity.
+/// Capacity must be a power of 2.
+pub fn createChannel(comptime T: type, comptime capacity: usize) BoundedChannel(T, capacity) {
+    return BoundedChannel(T, capacity).init();
 }
 
 // ============================================================================
@@ -98,4 +120,17 @@ test "convenience functions" {
 
     try std.testing.expectEqual(@as(usize, 65535), InputChan.CAPACITY);
     try std.testing.expectEqual(@as(usize, 65535), OutputChan.CAPACITY);
+}
+
+test "type aliases" {
+    const InputChannel = InputChannelType(u32);
+    const OutputChannel = OutputChannelType(u64);
+
+    try std.testing.expectEqual(@as(usize, 65535), InputChannel.CAPACITY);
+    try std.testing.expectEqual(@as(usize, 65535), OutputChannel.CAPACITY);
+}
+
+test "custom capacity channel" {
+    const SmallChannel = @TypeOf(createChannel(u32, 256));
+    try std.testing.expectEqual(@as(usize, 255), SmallChannel.CAPACITY);
 }

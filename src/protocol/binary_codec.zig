@@ -12,13 +12,18 @@
 //!
 //! Message sizes (including 2-byte header):
 //! - New Order:   27 bytes
-//! - Cancel:      10 bytes
+//! - Cancel:      18 bytes
 //! - Flush:        2 bytes
 //! - Ack:         18 bytes
 //! - Cancel Ack:  18 bytes
 //! - Trade:       34 bytes
 //! - Top of Book: 20 bytes
 //! - Reject:      19 bytes
+//!
+//! Security:
+//! - All enum values are validated before use (no @enumFromInt on untrusted data)
+//! - All buffer accesses are bounds-checked
+//! - Invalid messages return errors, never UB
 
 const std = @import("std");
 const msg = @import("message_types.zig");
@@ -76,6 +81,38 @@ comptime {
     std.debug.assert(FLUSH_WIRE_SIZE == HEADER_SIZE);
     std.debug.assert(ACK_WIRE_SIZE == HEADER_SIZE + msg.MAX_SYMBOL_LENGTH + 4 + 4);
     std.debug.assert(TRADE_WIRE_SIZE == HEADER_SIZE + msg.MAX_SYMBOL_LENGTH + 4 + 4 + 4 + 4 + 4 + 4);
+}
+
+// ============================================================================
+// Safe Enum Parsing (Security Critical)
+// ============================================================================
+
+/// Parse Side from wire byte. Returns null if invalid.
+/// SECURITY: Never use @enumFromInt on untrusted input!
+fn parseSide(byte: u8) ?msg.Side {
+    return switch (byte) {
+        @intFromEnum(msg.Side.buy) => .buy,
+        @intFromEnum(msg.Side.sell) => .sell,
+        else => null,
+    };
+}
+
+/// Parse RejectReason from wire byte. Returns null if invalid.
+/// SECURITY: Never use @enumFromInt on untrusted input!
+fn parseRejectReason(byte: u8) ?msg.RejectReason {
+    return switch (byte) {
+        @intFromEnum(msg.RejectReason.unknown_symbol) => .unknown_symbol,
+        @intFromEnum(msg.RejectReason.invalid_quantity) => .invalid_quantity,
+        @intFromEnum(msg.RejectReason.invalid_price) => .invalid_price,
+        @intFromEnum(msg.RejectReason.order_not_found) => .order_not_found,
+        @intFromEnum(msg.RejectReason.duplicate_order_id) => .duplicate_order_id,
+        @intFromEnum(msg.RejectReason.pool_exhausted) => .pool_exhausted,
+        @intFromEnum(msg.RejectReason.unauthorized) => .unauthorized,
+        @intFromEnum(msg.RejectReason.throttled) => .throttled,
+        @intFromEnum(msg.RejectReason.book_full) => .book_full,
+        @intFromEnum(msg.RejectReason.invalid_order_id) => .invalid_order_id,
+        else => null,
+    };
 }
 
 // ============================================================================
@@ -176,8 +213,9 @@ pub fn decode(data: []const u8) codec.CodecError!codec.DecodeResult {
     return switch (msg_type) {
         MSG_NEW_ORDER => {
             if (data.len < NEW_ORDER_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
+            const message = decodeNewOrder(data) orelse return codec.CodecError.InvalidField;
             return .{
-                .message = decodeNewOrder(data),
+                .message = message,
                 .bytes_consumed = NEW_ORDER_WIRE_SIZE,
             };
         },
@@ -201,7 +239,7 @@ pub fn decode(data: []const u8) codec.CodecError!codec.DecodeResult {
     };
 }
 
-fn decodeNewOrder(data: []const u8) msg.InputMsg {
+fn decodeNewOrder(data: []const u8) ?msg.InputMsg {
     std.debug.assert(data.len >= NEW_ORDER_WIRE_SIZE);
     std.debug.assert(data[0] == MAGIC and data[1] == MSG_NEW_ORDER);
 
@@ -220,7 +258,8 @@ fn decodeNewOrder(data: []const u8) msg.InputMsg {
     const quantity = readU32Big(data[pos..][0..4]);
     pos += 4;
 
-    const side: msg.Side = @enumFromInt(data[pos]);
+    // SECURITY: Validate side before use
+    const side = parseSide(data[pos]) orelse return null;
     pos += 1;
 
     const user_order_id = readU32Big(data[pos..][0..4]);
@@ -246,7 +285,7 @@ fn decodeCancel(data: []const u8) msg.InputMsg {
 
     const user_id = readU32Big(data[pos..][0..4]);
     pos += 4;
- 
+
     var symbol: msg.Symbol = undefined;
     @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
     pos += msg.MAX_SYMBOL_LENGTH;
@@ -440,8 +479,9 @@ pub fn decodeOutput(data: []const u8) codec.CodecError!codec.OutputDecodeResult 
         },
         MSG_TOP_OF_BOOK => {
             if (data.len < TOP_OF_BOOK_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
+            const message = decodeTopOfBookMsg(data) orelse return codec.CodecError.InvalidField;
             return .{
-                .message = decodeTopOfBookMsg(data),
+                .message = message,
                 .bytes_consumed = TOP_OF_BOOK_WIRE_SIZE,
             };
         },
@@ -454,8 +494,9 @@ pub fn decodeOutput(data: []const u8) codec.CodecError!codec.OutputDecodeResult 
         },
         MSG_REJECT => {
             if (data.len < REJECT_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
+            const message = decodeRejectMsg(data) orelse return codec.CodecError.InvalidField;
             return .{
-                .message = decodeRejectMsg(data),
+                .message = message,
                 .bytes_consumed = REJECT_WIRE_SIZE,
             };
         },
@@ -497,14 +538,15 @@ fn decodeTradeMsg(data: []const u8) msg.OutputMsg {
     );
 }
 
-fn decodeTopOfBookMsg(data: []const u8) msg.OutputMsg {
+fn decodeTopOfBookMsg(data: []const u8) ?msg.OutputMsg {
     var pos: usize = HEADER_SIZE;
 
     var symbol: msg.Symbol = undefined;
     @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
     pos += msg.MAX_SYMBOL_LENGTH;
 
-    const side: msg.Side = @enumFromInt(data[pos]);
+    // SECURITY: Validate side before use
+    const side = parseSide(data[pos]) orelse return null;
     pos += 1;
 
     return msg.OutputMsg.makeTopOfBook(
@@ -530,17 +572,20 @@ fn decodeCancelAckMsg(data: []const u8) msg.OutputMsg {
     );
 }
 
-fn decodeRejectMsg(data: []const u8) msg.OutputMsg {
+fn decodeRejectMsg(data: []const u8) ?msg.OutputMsg {
     var pos: usize = HEADER_SIZE;
 
     var symbol: msg.Symbol = undefined;
     @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
     pos += msg.MAX_SYMBOL_LENGTH;
 
+    // SECURITY: Validate reject reason before use
+    const reason = parseRejectReason(data[pos + 8]) orelse return null;
+
     return msg.OutputMsg.makeReject(
         readU32Big(data[pos..][0..4]),
         readU32Big(data[pos + 4 ..][0..4]),
-        @enumFromInt(data[pos + 8]),
+        reason,
         symbol,
         0,
     );
@@ -657,4 +702,44 @@ test "binary invalid magic" {
 test "binary unknown message type" {
     const unknown = [_]u8{ MAGIC, 0xFF };
     try std.testing.expectError(codec.CodecError.UnknownMessageType, decode(&unknown));
+}
+
+test "binary invalid side byte" {
+    // Construct a message with invalid side byte
+    var buf: [NEW_ORDER_WIRE_SIZE]u8 = undefined;
+    buf[0] = MAGIC;
+    buf[1] = MSG_NEW_ORDER;
+    // Fill rest with zeros (user_id, symbol, price, qty)
+    @memset(buf[2..], 0);
+    // Set side byte to invalid value (position is 2+4+8+4+4 = 22)
+    buf[22] = 0xFF; // Invalid side
+
+    try std.testing.expectError(codec.CodecError.InvalidField, decode(&buf));
+}
+
+test "binary invalid reject reason" {
+    var buf: [REJECT_WIRE_SIZE]u8 = undefined;
+    buf[0] = MAGIC;
+    buf[1] = MSG_REJECT;
+    @memset(buf[2..], 0);
+    // Reason byte is at position 2+8+4+4 = 18
+    buf[18] = 0xFF; // Invalid reason
+
+    try std.testing.expectError(codec.CodecError.InvalidField, decodeOutput(&buf));
+}
+
+test "parseSide validation" {
+    try std.testing.expectEqual(msg.Side.buy, parseSide('B').?);
+    try std.testing.expectEqual(msg.Side.sell, parseSide('S').?);
+    try std.testing.expect(parseSide('X') == null);
+    try std.testing.expect(parseSide(0) == null);
+    try std.testing.expect(parseSide(255) == null);
+}
+
+test "parseRejectReason validation" {
+    try std.testing.expectEqual(msg.RejectReason.unknown_symbol, parseRejectReason(1).?);
+    try std.testing.expectEqual(msg.RejectReason.invalid_order_id, parseRejectReason(10).?);
+    try std.testing.expect(parseRejectReason(0) == null);
+    try std.testing.expect(parseRejectReason(11) == null);
+    try std.testing.expect(parseRejectReason(255) == null);
 }

@@ -15,6 +15,12 @@
 //! - All large structures heap-allocated with initInPlace
 //! - Bounded memory usage
 //! - No dynamic allocation in hot path
+//!
+//! Backpressure handling:
+//! - Output queue full triggers extended spin-wait with yields
+//! - Critical messages (trades, rejects) get maximum retry effort
+//! - Dropped messages are logged with full details for debugging
+//! - In debug builds, dropping critical messages triggers panic
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -38,6 +44,17 @@ const MAX_POLL_ITERATIONS: u32 = 1000;
 
 /// Spin count before yielding when waiting for output queue space
 const OUTPUT_SPIN_COUNT: u32 = 100;
+
+/// Yield count before giving up on output queue space
+const OUTPUT_YIELD_COUNT: u32 = 50;
+
+/// Enable latency tracking (adds ~100-200ns per message from syscalls)
+/// Set to false for maximum performance in production
+pub const TRACK_LATENCY: bool = true;
+
+/// In debug/safe builds, panic if critical messages are dropped
+/// Critical = trades, rejects (clients MUST receive these)
+const PANIC_ON_CRITICAL_DROP: bool = std.debug.runtime_safety;
 
 // ============================================================================
 // Message Types
@@ -101,6 +118,9 @@ pub const ProcessorStats = struct {
     max_latency_ns: i64,
     output_backpressure_count: u64,
     output_spin_waits: u64,
+    output_yield_waits: u64,
+    critical_drops: u64,
+    non_critical_drops: u64,
     idle_cycles: u64,
 };
 
@@ -127,6 +147,9 @@ pub const Processor = struct {
     max_latency_ns: i64 = 0,
     output_backpressure_count: u64 = 0,
     output_spin_waits: u64 = 0,
+    output_yield_waits: u64 = 0,
+    critical_drops: u64 = 0,
+    non_critical_drops: u64 = 0,
     idle_cycles: u64 = 0,
 
     const Self = @This();
@@ -186,7 +209,11 @@ pub const Processor = struct {
         self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
 
-        std.log.info("{s} started", .{self.id.name()});
+        std.log.info("{s} started (latency_tracking={}, panic_on_critical_drop={})", .{
+            self.id.name(),
+            TRACK_LATENCY,
+            PANIC_ON_CRITICAL_DROP,
+        });
     }
 
     pub fn stop(self: *Self) void {
@@ -202,12 +229,15 @@ pub const Processor = struct {
             self.thread = null;
         }
 
-        std.log.info("{s} stopped (processed {d} messages, {d} outputs, {d} backpressure, {d} spin waits)", .{
+        std.log.info("{s} stopped (processed={d}, outputs={d}, backpressure={d}, spins={d}, yields={d}, critical_drops={d}, non_critical_drops={d})", .{
             self.id.name(),
             self.messages_processed,
             self.outputs_generated,
             self.output_backpressure_count,
             self.output_spin_waits,
+            self.output_yield_waits,
+            self.critical_drops,
+            self.non_critical_drops,
         });
     }
 
@@ -218,7 +248,8 @@ pub const Processor = struct {
             const processed = self.pollOnce();
 
             if (processed == 0) {
-                self.idle_cycles += 1;
+                // Saturating add to prevent overflow (not that it matters after 584 years)
+                self.idle_cycles +|= 1;
                 // Yield is bounded and explicit; no busy loops.
                 std.Thread.yield() catch {};
             }
@@ -240,58 +271,136 @@ pub const Processor = struct {
     }
 
     fn handleMessage(self: *Self, input: *const ProcessorInput) void {
-        const start_time: i64 = @truncate(std.time.nanoTimestamp());
+        // Conditional timestamp to avoid syscall overhead in production
+        const start_time: i128 = if (TRACK_LATENCY) std.time.nanoTimestamp() else 0;
 
         self.output_buffer.clear();
         self.engine.processMessage(&input.message, input.client_id, self.output_buffer);
 
-        const end_time: i64 = @truncate(std.time.nanoTimestamp());
-        const processing_time = end_time - start_time;
-        const queue_latency = start_time - input.enqueue_time_ns;
+        // Update timing stats if tracking enabled
+        if (TRACK_LATENCY) {
+            const end_time = std.time.nanoTimestamp();
+            const processing_time = end_time - start_time;
+            const queue_latency = start_time - input.enqueue_time_ns;
+
+            // Safe conversion to i64 (clamping if somehow > 292 years)
+            const processing_i64: i64 = @intCast(@min(processing_time, std.math.maxInt(i64)));
+            const queue_latency_i64: i64 = @intCast(@min(@max(queue_latency, 0), std.math.maxInt(i64)));
+
+            self.total_processing_time_ns += processing_i64;
+            self.min_latency_ns = @min(self.min_latency_ns, queue_latency_i64);
+            self.max_latency_ns = @max(self.max_latency_ns, queue_latency_i64);
+        }
 
         self.messages_processed += 1;
-        self.total_processing_time_ns += processing_time;
-        self.min_latency_ns = @min(self.min_latency_ns, queue_latency);
-        self.max_latency_ns = @max(self.max_latency_ns, queue_latency);
 
-        // Send outputs with retry on backpressure
+        // Send outputs with extended retry on backpressure
+        const latency_for_output: i64 = if (TRACK_LATENCY)
+            @intCast(@min(@max(std.time.nanoTimestamp() - input.enqueue_time_ns, 0), std.math.maxInt(i64)))
+        else
+            0;
+
         for (self.output_buffer.slice()) |out_msg| {
             const proc_output = ProcessorOutput{
                 .message = out_msg,
-                .latency_ns = queue_latency,
+                .latency_ns = latency_for_output,
             };
 
-            if (!self.pushOutputWithRetry(proc_output)) {
-                // After retries, still couldn't push - count as dropped
-                self.output_backpressure_count += 1;
-            } else {
+            const push_result = self.pushOutputWithRetry(proc_output);
+
+            if (push_result.success) {
                 self.outputs_generated += 1;
+                if (push_result.spin_waited) {
+                    self.output_spin_waits += 1;
+                }
+                if (push_result.yield_waited) {
+                    self.output_yield_waits += 1;
+                }
+            } else {
+                self.output_backpressure_count += 1;
+                self.handleDroppedOutput(&out_msg);
             }
         }
     }
 
-    /// Try to push output, with brief spin-wait on backpressure
-    /// This gives the I/O thread time to drain before we drop
-    fn pushOutputWithRetry(self: *Self, output: ProcessorOutput) bool {
+    const PushResult = struct {
+        success: bool,
+        spin_waited: bool,
+        yield_waited: bool,
+    };
+
+    /// Try to push output with extended retry on backpressure.
+    /// Uses spin-wait, then yield-wait before giving up.
+    fn pushOutputWithRetry(self: *Self, output: ProcessorOutput) PushResult {
         // First try - fast path
         if (self.output.push(output)) {
-            return true;
+            return .{ .success = true, .spin_waited = false, .yield_waited = false };
         }
 
         // Queue is full - spin briefly waiting for space
         var spins: u32 = 0;
         while (spins < OUTPUT_SPIN_COUNT) : (spins += 1) {
-            // Hint to CPU we're spinning
             std.atomic.spinLoopHint();
 
             if (self.output.push(output)) {
-                self.output_spin_waits += 1;
-                return true;
+                return .{ .success = true, .spin_waited = true, .yield_waited = false };
             }
         }
 
-        // Still full after spinning - give up
-        return false;
+        // Still full - yield to let I/O thread drain
+        var yields: u32 = 0;
+        while (yields < OUTPUT_YIELD_COUNT) : (yields += 1) {
+            std.Thread.yield() catch {};
+
+            if (self.output.push(output)) {
+                return .{ .success = true, .spin_waited = true, .yield_waited = true };
+            }
+        }
+
+        // Still full after extended retry - give up
+        return .{ .success = false, .spin_waited = true, .yield_waited = true };
+    }
+
+    /// Handle a dropped output message - log details and potentially panic.
+    fn handleDroppedOutput(self: *Self, out_msg: *const msg.OutputMsg) void {
+        const is_critical = switch (out_msg.msg_type) {
+            .trade, .reject => true,
+            .ack, .cancel_ack, .top_of_book => false,
+        };
+
+        if (is_critical) {
+            self.critical_drops += 1;
+
+            // Log full details for critical drops
+            std.log.err("CRITICAL OUTPUT DROPPED: {s} type={s} client={d} symbol={s} user={d} order={d}", .{
+                self.id.name(),
+                @tagName(out_msg.msg_type),
+                out_msg.client_id,
+                msg.symbolSlice(&out_msg.symbol),
+                out_msg.getUserId(),
+                switch (out_msg.msg_type) {
+                    .trade => out_msg.data.trade.buy_order_id,
+                    .reject => out_msg.data.reject.user_order_id,
+                    .ack => out_msg.data.ack.user_order_id,
+                    .cancel_ack => out_msg.data.cancel_ack.user_order_id,
+                    .top_of_book => 0,
+                },
+            });
+
+            // In debug builds, panic on critical drops - this is unacceptable
+            if (PANIC_ON_CRITICAL_DROP) {
+                @panic("Critical output message dropped - output queue overflow");
+            }
+        } else {
+            self.non_critical_drops += 1;
+
+            // Log warning for non-critical drops
+            std.log.warn("Output dropped: {s} type={s} client={d}", .{
+                self.id.name(),
+                @tagName(out_msg.msg_type),
+                out_msg.client_id,
+            });
+        }
     }
 
     fn drainRemaining(self: *Self) void {
@@ -321,8 +430,17 @@ pub const Processor = struct {
             .max_latency_ns = self.max_latency_ns,
             .output_backpressure_count = self.output_backpressure_count,
             .output_spin_waits = self.output_spin_waits,
+            .output_yield_waits = self.output_yield_waits,
+            .critical_drops = self.critical_drops,
+            .non_critical_drops = self.non_critical_drops,
             .idle_cycles = self.idle_cycles,
         };
+    }
+
+    /// Check if any critical messages have been dropped.
+    /// Returns true if system is healthy (no critical drops).
+    pub fn isHealthy(self: *const Self) bool {
+        return self.critical_drops == 0;
     }
 };
 
@@ -333,13 +451,62 @@ pub const Processor = struct {
 test "routeSymbol - A-M to processor 0" {
     try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("AAPL")));
     try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("MSFT")));
+    try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("IBM")));
+    try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("GE")));
 }
 
 test "routeSymbol - N-Z to processor 1" {
     try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("NVDA")));
     try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("TSLA")));
+    try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("XOM")));
+    try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("ZM")));
+}
+
+test "routeSymbol - lowercase handled" {
+    try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("aapl")));
+    try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("tsla")));
 }
 
 test "routeSymbol - empty symbol" {
     try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.EMPTY_SYMBOL));
+}
+
+test "ProcessorStats default values" {
+    const stats = ProcessorStats{
+        .messages_processed = 0,
+        .outputs_generated = 0,
+        .input_queue_depth = 0,
+        .output_queue_depth = 0,
+        .total_processing_time_ns = 0,
+        .min_latency_ns = std.math.maxInt(i64),
+        .max_latency_ns = 0,
+        .output_backpressure_count = 0,
+        .output_spin_waits = 0,
+        .output_yield_waits = 0,
+        .critical_drops = 0,
+        .non_critical_drops = 0,
+        .idle_cycles = 0,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), stats.messages_processed);
+    try std.testing.expectEqual(@as(u64, 0), stats.critical_drops);
+}
+
+test "PushResult flags" {
+    const fast_path = Processor.PushResult{ .success = true, .spin_waited = false, .yield_waited = false };
+    const spin_path = Processor.PushResult{ .success = true, .spin_waited = true, .yield_waited = false };
+    const yield_path = Processor.PushResult{ .success = true, .spin_waited = true, .yield_waited = true };
+    const failed = Processor.PushResult{ .success = false, .spin_waited = true, .yield_waited = true };
+
+    try std.testing.expect(fast_path.success);
+    try std.testing.expect(!fast_path.spin_waited);
+
+    try std.testing.expect(spin_path.success);
+    try std.testing.expect(spin_path.spin_waited);
+    try std.testing.expect(!spin_path.yield_waited);
+
+    try std.testing.expect(yield_path.success);
+    try std.testing.expect(yield_path.yield_waited);
+
+    try std.testing.expect(!failed.success);
 }
