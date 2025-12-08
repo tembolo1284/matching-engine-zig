@@ -103,8 +103,8 @@ pub const Config = struct {
     tcp_addr: []const u8 = "0.0.0.0",
     tcp_port: u16 = 1234,
     tcp_max_clients: u32 = 1024,
-    tcp_recv_buffer_size: u32 = 65536,
-    tcp_send_buffer_size: u32 = 65536,
+    tcp_recv_buffer_size: u32 = 1024 * 1024,
+    tcp_send_buffer_size: u32 = 1024 * 1024,
     tcp_nodelay: bool = true,
 
     // === UDP Settings ===
@@ -113,7 +113,7 @@ pub const Config = struct {
     udp_port: u16 = 1235,
     udp_recv_buffer_size: u32 = 1024 * 1024, // 1MB for burst handling
     udp_send_buffer_size: u32 = 1024 * 1024,
-    udp_max_clients: u32 = 4096,
+    udp_max_clients: u32 = 1024,
 
     // === Multicast Settings ===
     mcast_enabled: bool = true,
@@ -124,7 +124,7 @@ pub const Config = struct {
     mcast_loopback: bool = true, // Enable for local testing
 
     // === General Settings ===
-    channel_capacity: u32 = 65536,
+    channel_capacity: u32 = 131072,
     use_binary_protocol: bool = false,
     use_tcp_framing: bool = true,
 
