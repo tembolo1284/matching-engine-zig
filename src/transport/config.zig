@@ -103,16 +103,16 @@ pub const Config = struct {
     tcp_addr: []const u8 = "0.0.0.0",
     tcp_port: u16 = 1234,
     tcp_max_clients: u32 = 1024,
-    tcp_recv_buffer_size: u32 = 1024 * 1024,
-    tcp_send_buffer_size: u32 = 1024 * 1024,
+    tcp_recv_buffer_size: u32 = 4 * 1024 * 1024,
+    tcp_send_buffer_size: u32 = 4 * 1024 * 1024,
     tcp_nodelay: bool = true,
 
     // === UDP Settings ===
     udp_enabled: bool = true,
     udp_addr: []const u8 = "0.0.0.0",
     udp_port: u16 = 1235,
-    udp_recv_buffer_size: u32 = 1024 * 1024, // 1MB for burst handling
-    udp_send_buffer_size: u32 = 1024 * 1024,
+    udp_recv_buffer_size: u32 = 4 * 1024 * 1024, // 1MB for burst handling
+    udp_send_buffer_size: u32 = 4 * 1024 * 1024,
     udp_max_clients: u32 = 1024,
 
     // === Multicast Settings ===
