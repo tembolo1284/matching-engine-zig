@@ -1,8 +1,8 @@
 //! TCP client connection state and buffer management.
 //!
 //! Each TcpClient represents a single TCP connection with:
-//! - Receive buffer with frame extraction
-//! - Send buffer with optional length-prefix framing
+//! - Receive buffer with frame extraction (heap-allocated)
+//! - Send buffer with optional length-prefix framing (heap-allocated)
 //! - Protocol auto-detection
 //! - Per-connection statistics
 //! - Consecutive error tracking for disconnect decision
@@ -17,6 +17,7 @@
 //! Buffer management:
 //! - Receive: Accumulate bytes, extract complete frames
 //! - Send: Queue outbound data, flush when socket writable
+//! - Buffers are heap-allocated to avoid stack overflow
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Each client owned by single I/O thread.
@@ -70,7 +71,7 @@ comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(SEND_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(MAX_MESSAGE_SIZE > 0);
-    std.debug.assert(MAX_MESSAGE_SIZE <= 65535); // Reasonable limit
+    std.debug.assert(MAX_MESSAGE_SIZE <= (4 * 65535)); // Reasonable limit
     std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
     std.debug.assert(FRAME_HEADER_SIZE == 4);
 }
@@ -144,8 +145,8 @@ pub const FrameResult = union(enum) {
 ///
 /// Manages:
 /// - Socket file descriptor
-/// - Receive buffer with frame parsing
-/// - Send buffer with queuing
+/// - Receive buffer with frame parsing (heap-allocated)
+/// - Send buffer with queuing (heap-allocated)
 /// - Protocol detection
 /// - Statistics
 pub const TcpClient = struct {
@@ -159,17 +160,20 @@ pub const TcpClient = struct {
     /// Current connection state.
     state: ClientState = .disconnected,
 
-    // === Receive Buffer ===
-    /// Incoming data buffer.
-    recv_buf: [RECV_BUFFER_SIZE]u8 = undefined,
+    // === Heap-Allocated Buffers ===
+    /// Incoming data buffer (heap-allocated, null when disconnected).
+    recv_buf: ?[]u8 = null,
+
+    /// Outgoing data buffer (heap-allocated, null when disconnected).
+    send_buf: ?[]u8 = null,
+
+    /// Allocator used for buffers (null when disconnected).
+    allocator: ?std.mem.Allocator = null,
 
     /// Bytes currently in receive buffer.
     recv_len: u32 = 0,
 
     // === Send Buffer ===
-    /// Outgoing data buffer.
-    send_buf: [SEND_BUFFER_SIZE]u8 = undefined,
-
     /// Total bytes queued for sending.
     send_len: u32 = 0,
 
@@ -200,11 +204,18 @@ pub const TcpClient = struct {
     // Lifecycle
     // ========================================================================
 
-    /// Initialize client for new connection.
-    pub fn init(fd: posix.fd_t, client_id: config.ClientId) Self {
+    /// Initialize client for new connection with heap-allocated buffers.
+    pub fn init(allocator: std.mem.Allocator, fd: posix.fd_t, client_id: config.ClientId) !Self {
         std.debug.assert(fd >= 0);
         std.debug.assert(client_id != 0);
         std.debug.assert(config.isValidClient(client_id));
+
+        // Allocate buffers on heap
+        const recv_buf = try allocator.alloc(u8, RECV_BUFFER_SIZE);
+        errdefer allocator.free(recv_buf);
+
+        const send_buf = try allocator.alloc(u8, SEND_BUFFER_SIZE);
+        errdefer allocator.free(send_buf);
 
         const now = std.time.timestamp();
 
@@ -212,6 +223,9 @@ pub const TcpClient = struct {
             .fd = fd,
             .client_id = client_id,
             .state = .connected,
+            .recv_buf = recv_buf,
+            .send_buf = send_buf,
+            .allocator = allocator,
             .recv_len = 0,
             .send_len = 0,
             .send_pos = 0,
@@ -224,11 +238,22 @@ pub const TcpClient = struct {
     }
 
     /// Reset client to disconnected state.
-    /// Closes socket if open.
+    /// Closes socket and frees buffers if allocated.
     pub fn reset(self: *Self) void {
         if (self.fd >= 0) {
             posix.close(self.fd);
         }
+
+        // Free heap-allocated buffers
+        if (self.allocator) |alloc| {
+            if (self.recv_buf) |buf| {
+                alloc.free(buf);
+            }
+            if (self.send_buf) |buf| {
+                alloc.free(buf);
+            }
+        }
+
         self.* = .{};
     }
 
@@ -281,6 +306,8 @@ pub const TcpClient = struct {
         std.debug.assert(self.fd >= 0);
         std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
 
+        const recv_buf = self.recv_buf orelse return error.BufferNotAllocated;
+
         const available = RECV_BUFFER_SIZE - self.recv_len;
         if (available == 0) {
             self.stats.buffer_overflows += 1;
@@ -289,7 +316,7 @@ pub const TcpClient = struct {
 
         const n = posix.recv(
             self.fd,
-            self.recv_buf[self.recv_len..],
+            recv_buf[self.recv_len..],
             0,
         ) catch |err| {
             if (net_utils.isWouldBlock(err)) return error.WouldBlock;
@@ -310,7 +337,8 @@ pub const TcpClient = struct {
     /// Get available data in receive buffer (for raw protocol).
     pub fn getReceivedData(self: *const Self) []const u8 {
         std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
-        return self.recv_buf[0..self.recv_len];
+        const recv_buf = self.recv_buf orelse return &[_]u8{};
+        return recv_buf[0..self.recv_len];
     }
 
     /// Check if receive buffer has any data.
@@ -339,6 +367,8 @@ pub const TcpClient = struct {
     pub fn extractFrame(self: *Self) FrameResult {
         std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
 
+        const recv_buf = self.recv_buf orelse return .empty;
+
         if (self.recv_len == 0) {
             return .empty;
         }
@@ -348,7 +378,7 @@ pub const TcpClient = struct {
         }
 
         // Read length header
-        const msg_len = std.mem.readInt(u32, self.recv_buf[0..4], .big);
+        const msg_len = std.mem.readInt(u32, recv_buf[0..4], .big);
 
         // Validate length
         if (msg_len > MAX_MESSAGE_SIZE) {
@@ -375,7 +405,7 @@ pub const TcpClient = struct {
         std.debug.assert(total_len <= RECV_BUFFER_SIZE);
 
         // Return payload slice (caller must call consumeFrame after processing)
-        return .{ .frame = self.recv_buf[FRAME_HEADER_SIZE..total_len] };
+        return .{ .frame = recv_buf[FRAME_HEADER_SIZE..total_len] };
     }
 
     /// Consume a frame after successful processing.
@@ -396,6 +426,8 @@ pub const TcpClient = struct {
         std.debug.assert(bytes <= self.recv_len);
         std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
 
+        const recv_buf = self.recv_buf orelse return;
+
         if (bytes >= self.recv_len) {
             self.recv_len = 0;
             return;
@@ -404,8 +436,8 @@ pub const TcpClient = struct {
         const remaining = self.recv_len - bytes;
         std.mem.copyForwards(
             u8,
-            self.recv_buf[0..remaining],
-            self.recv_buf[bytes..self.recv_len],
+            recv_buf[0..remaining],
+            recv_buf[bytes..self.recv_len],
         );
         self.recv_len = remaining;
 
@@ -424,6 +456,8 @@ pub const TcpClient = struct {
         std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
         std.debug.assert(self.send_pos <= self.send_len);
 
+        const send_buf = self.send_buf orelse return false;
+
         if (data.len > MAX_MESSAGE_SIZE) {
             std.log.warn("Client {}: attempted to send oversized message {} bytes", .{
                 self.client_id,
@@ -441,12 +475,12 @@ pub const TcpClient = struct {
         }
 
         // Write length header (big-endian)
-        const len_bytes = self.send_buf[self.send_len..][0..4];
+        const len_bytes = send_buf[self.send_len..][0..4];
         std.mem.writeInt(u32, len_bytes, @intCast(data.len), .big);
         self.send_len += FRAME_HEADER_SIZE;
 
         // Write payload
-        @memcpy(self.send_buf[self.send_len..][0..data.len], data);
+        @memcpy(send_buf[self.send_len..][0..data.len], data);
         self.send_len += @intCast(data.len);
 
         std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
@@ -463,6 +497,8 @@ pub const TcpClient = struct {
         std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
         std.debug.assert(self.send_pos <= self.send_len);
 
+        const send_buf = self.send_buf orelse return false;
+
         const available = SEND_BUFFER_SIZE - self.send_len;
 
         if (data.len > available) {
@@ -470,7 +506,7 @@ pub const TcpClient = struct {
             return false;
         }
 
-        @memcpy(self.send_buf[self.send_len..][0..data.len], data);
+        @memcpy(send_buf[self.send_len..][0..data.len], data);
         self.send_len += @intCast(data.len);
 
         std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
@@ -487,10 +523,12 @@ pub const TcpClient = struct {
         std.debug.assert(self.send_pos <= self.send_len);
         std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
 
+        const send_buf = self.send_buf orelse return error.BufferNotAllocated;
+
         while (self.send_pos < self.send_len) {
             const sent = posix.send(
                 self.fd,
-                self.send_buf[self.send_pos..self.send_len],
+                send_buf[self.send_pos..self.send_len],
                 SEND_FLAGS,
             ) catch |err| {
                 if (net_utils.isWouldBlock(err)) return;
@@ -535,7 +573,8 @@ pub const TcpClient = struct {
         if (self.protocol != .unknown) return;
         if (self.recv_len == 0) return;
 
-        self.protocol = codec.detectProtocol(self.recv_buf[0..self.recv_len]);
+        const recv_buf = self.recv_buf orelse return;
+        self.protocol = codec.detectProtocol(recv_buf[0..self.recv_len]);
     }
 
     /// Get detected protocol.
@@ -571,6 +610,9 @@ pub const TcpClient = struct {
 
 /// Pre-allocated pool of client slots.
 /// Provides O(1) allocation and lookup by index.
+///
+/// Note: Client slots are lightweight (~100 bytes each) since buffers
+/// are heap-allocated only when a connection is established.
 ///
 /// P10 Note: All loops bounded by `capacity` parameter.
 pub fn ClientPool(comptime capacity: u32) type {
@@ -690,12 +732,16 @@ pub fn ClientPool(comptime capacity: u32) type {
 // ============================================================================
 
 test "TcpClient frame extraction - complete frame" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
+
+    const recv_buf = client.recv_buf.?;
 
     // Write a complete frame: length=5, payload="hello"
-    std.mem.writeInt(u32, client.recv_buf[0..4], 5, .big);
-    @memcpy(client.recv_buf[4..9], "hello");
+    std.mem.writeInt(u32, recv_buf[0..4], 5, .big);
+    @memcpy(recv_buf[4..9], "hello");
     client.recv_len = 9;
 
     const result = client.extractFrame();
@@ -710,12 +756,16 @@ test "TcpClient frame extraction - complete frame" {
 }
 
 test "TcpClient frame extraction - incomplete" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
+
+    const recv_buf = client.recv_buf.?;
 
     // Write partial frame: length=10, but only 5 bytes of payload
-    std.mem.writeInt(u32, client.recv_buf[0..4], 10, .big);
-    @memcpy(client.recv_buf[4..9], "hello");
+    std.mem.writeInt(u32, recv_buf[0..4], 10, .big);
+    @memcpy(recv_buf[4..9], "hello");
     client.recv_len = 9;
 
     const result = client.extractFrame();
@@ -723,12 +773,15 @@ test "TcpClient frame extraction - incomplete" {
 }
 
 test "TcpClient frame extraction - oversized" {
-    var client = TcpClient{};
-    client.state = .connected;
-    client.client_id = 1;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
+
+    const recv_buf = client.recv_buf.?;
 
     // Write oversized frame length
-    std.mem.writeInt(u32, client.recv_buf[0..4], MAX_MESSAGE_SIZE + 1, .big);
+    std.mem.writeInt(u32, recv_buf[0..4], MAX_MESSAGE_SIZE + 1, .big);
     client.recv_len = 4;
 
     const result = client.extractFrame();
@@ -742,14 +795,18 @@ test "TcpClient frame extraction - oversized" {
 }
 
 test "TcpClient frame extraction - multiple frames" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
+
+    const recv_buf = client.recv_buf.?;
 
     // Write two frames: "AB" and "XYZ"
-    std.mem.writeInt(u32, client.recv_buf[0..4], 2, .big);
-    @memcpy(client.recv_buf[4..6], "AB");
-    std.mem.writeInt(u32, client.recv_buf[6..10], 3, .big);
-    @memcpy(client.recv_buf[10..13], "XYZ");
+    std.mem.writeInt(u32, recv_buf[0..4], 2, .big);
+    @memcpy(recv_buf[4..6], "AB");
+    std.mem.writeInt(u32, recv_buf[6..10], 3, .big);
+    @memcpy(recv_buf[10..13], "XYZ");
     client.recv_len = 13;
 
     // Extract first frame
@@ -777,33 +834,42 @@ test "TcpClient frame extraction - multiple frames" {
 }
 
 test "TcpClient queue framed send" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
 
     const success = client.queueFramedSend("hello");
     try std.testing.expect(success);
 
+    const send_buf = client.send_buf.?;
+
     // Verify frame structure
-    const len = std.mem.readInt(u32, client.send_buf[0..4], .big);
+    const len = std.mem.readInt(u32, send_buf[0..4], .big);
     try std.testing.expectEqual(@as(u32, 5), len);
-    try std.testing.expectEqualStrings("hello", client.send_buf[4..9]);
+    try std.testing.expectEqualStrings("hello", send_buf[4..9]);
     try std.testing.expectEqual(@as(u32, 9), client.send_len);
 }
 
 test "TcpClient queue raw send" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
 
     const success = client.queueRawSend("hello");
     try std.testing.expect(success);
 
-    try std.testing.expectEqualStrings("hello", client.send_buf[0..5]);
+    const send_buf = client.send_buf.?;
+    try std.testing.expectEqualStrings("hello", send_buf[0..5]);
     try std.testing.expectEqual(@as(u32, 5), client.send_len);
 }
 
 test "TcpClient buffer overflow detection" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
 
     // Fill send buffer
     client.send_len = SEND_BUFFER_SIZE - 5;
@@ -815,8 +881,10 @@ test "TcpClient buffer overflow detection" {
 }
 
 test "TcpClient consecutive error tracking" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
 
     // Record errors up to threshold
     for (0..MAX_CONSECUTIVE_ERRORS - 1) |_| {
@@ -831,8 +899,10 @@ test "TcpClient consecutive error tracking" {
 }
 
 test "TcpClient error reset on success" {
-    var client = TcpClient{};
-    client.state = .connected;
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 1);
+    defer client.reset();
 
     // Accumulate some errors
     _ = client.recordDecodeError();
@@ -846,24 +916,26 @@ test "TcpClient error reset on success" {
 }
 
 test "ClientPool allocation" {
+    const allocator = std.testing.allocator;
+
     var pool = ClientPool(4){};
 
     // Allocate all slots
     const c1 = pool.allocate();
     try std.testing.expect(c1 != null);
-    c1.?.state = .connected;
+    c1.?.* = try TcpClient.init(allocator, 5, 1);
 
     const c2 = pool.allocate();
     try std.testing.expect(c2 != null);
-    c2.?.state = .connected;
+    c2.?.* = try TcpClient.init(allocator, 6, 2);
 
     const c3 = pool.allocate();
     try std.testing.expect(c3 != null);
-    c3.?.state = .connected;
+    c3.?.* = try TcpClient.init(allocator, 7, 3);
 
     const c4 = pool.allocate();
     try std.testing.expect(c4 != null);
-    c4.?.state = .connected;
+    c4.?.* = try TcpClient.init(allocator, 8, 4);
 
     // Pool should be full
     try std.testing.expect(pool.allocate() == null);
@@ -872,13 +944,43 @@ test "ClientPool allocation" {
     c2.?.reset();
     const c5 = pool.allocate();
     try std.testing.expect(c5 != null);
+    c5.?.* = try TcpClient.init(allocator, 9, 5);
+
+    // Clean up
+    c1.?.reset();
+    c3.?.reset();
+    c4.?.reset();
+    c5.?.reset();
 }
 
 test "TcpClient init validation" {
-    const client = TcpClient.init(5, 100);
+    const allocator = std.testing.allocator;
+
+    var client = try TcpClient.init(allocator, 5, 100);
+    defer client.reset();
+
     try std.testing.expectEqual(@as(posix.fd_t, 5), client.fd);
     try std.testing.expectEqual(@as(config.ClientId, 100), client.client_id);
     try std.testing.expectEqual(ClientState.connected, client.state);
     try std.testing.expectEqual(@as(u32, 0), client.recv_len);
     try std.testing.expectEqual(@as(u32, 0), client.send_len);
+    try std.testing.expect(client.recv_buf != null);
+    try std.testing.expect(client.send_buf != null);
+    try std.testing.expect(client.allocator != null);
+}
+
+test "TcpClient disconnected has no buffers" {
+    var client = TcpClient{};
+    try std.testing.expect(client.isDisconnected());
+    try std.testing.expect(client.recv_buf == null);
+    try std.testing.expect(client.send_buf == null);
+    try std.testing.expect(client.allocator == null);
+}
+
+test "ClientPool size is reasonable" {
+    // Verify that the pool struct itself is small (buffers are heap-allocated)
+    const pool_size = @sizeOf(ClientPool(64));
+    // Each TcpClient should be ~100-200 bytes without embedded buffers
+    // 64 clients * ~150 bytes = ~10KB, plus some overhead
+    try std.testing.expect(pool_size < 20 * 1024); // Should be well under 20KB
 }
