@@ -11,7 +11,8 @@ const msg = @import("../protocol/message_types.zig");
 const csv_codec = @import("../protocol/csv_codec.zig");
 const MatchingEngine = @import("../core/matching_engine.zig").MatchingEngine;
 const OutputBuffer = @import("../core/order_book.zig").OutputBuffer;
-const TcpServer = @import("tcp_server.zig").TcpServer;
+const tcp_server = @import("tcp_server.zig");
+const TcpServer = tcp_server.TcpServer;
 const UdpServer = @import("udp_server.zig").UdpServer;
 const MulticastPublisher = @import("multicast.zig").MulticastPublisher;
 const config = @import("config.zig");
@@ -39,7 +40,7 @@ pub const Server = struct {
         self: *Self,
         allocator: std.mem.Allocator,
         engine: *MatchingEngine,
-        cfg: config.Config,
+        cfg_param: config.Config,
     ) void {
         self.tcp = TcpServer.init(allocator);
         self.udp = UdpServer.init();
@@ -47,7 +48,7 @@ pub const Server = struct {
         self.engine = engine;
         self.output = OutputBuffer.init();
         self.send_buf = undefined;
-        self.cfg = cfg;
+        self.cfg = cfg_param;
         self.allocator = allocator;
         self.messages_processed = 0;
         self.encode_errors = 0;
@@ -181,10 +182,11 @@ pub const Server = struct {
         };
     }
 
+    /// Aggregated server statistics from all transports.
     pub const ServerStats = struct {
         messages_processed: u64,
         encode_errors: u64,
-        tcp_stats: TcpServer.ServerStats,
+        tcp_stats: tcp_server.ServerStats,
         udp_stats: UdpServer.UdpServerStats,
         multicast_stats: MulticastPublisher.PublisherStats,
     };

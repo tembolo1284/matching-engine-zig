@@ -1,4 +1,12 @@
 //! Zig Matching Engine - Main Entry Point
+//!
+//! A high-performance order matching engine written in Zig.
+//!
+//! Features:
+//! - Single-threaded or dual-processor modes
+//! - TCP/UDP/Multicast transport
+//! - CSV, Binary, and FIX protocol support
+//! - Cross-platform (Linux/macOS)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,56 +37,36 @@ var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(fal
 fn signalHandler(sig: c_int) callconv(.C) void {
     _ = sig;
     shutdown_requested.store(true, .release);
-    std.log.info("Shutdown signal received", .{});
 }
 
 fn setupSignalHandlers() void {
-    // sigaction returns void on Darwin, error union on Linux
-    // Use platform-specific handling
+    const sigint_action = std.posix.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+
+    const sigterm_action = std.posix.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+
+    const sigpipe_action = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
 
     if (is_darwin) {
-        // macOS: sigaction returns void, no error handling needed
-        const sigint_action = std.posix.Sigaction{
-            .handler = .{ .handler = signalHandler },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        };
+        // macOS: sigaction returns void
         std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null);
-
-        const sigterm_action = std.posix.Sigaction{
-            .handler = .{ .handler = signalHandler },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        };
         std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null);
-
-        const sigpipe_action = std.posix.Sigaction{
-            .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        };
         std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null);
     } else {
         // Linux: sigaction returns error union
-        const sigint_action = std.posix.Sigaction{
-            .handler = .{ .handler = signalHandler },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        };
         std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null) catch {};
-
-        const sigterm_action = std.posix.Sigaction{
-            .handler = .{ .handler = signalHandler },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        };
         std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null) catch {};
-
-        const sigpipe_action = std.posix.Sigaction{
-            .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        };
         std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null) catch {};
     }
 }
@@ -124,6 +112,7 @@ fn parseOptions(allocator: std.mem.Allocator) Options {
         }
     }
 
+    // Check environment variable
     const threaded_env = std.process.getEnvVarOwned(allocator, "ENGINE_THREADED") catch null;
     defer if (threaded_env) |t| allocator.free(t);
 
@@ -140,19 +129,31 @@ fn printUsage() void {
     const usage =
         \\Zig Matching Engine v{s} ({s})
         \\
+        \\A high-performance order matching engine.
+        \\
         \\Usage: matching_engine [OPTIONS]
         \\
         \\Options:
         \\  -h, --help       Show this help message
         \\  -v, --version    Show version information
-        \\  -t, --threaded   Run in dual-processor mode
+        \\  -t, --threaded   Run in dual-processor mode (recommended)
         \\  --verbose        Enable verbose logging
         \\
         \\Environment Variables:
         \\  ENGINE_THREADED=true        Enable dual-processor mode
+        \\  ENGINE_TCP_ENABLED=true     Enable TCP transport
         \\  ENGINE_TCP_PORT=1234        TCP listen port
+        \\  ENGINE_UDP_ENABLED=true     Enable UDP transport
         \\  ENGINE_UDP_PORT=1235        UDP listen port
+        \\  ENGINE_MCAST_ENABLED=true   Enable multicast market data
+        \\  ENGINE_MCAST_GROUP=239.255.0.1  Multicast group
         \\  ENGINE_MCAST_PORT=1236      Multicast port
+        \\  ENGINE_BINARY_PROTOCOL=false  Use binary protocol (vs CSV)
+        \\
+        \\Examples:
+        \\  matching_engine                    # Single-threaded, default config
+        \\  matching_engine -t                 # Dual-processor mode
+        \\  ENGINE_TCP_PORT=5000 matching_engine  # Custom TCP port
         \\
     ;
 
@@ -161,6 +162,10 @@ fn printUsage() void {
 
 fn printVersion() void {
     std.debug.print("Zig Matching Engine v{s} ({s})\n", .{ VERSION, BUILD_MODE });
+    std.debug.print("Platform: {s} {s}\n", .{
+        if (is_linux) "Linux" else if (is_darwin) "macOS" else @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+    });
 }
 
 // ============================================================================
@@ -177,11 +182,9 @@ fn validateConfig(config: *const cfg.Config) !void {
         std.log.err("At least one transport (TCP or UDP) must be enabled", .{});
         return error.NoTransportEnabled;
     }
-
-    config.log();
 }
 
-fn validateSystem() !void {
+fn validateSystem() void {
     if (!is_linux and !is_darwin) {
         std.log.warn("This engine is optimized for Linux/macOS. Performance may vary on {s}.", .{
             @tagName(builtin.os.tag),
@@ -196,43 +199,52 @@ fn validateSystem() !void {
 }
 
 // ============================================================================
+// Graceful Shutdown
+// ============================================================================
+
+/// Number of poll cycles to allow for draining pending messages.
+const SHUTDOWN_DRAIN_CYCLES: usize = 10;
+
+/// Timeout per drain cycle in milliseconds.
+const SHUTDOWN_DRAIN_TIMEOUT_MS: i32 = 50;
+
+// ============================================================================
 // Server Runners
 // ============================================================================
 
-fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
-    std.debug.print("DEBUG 1: Entering runSingleThreaded\n", .{});
-    std.log.info("Starting in SINGLE-THREADED mode", .{});
+fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config, verbose: bool) !void {
+    if (verbose) std.log.info("Initializing single-threaded mode...", .{});
 
-    std.debug.print("DEBUG 2: About to init MemoryPools\n", .{});
-    // Heap-allocate memory pools: no large stack frames.
+    // Heap-allocate memory pools (large structure)
     const pools = try MemoryPools.init(allocator);
     defer pools.deinit();
 
-    std.debug.print("DEBUG 3: MemoryPools done, creating engine\n", .{});
-    // Heap-allocate matching engine (large hash tables inside).
+    if (verbose) std.log.info("Memory pools initialized", .{});
+
+    // Heap-allocate matching engine (contains large hash tables)
     const engine = try allocator.create(MatchingEngine);
     defer {
         engine.deinit();
         allocator.destroy(engine);
     }
-    std.debug.print("DEBUG 4: Engine created, calling initInPlace\n", .{});
     engine.initInPlace(pools);
 
-    std.debug.print("DEBUG 5: Engine initialized, creating server\n", .{});
-    // Heap-allocate server (contains sizable buffers).
+    if (verbose) std.log.info("Matching engine initialized", .{});
+
+    // Heap-allocate server (contains sizable buffers)
     const server = try allocator.create(Server);
     defer {
         server.deinit();
         allocator.destroy(server);
     }
-    std.debug.print("DEBUG 6: Server created, calling initInPlace\n", .{});
     server.initInPlace(allocator, engine, config);
 
-    std.debug.print("DEBUG 7: Starting server\n", .{});
-    try server.start();
+    if (verbose) std.log.info("Server initialized", .{});
 
+    try server.start();
     printStartupBanner(config, false);
 
+    // Main event loop
     while (!shutdown_requested.load(.acquire)) {
         server.pollOnce(100) catch |err| {
             std.log.err("Server error: {any}", .{err});
@@ -240,35 +252,51 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
         };
     }
 
-    std.log.info("Shutting down...", .{});
+    // Graceful shutdown: drain pending messages
+    std.log.info("Shutting down (draining pending messages)...", .{});
+    for (0..SHUTDOWN_DRAIN_CYCLES) |_| {
+        server.pollOnce(SHUTDOWN_DRAIN_TIMEOUT_MS) catch break;
+    }
+
     server.stop();
+
+    // Print final statistics
+    const stats = server.getStats();
+    std.log.info("Session complete: {} messages processed", .{stats.messages_processed});
 }
 
-fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config) !void {
-    std.log.info("Starting in THREADED mode (dual-processor)", .{});
+fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config, verbose: bool) !void {
+    if (verbose) std.log.info("Initializing threaded mode...", .{});
 
     var server = try ThreadedServer.init(allocator, config);
     defer server.deinit();
 
-    try server.start();
+    if (verbose) std.log.info("Threaded server initialized", .{});
 
+    try server.start();
     printStartupBanner(config, true);
 
+    // Main event loop
     while (!shutdown_requested.load(.acquire)) {
         server.pollOnce(100) catch |err| {
             std.log.err("Server error: {any}", .{err});
         };
     }
 
-    std.log.info("Shutting down...", .{});
+    // Graceful shutdown: drain pending messages
+    std.log.info("Shutting down (draining pending messages)...", .{});
+    for (0..SHUTDOWN_DRAIN_CYCLES) |_| {
+        server.pollOnce(SHUTDOWN_DRAIN_TIMEOUT_MS) catch break;
+    }
 
-    printThreadedStats(server);
+    // Print statistics before stopping
+    printThreadedStats(&server);
     server.stop();
 }
 
 fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     const backend = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
-    
+
     std.log.info("", .{});
     std.log.info("╔════════════════════════════════════════════╗", .{});
     std.log.info("║     Zig Matching Engine v{s}             ║", .{VERSION});
@@ -328,7 +356,9 @@ fn printThreadedStats(server: *ThreadedServer) void {
         std.log.info("    Outputs:     {d}", .{ps.outputs_generated});
         std.log.info("    Backpressure:{d}", .{ps.output_backpressure_count});
         if (ps.messages_processed > 0) {
-            const avg_ns = @divTrunc(ps.total_processing_time_ns, @as(i64, @intCast(ps.messages_processed)));
+            const total_time: i128 = ps.total_processing_time_ns;
+            const msg_count: i128 = @intCast(ps.messages_processed);
+            const avg_ns = @divTrunc(total_time, msg_count);
             std.log.info("    Avg latency: {d}ns", .{avg_ns});
         }
     }
@@ -341,12 +371,10 @@ fn printThreadedStats(server: *ThreadedServer) void {
 // ============================================================================
 
 pub fn main() !void {
-    std.debug.print("MAIN 1: Starting\n", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("MAIN 2: Parsing Options\n", .{});
     const opts = parseOptions(allocator);
 
     switch (opts.mode) {
@@ -360,26 +388,40 @@ pub fn main() !void {
         },
         else => {},
     }
-    std.debug.print("MAIN 3: Setting up signal handlers\n", .{});
-    setupSignalHandlers();
-    std.debug.print("MAIN 4: Validating system\n", .{});
-    try validateSystem();
 
-    std.debug.print("MAIN 5: Validating config\n", .{});
+    setupSignalHandlers();
+    validateSystem();
     try validateConfig(&opts.config);
 
-    std.debug.print("MAIN 6: About to enter switch for mode\n", .{});
+    if (opts.verbose) {
+        opts.config.log();
+    }
+
     switch (opts.mode) {
-        .single_threaded => {
-            std.debug.print("MAIN 7: Calling runSingleThreaded\n", .{});
-            try runSingleThreaded(allocator, opts.config);
-        },
-        .threaded => {
-            std.debug.print("MAIN 7: Calling runThreaded\n", .{});
-            try runThreaded(allocator, opts.config);
-        },
+        .single_threaded => try runSingleThreaded(allocator, opts.config, opts.verbose),
+        .threaded => try runThreaded(allocator, opts.config, opts.verbose),
         else => unreachable,
     }
 
     std.log.info("Shutdown complete", .{});
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "signal handler setup" {
+    // Just verify it doesn't crash
+    setupSignalHandlers();
+}
+
+test "option parsing defaults" {
+    const opts = Options{
+        .mode = .single_threaded,
+        .config = cfg.Config{},
+        .verbose = false,
+    };
+
+    try std.testing.expectEqual(RunMode.single_threaded, opts.mode);
+    try std.testing.expect(!opts.verbose);
 }

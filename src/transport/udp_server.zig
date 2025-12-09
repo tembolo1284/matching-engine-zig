@@ -91,6 +91,7 @@ const UdpClientMap = struct {
     const Self = @This();
 
     fn init() Self {
+        @setEvalBranchQuota(20000);
         var self = Self{};
         for (&self.entries) |*entry| {
             entry.active = false;
