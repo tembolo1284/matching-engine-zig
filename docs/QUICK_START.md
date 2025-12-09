@@ -1,300 +1,305 @@
 # Quick Start Guide
 
-Get the Zig Matching Engine running in under 5 minutes.
+Get the Zig Matching Engine up and running in 5 minutes.
 
 ## Prerequisites
 
-- Zig 0.13.0 or later (`zig version` to check)
-- netcat (`nc`) for testing
-- Optional: Docker for containerized deployment
+- **Zig 0.13.0+**: Download from [ziglang.org](https://ziglang.org/download/)
+- **Linux or macOS** (Windows support is experimental)
+- **netcat** (nc) for testing (usually pre-installed)
 
-## 1. Build
+Verify Zig installation:
 ```bash
-# Clone and enter directory
+zig version
+# Should output: 0.13.0 or later
+```
+
+## Step 1: Build
+
+```bash
+# Clone (or extract) the project
 cd matching-engine-zig
 
-# Build (debug)
-zig build
+# Build in debug mode
+make build
+# Or: zig build
 
-# Or build optimized
-zig build -Doptimize=ReleaseFast
+# Run tests to verify everything works
+make test
 ```
 
-## 2. Run Server
+## Step 2: Start the Server
+
+### Option A: Threaded Mode (Production)
+
 ```bash
-# Start with all transports enabled
-zig build run
-
-# Or run binary directly
-./zig-out/bin/matching_engine
+make run-threaded
 ```
 
-You should see:
+Expected output:
 ```
-╔════════════════════════════════════════════╗
-║     Zig Matching Engine v0.1.0             ║
-╠════════════════════════════════════════════╣
-║  TCP:       0.0.0.0:1234                   ║
-║  UDP:       0.0.0.0:1235                   ║
-║  Multicast: 239.255.0.1:1236               ║
-║  Mode:      Single-Threaded                ║
-╚════════════════════════════════════════════╝
-
-Press Ctrl+C to shutdown gracefully
+info: Starting threaded server...
+info: Config: channel_capacity=65536, drain_limit=131072, batch_size=1400, max_batches=64
+info: Processor-0 (A-M) started (latency_tracking=true, panic_on_critical_drop=true)
+info: Processor-1 (N-Z) started (latency_tracking=true, panic_on_critical_drop=true)
+info: TCP server listening on 0.0.0.0:8080
+info: UDP server listening on 0.0.0.0:8081
+info: Threaded server started (2 processors)
 ```
 
-## 3. Send Test Orders (UDP - Easiest)
+### Option B: Single-Threaded Mode (Debugging)
 
-UDP requires no framing, perfect for quick testing:
 ```bash
-# Terminal 2: Send a buy order
-echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
-```
-
-**Message breakdown:**
-- `N` - New order
-- `1` - User ID
-- `IBM` - Symbol
-- `10000` - Price ($100.00 in cents)
-- `100` - Quantity (shares)
-- `B` - Side (Buy)
-- `1` - Order ID
-
-## 4. Create a Trade
-```bash
-# Send buy order
-echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 1235
-
-# Send matching sell order
-echo "N, 2, IBM, 10000, 50, S, 1" | nc -u -w1 localhost 1235
-```
-
-**Expected server output:**
-```
-A, IBM, 1, 1           # Buy order acknowledged
-B, IBM, B, 10000, 100  # Top of book: 100 shares at $100
-A, IBM, 2, 1           # Sell order acknowledged
-T, IBM, 1, 1, 2, 1, 10000, 50  # Trade executed!
-B, IBM, B, 10000, 50   # Top of book: 50 shares remaining
-```
-
-## 5. Cancel an Order
-```bash
-echo "C, 1, 1" | nc -u -w1 localhost 1235
-```
-
-**Output:**
-```
-C, IBM, 1, 1           # Cancel acknowledged
-B, IBM, B, -, -        # Book now empty on bid side
-```
-
-## 6. Flush All Orders
-```bash
-echo "F" | nc -u -w1 localhost 1235
-```
-
----
-
-## TCP Testing (With Framing)
-
-TCP requires 4-byte length prefix. Here's a Python helper:
-```python
-#!/usr/bin/env python3
-# tcp_client.py
-import socket
-import struct
-
-def send_order(sock, message):
-    data = message.encode('utf-8')
-    # 4-byte big-endian length prefix
-    frame = struct.pack('>I', len(data)) + data
-    sock.sendall(frame)
-
-    # Read response
-    header = sock.recv(4)
-    if len(header) == 4:
-        length = struct.unpack('>I', header)[0]
-        response = sock.recv(length)
-        print(f"Response: {response.decode('utf-8')}")
-
-# Connect
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('localhost', 1234))
-
-# Send orders
-send_order(sock, "N, 1, IBM, 10000, 100, B, 1\n")
-send_order(sock, "N, 2, IBM, 10000, 50, S, 1\n")
-
-sock.close()
-```
-
-Run it:
-```bash
-python3 tcp_client.py
-```
-
----
-
-## Binary Protocol Testing
-
-For binary protocol, use the magic byte `0x4D`:
-```python
-#!/usr/bin/env python3
-# binary_client.py
-import socket
-import struct
-
-def create_new_order(user_id, symbol, price, qty, side, order_id):
-    """Create binary new order message."""
-    magic = 0x4D
-    msg_type = ord('N')
-    symbol_bytes = symbol.encode('ascii').ljust(8, b'\0')
-
-    # Pack in network byte order (big-endian)
-    return struct.pack(
-        '>BB I 8s I I B I',
-        magic, msg_type,
-        user_id,
-        symbol_bytes,
-        price,
-        qty,
-        ord(side),
-        order_id
-    )
-
-# UDP - no framing
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-msg = create_new_order(1, "IBM", 10000, 100, 'B', 1)
-sock.sendto(msg, ('localhost', 1235))
-
-# Receive response
-sock.settimeout(1.0)
-try:
-    data, addr = sock.recvfrom(1024)
-    print(f"Response ({len(data)} bytes): {data.hex()}")
-except socket.timeout:
-    print("No response (check server output)")
-```
-
----
-
-## Multicast Subscriber
-
-To receive market data broadcasts:
-```python
-#!/usr/bin/env python3
-# mcast_subscriber.py
-import socket
-import struct
-
-MCAST_GROUP = '239.255.0.1'
-MCAST_PORT = 1236
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(('', MCAST_PORT))
-
-# Join multicast group
-mreq = struct.pack('4sl', socket.inet_aton(MCAST_GROUP), socket.INADDR_ANY)
-sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-print(f"Listening on {MCAST_GROUP}:{MCAST_PORT}...")
-
-while True:
-    data, addr = sock.recvfrom(1024)
-    if data[0] == 0x4D:
-        print(f"Binary: {data.hex()}")
-    else:
-        print(f"CSV: {data.decode('utf-8').strip()}")
-```
-
----
-
-## Using Make
-```bash
-# Build and run
 make run
+```
 
-# Run in threaded mode
+## Step 3: Send Orders
+
+### Using TCP (Recommended)
+
+TCP provides reliable, ordered delivery with acknowledgments.
+
+**Terminal 2 - Connect to server:**
+```bash
+# Using netcat (length-prefixed framing not needed for simple test)
+nc localhost 8080
+```
+
+**Send a new order:**
+```
+N,AAPL,1001,1,B,15000,100
+```
+
+**Expected response:**
+```
+A,AAPL,1,0
+```
+
+This means: Order acknowledged for AAPL, user_order_id=1, status=0 (success)
+
+### Using UDP (Low-Latency)
+
+UDP provides lower latency but no delivery guarantee.
+
+**Terminal 2:**
+```bash
+# Send order via UDP
+echo "N,AAPL,1001,1,B,15000,100" | nc -u localhost 8081
+
+# Listen for responses (in a separate terminal)
+nc -ul 8081
+```
+
+## Step 4: Execute a Trade
+
+**Terminal 2 - Send a buy order:**
+```bash
+echo "N,AAPL,1001,1,B,15000,100" | nc -u localhost 8081
+```
+
+**Terminal 3 - Send a matching sell order:**
+```bash
+echo "N,AAPL,1002,1,S,15000,50" | nc -u localhost 8081
+```
+
+**Expected output (on server):**
+```
+# Trade executed: 50 shares @ $150.00
+T,AAPL,15000,50,<buy_order_id>,<sell_order_id>
+```
+
+## Message Format Reference
+
+### Input Messages
+
+| Type | Format | Example |
+|------|--------|---------|
+| New Order | `N,<symbol>,<user_id>,<user_order_id>,<side>,<price>,<qty>` | `N,AAPL,1001,1,B,15000,100` |
+| Cancel | `C,<symbol>,<user_id>,<user_order_id>` | `C,AAPL,1001,1` |
+
+**Field Details:**
+- `symbol`: 1-8 character stock symbol (e.g., `AAPL`, `MSFT`)
+- `user_id`: Your client identifier (any u32)
+- `user_order_id`: Your order identifier (unique per user)
+- `side`: `B` for buy, `S` for sell
+- `price`: Price in cents (e.g., 15000 = $150.00)
+- `qty`: Number of shares
+
+### Output Messages
+
+| Type | Format | Meaning |
+|------|--------|---------|
+| Ack | `A,<symbol>,<user_order_id>,<status>` | Order accepted (status=0) |
+| Reject | `R,<symbol>,<user_order_id>,<reason>` | Order rejected |
+| Trade | `T,<symbol>,<price>,<qty>,<buy_id>,<sell_id>` | Execution report |
+| Cancel Ack | `X,<symbol>,<user_order_id>,<qty>` | Cancel confirmed |
+| Top of Book | `B,<symbol>,<bid>,<ask>,<bid_qty>,<ask_qty>` | BBO update |
+
+**Reject Reasons:**
+- 0: Unknown
+- 1: Invalid symbol
+- 2: Invalid price
+- 3: Invalid quantity
+- 4: Invalid side
+- 5: Order not found
+- 6: Duplicate order ID
+
+## Example Trading Session
+
+```bash
+# Terminal 1: Start server
 make run-threaded
 
-# Run tests
-make test
+# Terminal 2: Send orders
+nc localhost 8080
 
-# Send test order (server must be running)
-make send-udp
-
-# Send sequence of orders
-make send-orders
-
-# See all targets
-make help
+# Enter these commands one by one:
+N,AAPL,1001,1,B,15000,100    # Buy 100 AAPL @ $150
+N,AAPL,1001,2,B,14900,50     # Buy 50 AAPL @ $149
+N,AAPL,1002,1,S,15000,75     # Sell 75 AAPL @ $150 (matches!)
+C,AAPL,1001,2                 # Cancel the $149 bid
 ```
 
----
+**Expected responses:**
+```
+A,AAPL,1,0                    # Ack for order 1
+A,AAPL,2,0                    # Ack for order 2
+A,AAPL,1,0                    # Ack for sell order
+T,AAPL,15000,75,1,1           # Trade: 75 @ $150
+X,AAPL,2,50                   # Cancel ack for order 2
+```
 
-## Environment Configuration
+## Using Binary Protocol
 
-Override defaults with environment variables:
+For lower latency, use the binary protocol (64-byte fixed messages):
+
+```python
+import struct
+import socket
+
+# Message types
+NEW_ORDER = 1
+CANCEL = 2
+
+# Sides
+BUY = 1
+SELL = 2
+
+def make_new_order(symbol, user_id, user_order_id, side, price, qty):
+    msg = struct.pack(
+        '<BB8sIIQI34s',  # Little-endian format
+        NEW_ORDER,       # msg_type (1 byte)
+        side,            # side (1 byte)
+        symbol.encode().ljust(8, b'\x00'),  # symbol (8 bytes)
+        user_id,         # user_id (4 bytes)
+        user_order_id,   # user_order_id (4 bytes)
+        price,           # price (8 bytes)
+        qty,             # quantity (4 bytes)
+        b'\x00' * 34     # padding (34 bytes)
+    )
+    return msg
+
+# Connect and send
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+msg = make_new_order("AAPL", 1001, 1, BUY, 15000, 100)
+sock.sendto(msg, ('localhost', 8081))
+```
+
+## Configuration
+
+### Environment Variables
+
 ```bash
-# Custom ports
-export ENGINE_TCP_PORT=8000
-export ENGINE_UDP_PORT=8001
-export ENGINE_MCAST_PORT=8002
-export ENGINE_MCAST_GROUP=239.255.1.1
+# Network ports
+export ME_TCP_PORT=8080
+export ME_UDP_PORT=8081
+export ME_MCAST_GROUP=239.0.0.1
+export ME_MCAST_PORT=8082
 
-# Disable transports
-export ENGINE_TCP_ENABLED=false
-export ENGINE_MCAST_ENABLED=false
+# Enable/disable transports
+export ME_TCP_ENABLED=true
+export ME_UDP_ENABLED=true
+export ME_MCAST_ENABLED=false
 
-zig build run
+# Performance tuning
+export ME_CHANNEL_CAPACITY=65536
+export ME_TRACK_LATENCY=true
 ```
 
----
+### Build Options
 
-## Docker Quick Start
 ```bash
-# Build image
-docker build -t zig-matching-engine .
+# Debug build (default)
+zig build
 
-# Run container
-docker run -p 1234:1234 -p 1235:1235/udp zig-matching-engine
+# Release build (optimized)
+zig build -Doptimize=ReleaseFast
 
-# Test from host
-echo "N, 1, IBM, 10000, 100, B, 1" | nc -u -w1 localhost 9001
+# Release with safety checks
+zig build -Doptimize=ReleaseSafe
 ```
 
----
+## Monitoring
 
-## Common Issues
+### Server Statistics
 
-### "Address already in use"
+The server logs statistics on shutdown:
+
+```
+info: Stopping threaded server...
+info: Stats: batches_sent=1234, outputs_dispatched=5678, messages_dropped=0
+info: Processor-0 (A-M) stopped (processed=2500, outputs=4800, backpressure=0, critical_drops=0)
+info: Processor-1 (N-Z) stopped (processed=2500, outputs=4800, backpressure=0, critical_drops=0)
+```
+
+### Health Check
+
+A healthy system has:
+- `critical_drops=0` (trades and rejects delivered)
+- `messages_dropped=0` (input queues not overflowing)
+- `backpressure=0` or low (output queues keeping up)
+
+## Troubleshooting
+
+### "Connection refused"
+
+Server isn't running or wrong port:
 ```bash
-# Find and kill existing process
-lsof -i :1234
-kill <PID>
+# Check if server is listening
+ss -tlnp | grep 8080
 ```
 
-### UDP messages not received
-- Check firewall: `sudo ufw allow 1235/udp`
-- Ensure netcat uses UDP: `nc -u` flag
+### "Queue full, dropping message"
 
-### Multicast not working
-- Multicast requires network support
-- Use loopback for local testing
-- Check TTL settings (default=1, local subnet only)
+System is overloaded:
+- Reduce order rate
+- Increase `ME_CHANNEL_CAPACITY`
+- Use Release build for better performance
 
-### Binary messages rejected
-- Verify magic byte is `0x4D` (not `0x01`)
-- Verify big-endian byte order
-- Check message sizes match spec
+### Orders not matching
 
----
+Check price format (price is in cents, not dollars):
+- `15000` = $150.00
+- `14999` = $149.99
+
+### No response on UDP
+
+UDP is stateless; responses go to sender's address:
+```bash
+# Use nc in listen mode to see responses
+nc -ul 8081 &
+echo "N,AAPL,1001,1,B,15000,100" | nc -u localhost 8081
+```
 
 ## Next Steps
 
-1. Read [ARCHITECTURE.md](ARCHITECTURE.md) for system design details
-2. Run benchmarks: `make bench`
-3. Deploy with Docker: see [DOCKER.md](DOCKER.md)
-4. Try threaded mode: `make run-threaded`
+1. Read [ARCHITECTURE.md](ARCHITECTURE.md) for design details
+2. Review the [README.md](README.md) for full API documentation
+3. Examine `src/main.zig` for configuration options
+4. Run `make test` to see test examples
+
+## Getting Help
+
+- Check test files in `src/*/` for usage examples
+- Run with debug logging: `zig build run 2>&1 | less`
+- File issues on the project repository

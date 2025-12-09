@@ -207,7 +207,8 @@ pub const Processor = struct {
         input: *InputQueue,
         output: *OutputQueue,
     ) !Self {
-        std.debug.assert(input != output);
+        // Note: input and output are different types (InputQueue vs OutputQueue),
+        // so they cannot be the same queue by construction.
 
         // Initialize all large structures on the heap in a simple,
         // linear fashion (P10: avoid clever control flow).
