@@ -52,7 +52,7 @@ pub const RECV_BUFFER_SIZE: u32 = 4 * 65536;
 
 /// Send buffer size per client.
 /// Should handle burst of outbound messages.
-pub const SEND_BUFFER_SIZE: u32 = 4 *65536;
+pub const SEND_BUFFER_SIZE: u32 = 4 * 65536;
 
 /// Frame header size (4-byte length prefix).
 pub const FRAME_HEADER_SIZE: u32 = 4;
