@@ -10,9 +10,11 @@
 //! - Informational messages: Use add() if dropping is acceptable
 //!
 //! Sizing:
-//! - Default capacity: 8,192 messages
-//! - Worst case: 100K orders × 2 messages each (ack + trade) + TOB updates
-//! - If you hit overflow, increase MAX_OUTPUT_MESSAGES or batch processing
+//! - Default capacity: 8,192 messages per batch
+//! - This is per-batch capacity, not total throughput capacity
+//! - Caller must drain buffer between processing batches
+//! - Typical batch: ~4K orders generating ~8K messages (ack + trade each)
+//! - If you hit overflow, either increase MAX_OUTPUT_MESSAGES or drain more frequently
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -21,8 +23,18 @@ const msg = @import("../protocol/message_types.zig");
 // Configuration
 // ============================================================================
 
-/// Output buffer capacity. Sized for worst case: 100K orders generating
-/// 2 messages each (ack + trade) plus TOB updates.
+/// Output buffer capacity per processing batch.
+///
+/// Sizing rationale:
+/// - Typical order generates 1-3 messages (ack, possibly trade, possibly TOB)
+/// - Batch of 4K orders → up to 12K messages worst case
+/// - 8K provides good headroom for typical workloads
+/// - Caller must drain between batches for sustained throughput
+///
+/// If overflow occurs:
+/// 1. First, ensure you're draining between batches
+/// 2. If still overflowing, increase this value
+/// 3. Memory impact: 8K × ~64 bytes = ~512KB per buffer
 pub const MAX_OUTPUT_MESSAGES: u32 = 8_192;
 
 // ============================================================================
@@ -34,6 +46,8 @@ pub const MAX_OUTPUT_MESSAGES: u32 = 8_192;
 /// CRITICAL: This buffer MUST NOT overflow for trade messages.
 /// Use addChecked() for critical messages - it panics on overflow.
 /// Use add() only for messages that can be safely dropped (none currently).
+///
+/// Memory footprint: ~512KB (8,192 × 64 bytes)
 pub const OutputBuffer = struct {
     /// Message storage.
     messages: [MAX_OUTPUT_MESSAGES]msg.OutputMsg,
@@ -64,16 +78,30 @@ pub const OutputBuffer = struct {
     }
 
     // ========================================================================
+    // Invariant Checking
+    // ========================================================================
+
+    /// Check buffer invariants. Used in debug assertions.
+    fn isValid(self: *const Self) bool {
+        if (self.count > MAX_OUTPUT_MESSAGES) return false;
+        if (self.peak_count > MAX_OUTPUT_MESSAGES) return false;
+        if (self.peak_count < self.count) return false;
+        return true;
+    }
+
+    // ========================================================================
     // Capacity Queries
     // ========================================================================
 
     /// Check if buffer has space for N more messages.
     pub fn hasSpace(self: *const Self, needed: u32) bool {
+        std.debug.assert(self.isValid());
         return (self.count + needed) <= MAX_OUTPUT_MESSAGES;
     }
 
     /// Get remaining capacity.
     pub fn remaining(self: *const Self) u32 {
+        std.debug.assert(self.isValid());
         return MAX_OUTPUT_MESSAGES - self.count;
     }
 
@@ -96,6 +124,8 @@ pub const OutputBuffer = struct {
     /// WARNING: Use addChecked() for critical messages that must not be lost
     /// (trades, acks, rejects). This method is for optional/droppable messages.
     pub fn add(self: *Self, message: msg.OutputMsg) bool {
+        std.debug.assert(self.isValid());
+
         if (self.count >= MAX_OUTPUT_MESSAGES) {
             self.overflow_count += 1;
             return false;
@@ -105,6 +135,7 @@ pub const OutputBuffer = struct {
         self.count += 1;
         self.peak_count = @max(self.peak_count, self.count);
 
+        std.debug.assert(self.isValid());
         return true;
     }
 
@@ -113,9 +144,11 @@ pub const OutputBuffer = struct {
     /// Use for critical messages (trades, acks, rejects) that MUST NOT be lost.
     /// A panic here indicates a serious sizing problem that must be fixed.
     pub fn addChecked(self: *Self, message: msg.OutputMsg) void {
+        std.debug.assert(self.isValid());
+
         if (self.count >= MAX_OUTPUT_MESSAGES) {
             std.debug.panic(
-                "OutputBuffer overflow: {d}/{d} messages, dropping critical message type={c}",
+                "OutputBuffer overflow: {d}/{d} messages, dropping critical message type={d}",
                 .{ self.count, MAX_OUTPUT_MESSAGES, @intFromEnum(message.msg_type) },
             );
         }
@@ -123,16 +156,22 @@ pub const OutputBuffer = struct {
         self.messages[self.count] = message;
         self.count += 1;
         self.peak_count = @max(self.peak_count, self.count);
+
+        std.debug.assert(self.isValid());
     }
 
     /// Add multiple messages at once.
     /// Returns number of messages actually added (may be less than requested if buffer fills).
     pub fn addBatch(self: *Self, messages_to_add: []const msg.OutputMsg) u32 {
+        std.debug.assert(self.isValid());
+
         var added: u32 = 0;
         for (messages_to_add) |message| {
             if (!self.add(message)) break;
             added += 1;
         }
+
+        std.debug.assert(self.isValid());
         return added;
     }
 
@@ -142,12 +181,14 @@ pub const OutputBuffer = struct {
 
     /// Get slice of all messages in buffer.
     pub fn slice(self: *const Self) []const msg.OutputMsg {
+        std.debug.assert(self.isValid());
         return self.messages[0..self.count];
     }
 
     /// Get a specific message by index.
     /// Returns null if index is out of bounds.
     pub fn get(self: *const Self, index: u32) ?*const msg.OutputMsg {
+        std.debug.assert(self.isValid());
         if (index >= self.count) return null;
         return &self.messages[index];
     }
@@ -159,7 +200,9 @@ pub const OutputBuffer = struct {
     /// Clear all messages from buffer.
     /// Does NOT reset overflow_count or peak_count (lifetime stats).
     pub fn clear(self: *Self) void {
+        std.debug.assert(self.isValid());
         self.count = 0;
+        std.debug.assert(self.isValid());
     }
 
     /// Reset buffer including statistics.
@@ -167,6 +210,7 @@ pub const OutputBuffer = struct {
         self.count = 0;
         self.overflow_count = 0;
         self.peak_count = 0;
+        std.debug.assert(self.isValid());
     }
 
     // ========================================================================
@@ -350,4 +394,18 @@ test "OutputBuffer reset vs clear" {
     try std.testing.expectEqual(@as(u32, 0), buf.count);
     try std.testing.expect(!buf.hasOverflowed());
     try std.testing.expectEqual(@as(u32, 0), buf.peak_count);
+}
+
+test "OutputBuffer isValid" {
+    var buf = OutputBuffer.init();
+    try std.testing.expect(buf.isValid());
+
+    // Add some messages
+    for (0..100) |_| {
+        _ = buf.add(std.mem.zeroes(msg.OutputMsg));
+    }
+    try std.testing.expect(buf.isValid());
+
+    buf.clear();
+    try std.testing.expect(buf.isValid());
 }

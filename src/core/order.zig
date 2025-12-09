@@ -36,6 +36,16 @@ pub const CACHE_LINE_SIZE = 64;
 /// Order alignment - one cache line to prevent false sharing
 pub const ORDER_ALIGNMENT = CACHE_LINE_SIZE;
 
+/// Maximum order quantity. Chosen because:
+/// - Fits comfortably in u32 with room for arithmetic without overflow
+/// - Exceeds any real exchange limit (~10M shares typically)
+/// - Prevents overflow in quantity × price calculations (u32 × u32 fits in u64)
+/// - Round number for easy debugging
+pub const MAX_ORDER_QUANTITY: u32 = 1_000_000_000;
+
+/// Minimum valid timestamp (ensures we never have zero timestamps)
+pub const MIN_VALID_TIMESTAMP: u64 = 1;
+
 // ============================================================================
 // Timestamp Implementation
 // ============================================================================
@@ -58,7 +68,8 @@ pub const ORDER_ALIGNMENT = CACHE_LINE_SIZE;
 /// RDTSCP provides the necessary monotonicity guarantees.
 ///
 /// WARNING: On non-x86_64-linux platforms, this uses std.time.nanoTimestamp()
-/// which may syscall and add microseconds of latency.
+/// which may syscall and add microseconds of latency. This is acceptable for
+/// development/testing but NOT for production latency-sensitive deployments.
 pub inline fn getCurrentTimestamp() u64 {
     if (comptime SUPPORTED_PLATFORM) {
         // RDTSCP: Read Time Stamp Counter and Processor ID (serializing)
@@ -68,14 +79,24 @@ pub inline fn getCurrentTimestamp() u64 {
         var hi: u32 = undefined;
         asm volatile ("rdtscp"
             : [lo] "={eax}" (lo),
-              [hi] "={edx}" (hi)
+              [hi] "={edx}" (hi),
             :
-            : "ecx", "memory" // ECX clobbered with processor ID; memory barrier
+            : "ecx", "memory", // ECX clobbered with processor ID; memory barrier
         );
         return (@as(u64, hi) << 32) | lo;
     } else {
         // Fallback for development/testing on other platforms
         // WARNING: This may syscall and add microseconds of latency
+        if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+            // Only log once to avoid spam
+            const logged = struct {
+                var value: bool = false;
+            };
+            if (!logged.value) {
+                logged.value = true;
+                std.log.warn("Using fallback timestamp (not x86_64 Linux) - not suitable for production", .{});
+            }
+        }
         const ts = std.time.nanoTimestamp();
         std.debug.assert(ts >= 0);
         return @intCast(@as(u128, @intCast(ts)));
@@ -104,31 +125,31 @@ pub inline fn getCurrentTimestamp() u64 {
 /// - Padding ensures the struct is exactly one cache line
 pub const Order = extern struct {
     // === HOT PATH FIELDS === (bytes 0-19, accessed every match check)
-    user_id: u32,              // 0-3:   Owner identification
-    user_order_id: u32,        // 4-7:   Client's order reference
-    price: u32,                // 8-11:  Price in ticks (0 = market order)
-    quantity: u32,             // 12-15: Original quantity (immutable after init)
-    remaining_qty: u32,        // 16-19: Remaining unfilled quantity
+    user_id: u32, // 0-3:   Owner identification
+    user_order_id: u32, // 4-7:   Client's order reference
+    price: u32, // 8-11:  Price in ticks (0 = market order)
+    quantity: u32, // 12-15: Original quantity (immutable after init)
+    remaining_qty: u32, // 16-19: Remaining unfilled quantity
 
     // === METADATA === (bytes 20-31)
-    side: msg.Side,            // 20:    Buy or Sell
+    side: msg.Side, // 20:    Buy or Sell
     order_type: msg.OrderType, // 21:    Market or Limit
-    _pad1: [2]u8 = .{ 0, 0 },  // 22-23: Explicit zero padding
-    client_id: u32,            // 24-27: TCP client ID (0 = UDP origin)
-    _pad2: u32 = 0,            // 28-31: Align timestamp to 8-byte boundary
+    _pad1: [2]u8 = .{ 0, 0 }, // 22-23: Explicit zero padding
+    client_id: u32, // 24-27: TCP client ID (0 = UDP origin)
+    _pad2: u32 = 0, // 28-31: Align timestamp to 8-byte boundary
 
     // === TIME PRIORITY === (bytes 32-39)
-    timestamp: u64,            // 32-39: RDTSCP timestamp for FIFO ordering
+    timestamp: u64, // 32-39: RDTSCP timestamp for FIFO ordering
 
     // === LINKED LIST POINTERS === (bytes 40-55)
     /// Next order at same price level (toward tail, newer orders)
-    next: ?*Order,             // 40-47
+    next: ?*Order, // 40-47
     /// Previous order at same price level (toward head, older orders)
-    prev: ?*Order,             // 48-55
+    prev: ?*Order, // 48-55
 
     // === RESERVED === (bytes 56-63)
     /// Reserved for future use (e.g., order flags, sequence number)
-    _reserved: u64 = 0,        // 56-63
+    _reserved: u64 = 0, // 56-63
 
     const Self = @This();
 
@@ -172,13 +193,13 @@ pub const Order = extern struct {
     /// This separation allows batching timestamp reads.
     ///
     /// Preconditions (enforced by assertions):
-    /// - quantity > 0 and <= 1 billion
-    /// - timestamp > 0
+    /// - quantity > 0 and <= MAX_ORDER_QUANTITY
+    /// - timestamp >= MIN_VALID_TIMESTAMP
     pub fn init(order_msg: *const msg.NewOrderMsg, client_id: u32, ts: u64) Self {
         // Rule 7: Validate all parameters
         std.debug.assert(order_msg.quantity > 0);
-        std.debug.assert(order_msg.quantity <= 1_000_000_000); // Sanity bound
-        std.debug.assert(ts > 0);
+        std.debug.assert(order_msg.quantity <= MAX_ORDER_QUANTITY);
+        std.debug.assert(ts >= MIN_VALID_TIMESTAMP);
 
         const order = Self{
             .user_id = order_msg.user_id,
@@ -207,23 +228,24 @@ pub const Order = extern struct {
     ///
     /// Invariants:
     /// - remaining_qty <= quantity
-    /// - quantity > 0
+    /// - quantity > 0 and <= MAX_ORDER_QUANTITY
     /// - Market orders have price == 0
     /// - Limit orders have price > 0
-    /// - timestamp > 0
+    /// - timestamp >= MIN_VALID_TIMESTAMP
     pub inline fn isValid(self: *const Self) bool {
         // Remaining can't exceed original
         if (self.remaining_qty > self.quantity) return false;
 
-        // Original quantity must be positive
+        // Original quantity must be positive and bounded
         if (self.quantity == 0) return false;
+        if (self.quantity > MAX_ORDER_QUANTITY) return false;
 
         // Market orders have price 0, limit orders have price > 0
         if (self.order_type == .market and self.price != 0) return false;
         if (self.order_type == .limit and self.price == 0) return false;
 
         // Timestamp must be set
-        if (self.timestamp == 0) return false;
+        if (self.timestamp < MIN_VALID_TIMESTAMP) return false;
 
         return true;
     }
@@ -444,7 +466,7 @@ test "Order price crossing - limit orders" {
 
     // Buy at 100 crosses sell at 100 or below
     try std.testing.expect(buy.pricesCross(100)); // Equal - crosses
-    try std.testing.expect(buy.pricesCross(99));  // Below - crosses
+    try std.testing.expect(buy.pricesCross(99)); // Below - crosses
     try std.testing.expect(!buy.pricesCross(101)); // Above - no cross
 
     const sell_order_msg = msg.NewOrderMsg{
@@ -556,7 +578,7 @@ test "Timestamp monotonicity" {
 test "Timestamp non-zero" {
     // Ensure we never get a zero timestamp (which would fail isValid)
     const t = getCurrentTimestamp();
-    try std.testing.expect(t > 0);
+    try std.testing.expect(t >= MIN_VALID_TIMESTAMP);
 }
 
 test "Market order initialization" {
@@ -574,4 +596,11 @@ test "Market order initialization" {
     try std.testing.expectEqual(@as(u32, 0), order.price);
     try std.testing.expectEqual(msg.OrderType.market, order.order_type);
     try std.testing.expect(order.isValid());
+}
+
+test "MAX_ORDER_QUANTITY constant" {
+    try std.testing.expectEqual(@as(u32, 1_000_000_000), MAX_ORDER_QUANTITY);
+
+    // Verify it fits in u32 with headroom
+    try std.testing.expect(MAX_ORDER_QUANTITY < std.math.maxInt(u32));
 }

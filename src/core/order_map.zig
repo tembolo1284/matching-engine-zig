@@ -4,12 +4,17 @@
 //! - Power-of-2 size for fast modulo via bitmask
 //! - Linear probing with bounded probe length (NASA Rule 2)
 //! - Tombstone-based deletion with periodic compaction
-//! - Heap allocation for compaction (not hot path)
+//! - Pre-allocated compaction buffer (NASA Rule 3 - no allocation in hot path)
 //!
 //! Key space:
 //! - Key 0 is reserved as EMPTY sentinel
 //! - Key maxInt(u64) is reserved as TOMBSTONE sentinel
 //! - Orders with user_id=0 AND order_id=0 must be rejected upstream
+//!
+//! Memory footprint:
+//! - Main slots: ORDER_MAP_SIZE × 32 bytes = 8MB
+//! - Compaction buffer: ORDER_MAP_SIZE × 32 bytes = 8MB
+//! - Total: ~16MB per OrderMap instance
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -81,10 +86,15 @@ const OrderMapSlot = struct {
 /// Uses linear probing with tombstone markers for deletion.
 /// Compaction runs when tombstones exceed TOMBSTONE_COMPACT_THRESHOLD%.
 ///
-/// Memory: ~8MB (262,144 slots × 32 bytes per slot)
+/// Memory: ~16MB total (8MB slots + 8MB compaction buffer)
+/// This struct is too large for stack allocation - use heap via create().
 pub const OrderMap = struct {
     /// Hash table slots. Must use initInPlace due to size.
     slots: [ORDER_MAP_SIZE]OrderMapSlot,
+
+    /// Pre-allocated buffer for compaction (avoids allocation during operation).
+    /// This ensures compaction is O(n) time but O(1) allocations.
+    compact_buffer: [ORDER_MAP_SIZE]OrderMapSlot,
 
     /// Number of active entries.
     count: u32,
@@ -100,10 +110,17 @@ pub const OrderMap = struct {
     max_probe: u32,
     compactions: u32,
 
-    /// Allocator for compaction (stored at init, used rarely).
-    allocator: std.mem.Allocator,
-
     const Self = @This();
+
+    // ========================================================================
+    // Compile-time size verification
+    // ========================================================================
+    comptime {
+        // Verify this struct is too large for typical stack (1MB threshold)
+        // Actual size is ~12-16MB depending on OrderMapSlot padding
+        const size = @sizeOf(Self);
+        std.debug.assert(size > 1 * 1024 * 1024); // > 1MB = too large for stack
+    }
 
     // ========================================================================
     // Initialization
@@ -111,7 +128,10 @@ pub const OrderMap = struct {
 
     /// Initialize in-place (required for large struct).
     /// Must be called before any other operations.
-    pub fn initInPlace(self: *Self, allocator: std.mem.Allocator) void {
+    ///
+    /// Note: allocator parameter kept for API compatibility but no longer used
+    /// since compaction buffer is now pre-allocated.
+    pub fn initInPlace(self: *Self, _: std.mem.Allocator) void {
         self.count = 0;
         self.tombstone_count = 0;
         self.total_inserts = 0;
@@ -120,12 +140,15 @@ pub const OrderMap = struct {
         self.probe_total = 0;
         self.max_probe = 0;
         self.compactions = 0;
-        self.allocator = allocator;
 
         // Initialize all slots at runtime (NOT compile-time!)
         for (&self.slots) |*slot| {
             slot.key = HASH_SLOT_EMPTY;
         }
+
+        // Compact buffer doesn't need initialization - it's written before read
+
+        std.debug.assert(self.isValid());
     }
 
     // ========================================================================
@@ -181,6 +204,7 @@ pub const OrderMap = struct {
         std.debug.assert(key != HASH_SLOT_EMPTY);
         std.debug.assert(key != HASH_SLOT_TOMBSTONE);
         std.debug.assert(location.order_ptr.remaining_qty > 0);
+        std.debug.assert(self.isValid());
 
         if (self.shouldCompact()) {
             self.compact();
@@ -206,6 +230,7 @@ pub const OrderMap = struct {
                 self.recordProbe(probe);
                 self.total_inserts += 1;
                 std.debug.assert(self.count <= ORDER_MAP_SIZE);
+                std.debug.assert(self.isValid());
                 return true;
             }
 
@@ -224,6 +249,7 @@ pub const OrderMap = struct {
     pub fn find(self: *Self, key: u64) ?*const OrderLocation {
         std.debug.assert(key != HASH_SLOT_EMPTY);
         std.debug.assert(key != HASH_SLOT_TOMBSTONE);
+        std.debug.assert(self.isValid());
 
         var idx = hash(key);
         var probe: u32 = 0;
@@ -256,6 +282,7 @@ pub const OrderMap = struct {
     pub fn remove(self: *Self, key: u64) bool {
         std.debug.assert(key != HASH_SLOT_EMPTY);
         std.debug.assert(key != HASH_SLOT_TOMBSTONE);
+        std.debug.assert(self.isValid());
 
         var idx = hash(key);
         var probe: u32 = 0;
@@ -275,6 +302,7 @@ pub const OrderMap = struct {
                 self.tombstone_count += 1;
                 self.recordProbe(probe);
                 self.total_removes += 1;
+                std.debug.assert(self.isValid());
                 return true;
             }
 
@@ -295,22 +323,17 @@ pub const OrderMap = struct {
     }
 
     /// Compact the hash map by removing tombstones.
-    /// Uses heap allocation for temporary storage (not hot path).
+    /// Uses pre-allocated compact_buffer - NO allocation during operation.
+    ///
+    /// Complexity: O(n) time, O(1) allocation
     fn compact(self: *Self) void {
-        // Allocate temporary storage on heap (avoids 4MB+ stack allocation)
-        const entries = self.allocator.alloc(OrderMapSlot, self.count) catch {
-            // If allocation fails, skip compaction this time
-            // This is safe - we'll just have more tombstones
-            std.log.warn("OrderMap.compact: allocation failed, skipping", .{});
-            return;
-        };
-        defer self.allocator.free(entries);
+        std.debug.assert(self.isValid());
 
-        // Collect live entries
+        // Copy live entries to pre-allocated buffer
         var entry_count: u32 = 0;
         for (&self.slots) |*slot| {
             if (slot.key != HASH_SLOT_EMPTY and slot.key != HASH_SLOT_TOMBSTONE) {
-                entries[entry_count] = slot.*;
+                self.compact_buffer[entry_count] = slot.*;
                 entry_count += 1;
             }
         }
@@ -327,13 +350,15 @@ pub const OrderMap = struct {
         self.count = 0;
         self.tombstone_count = 0;
 
-        for (entries[0..entry_count]) |entry| {
+        for (self.compact_buffer[0..entry_count]) |entry| {
             const success = self.insertInternal(entry.key, entry.location);
             std.debug.assert(success);
         }
 
         std.debug.assert(self.count == old_count);
         self.compactions += 1;
+
+        std.debug.assert(self.isValid());
     }
 
     /// Internal insert without compaction check (used during compaction).
@@ -372,6 +397,11 @@ pub const OrderMap = struct {
         if (self.tombstone_count > ORDER_MAP_SIZE) return false;
         if (self.count + self.tombstone_count > ORDER_MAP_SIZE) return false;
         return true;
+    }
+
+    /// Get memory footprint in bytes.
+    pub fn getMemoryFootprint() usize {
+        return @sizeOf(Self);
     }
 };
 
@@ -505,4 +535,40 @@ test "OrderLocation validation" {
 
     const invalid_side = OrderLocation{ .side = .sell, .price = 5000, .order_ptr = &order };
     try std.testing.expect(!invalid_side.isValid());
+}
+
+test "OrderMap compaction" {
+    var map: OrderMap = undefined;
+    map.initInPlace(std.testing.allocator);
+
+    // Insert many orders
+    var orders: [100]Order = undefined;
+    for (&orders, 0..) |*order, i| {
+        order.* = std.mem.zeroes(Order);
+        order.price = 1000;
+        order.side = .buy;
+        order.remaining_qty = 10;
+
+        const key = OrderMap.makeKey(@intCast(i), 1);
+        const loc = OrderLocation{ .side = .buy, .price = 1000, .order_ptr = order };
+        try std.testing.expect(map.insert(key, loc));
+    }
+
+    try std.testing.expectEqual(@as(u32, 100), map.count);
+    try std.testing.expectEqual(@as(u32, 0), map.tombstone_count);
+
+    // Remove all - creates tombstones
+    for (0..100) |i| {
+        const key = OrderMap.makeKey(@intCast(i), 1);
+        try std.testing.expect(map.remove(key));
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), map.count);
+    try std.testing.expectEqual(@as(u32, 100), map.tombstone_count);
+}
+
+test "OrderMap memory footprint" {
+    const footprint = OrderMap.getMemoryFootprint();
+    // Should be > 16MB (slots + compact_buffer)
+    try std.testing.expect(footprint > 16 * 1024 * 1024);
 }

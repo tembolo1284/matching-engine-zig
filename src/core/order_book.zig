@@ -7,6 +7,7 @@
 //! - Zero allocation in hot path (uses pre-allocated pools)
 //! - Bounded iterations prevent runaway matching (NASA Rule 2)
 //! - All output buffer writes are checked (NASA Rule 7)
+//! - Functions kept under 60 lines (NASA Rule 4)
 //!
 //! Output Message Routing:
 //! - client_id > 0: unicast to specific TCP client
@@ -19,6 +20,7 @@
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const Order = @import("order.zig").Order;
+const MAX_ORDER_QUANTITY = @import("order.zig").MAX_ORDER_QUANTITY;
 const getCurrentTimestamp = @import("order.zig").getCurrentTimestamp;
 const MemoryPools = @import("memory_pool.zig").MemoryPools;
 
@@ -37,13 +39,24 @@ pub const MAX_OUTPUT_MESSAGES = output_buffer.MAX_OUTPUT_MESSAGES;
 
 /// Maximum price levels per side. With O(n) operations, keep this reasonable.
 /// For high-frequency scenarios with many price levels, consider a skip list.
+///
+/// Performance note: With 10,000 levels, worst-case level lookup is O(10000).
+/// In practice, most orders trade near best price so typical case is O(10-100).
+/// If you need >1000 active levels, consider hash-based level lookup.
 pub const MAX_PRICE_LEVELS: u32 = 10_000;
 
 /// Safety bound on matching iterations per incoming order.
 /// Prevents runaway matching if book is corrupted.
+///
+/// Sized for worst case: 200K fills per order (e.g., large order vs many small).
+/// If this limit is hit, remaining quantity stays in book (not rejected).
 pub const MAX_MATCH_ITERATIONS: u32 = 200_000;
 
 /// Threshold for lazy price level cleanup (number of inactive levels).
+/// When exceeded, triggers compaction of empty levels.
+///
+/// Trade-off: Lower = cleaner book but more frequent cleanup.
+/// Higher = less cleanup overhead but more memory/iteration waste.
 const LAZY_CLEANUP_THRESHOLD: u32 = 100;
 
 // ============================================================================
@@ -180,6 +193,17 @@ pub const OrderBookStats = struct {
 };
 
 // ============================================================================
+// Fill Result (for extracted fill logic)
+// ============================================================================
+
+/// Result of executing a fill between two orders.
+const FillResult = struct {
+    fill_qty: u32,
+    fill_price: u32,
+    resting_filled: bool,
+};
+
+// ============================================================================
 // Order Book
 // ============================================================================
 
@@ -278,7 +302,7 @@ pub const OrderBook = struct {
         return true;
     }
 
-    // ========================================================================
+        // ========================================================================
     // Order Entry
     // ========================================================================
 
@@ -293,6 +317,7 @@ pub const OrderBook = struct {
         output: *OutputBuffer,
     ) void {
         std.debug.assert(self.isValid());
+        std.debug.assert(order_msg.quantity <= MAX_ORDER_QUANTITY);
 
         self.total_orders += 1;
 
@@ -353,21 +378,7 @@ pub const OrderBook = struct {
 
         // If not fully filled, add to book
         if (!order.isFilled()) {
-            const inserted = self.insertOrder(order);
-            if (!inserted) {
-                std.log.err("Order book full, rejecting order", .{});
-                self.total_rejects += 1;
-                output.addChecked(msg.OutputMsg.makeReject(
-                    order.user_id,
-                    order.user_order_id,
-                    .book_full,
-                    self.symbol,
-                    client_id,
-                ));
-                self.pools.order_pool.release(order);
-                return;
-            }
-            self.checkTopOfBookChange(output, client_id);
+            self.insertOrderOrReject(order, client_id, output);
         } else {
             // Fully filled - release back to pool
             self.checkTopOfBookChange(output, client_id);
@@ -375,6 +386,30 @@ pub const OrderBook = struct {
         }
 
         std.debug.assert(self.isValid());
+    }
+
+    /// Insert order into book or reject if book is full.
+    fn insertOrderOrReject(
+        self: *Self,
+        order: *Order,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) void {
+        const inserted = self.insertOrder(order);
+        if (!inserted) {
+            std.log.err("Order book full, rejecting order", .{});
+            self.total_rejects += 1;
+            output.addChecked(msg.OutputMsg.makeReject(
+                order.user_id,
+                order.user_order_id,
+                .book_full,
+                self.symbol,
+                client_id,
+            ));
+            self.pools.order_pool.release(order);
+            return;
+        }
+        self.checkTopOfBookChange(output, client_id);
     }
 
     // ========================================================================
@@ -411,31 +446,7 @@ pub const OrderBook = struct {
         const key = OrderMap.makeKey(user_id, user_order_id);
 
         if (self.order_map.find(key)) |loc| {
-            std.debug.assert(loc.isValid());
-
-            const order = loc.order_ptr;
-
-            if (self.findLevel(loc.side, loc.price)) |level| {
-                level.removeOrder(order);
-                self.markLevelMaybeInactive(loc.side);
-            } else {
-                std.debug.panic("Order in map but level not found: price={d}", .{loc.price});
-            }
-
-            const removed = self.order_map.remove(key);
-            std.debug.assert(removed);
-
-            self.pools.order_pool.release(order);
-
-            output.addChecked(msg.OutputMsg.makeCancelAck(
-                user_id,
-                user_order_id,
-                self.symbol,
-                client_id,
-            ));
-
-            self.maybeCleanupLevels();
-            self.checkTopOfBookChange(output, client_id);
+            self.executeCancelFound(loc, key, user_id, user_order_id, client_id, output);
         } else {
             self.total_rejects += 1;
             output.addChecked(msg.OutputMsg.makeReject(
@@ -448,6 +459,43 @@ pub const OrderBook = struct {
         }
 
         std.debug.assert(self.isValid());
+    }
+
+    /// Execute cancellation for a found order.
+    fn executeCancelFound(
+        self: *Self,
+        loc: *const OrderLocation,
+        key: u64,
+        user_id: u32,
+        user_order_id: u32,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) void {
+        std.debug.assert(loc.isValid());
+
+        const order = loc.order_ptr;
+
+        if (self.findLevel(loc.side, loc.price)) |level| {
+            level.removeOrder(order);
+            self.markLevelMaybeInactive(loc.side);
+        } else {
+            std.debug.panic("Order in map but level not found: price={d}", .{loc.price});
+        }
+
+        const removed = self.order_map.remove(key);
+        std.debug.assert(removed);
+
+        self.pools.order_pool.release(order);
+
+        output.addChecked(msg.OutputMsg.makeCancelAck(
+            user_id,
+            user_order_id,
+            self.symbol,
+            client_id,
+        ));
+
+        self.maybeCleanupLevels();
+        self.checkTopOfBookChange(output, client_id);
     }
 
     /// Cancel all orders for a specific client (e.g., on disconnect).
@@ -514,6 +562,8 @@ pub const OrderBook = struct {
     // Matching Engine
     // ========================================================================
 
+    /// Match incoming order against resting orders.
+    /// Extracted to keep under 60 lines per P10 Rule 4.
     fn matchOrder(self: *Self, incoming: *Order, client_id: u32, output: *OutputBuffer) void {
         std.debug.assert(incoming.isValid());
         std.debug.assert(incoming.remaining_qty > 0);
@@ -528,80 +578,7 @@ pub const OrderBook = struct {
                 break;
             }
 
-            var resting = best_level.orders_head;
-
-            while (resting) |rest_order| {
-                if (incoming.isFilled() or iterations >= MAX_MATCH_ITERATIONS) break;
-
-                iterations += 1;
-                const next = rest_order.next;
-
-                const fill_qty = @min(incoming.remaining_qty, rest_order.remaining_qty);
-                const fill_price = rest_order.price;
-
-                std.debug.assert(fill_qty > 0);
-
-                const incoming_filled = incoming.fill(fill_qty);
-                const resting_filled = rest_order.fill(fill_qty);
-
-                std.debug.assert(incoming_filled == fill_qty);
-                std.debug.assert(resting_filled == fill_qty);
-
-                self.total_trades += 1;
-                self.total_fills += 2;
-                self.volume_traded += fill_qty;
-
-                const is_incoming_buyer = (incoming.side == .buy);
-
-                const buyer_uid = if (is_incoming_buyer) incoming.user_id else rest_order.user_id;
-                const buyer_oid = if (is_incoming_buyer) incoming.user_order_id else rest_order.user_order_id;
-                const buyer_client = if (is_incoming_buyer) client_id else rest_order.client_id;
-
-                const seller_uid = if (!is_incoming_buyer) incoming.user_id else rest_order.user_id;
-                const seller_oid = if (!is_incoming_buyer) incoming.user_order_id else rest_order.user_order_id;
-                const seller_client = if (!is_incoming_buyer) client_id else rest_order.client_id;
-
-                // Trade to buyer (CRITICAL - must not drop)
-                output.addChecked(msg.OutputMsg.makeTrade(
-                    buyer_uid,
-                    buyer_oid,
-                    seller_uid,
-                    seller_oid,
-                    fill_price,
-                    fill_qty,
-                    self.symbol,
-                    buyer_client,
-                ));
-
-                // Trade to seller if different client (CRITICAL - must not drop)
-                if (seller_client != buyer_client) {
-                    output.addChecked(msg.OutputMsg.makeTrade(
-                        buyer_uid,
-                        buyer_oid,
-                        seller_uid,
-                        seller_oid,
-                        fill_price,
-                        fill_qty,
-                        self.symbol,
-                        seller_client,
-                    ));
-                }
-
-                if (rest_order.isFilled()) {
-                    best_level.reduceQuantity(fill_qty);
-                    best_level.removeOrder(rest_order);
-
-                    const key = OrderMap.makeKey(rest_order.user_id, rest_order.user_order_id);
-                    const removed = self.order_map.remove(key);
-                    std.debug.assert(removed);
-
-                    self.pools.order_pool.release(rest_order);
-                } else {
-                    best_level.reduceQuantity(fill_qty);
-                }
-
-                resting = next;
-            }
+            self.matchAtLevel(incoming, best_level, client_id, output, &iterations);
 
             if (!best_level.active or best_level.orders_head == null) {
                 self.markLevelMaybeInactive(opposite_side);
@@ -611,6 +588,128 @@ pub const OrderBook = struct {
         if (iterations >= MAX_MATCH_ITERATIONS) {
             std.log.warn("Match iteration limit reached: {d}", .{iterations});
         }
+    }
+
+    /// Match incoming order against orders at a specific price level.
+    fn matchAtLevel(
+        self: *Self,
+        incoming: *Order,
+        level: *PriceLevel,
+        client_id: u32,
+        output: *OutputBuffer,
+        iterations: *u32,
+    ) void {
+        var resting = level.orders_head;
+
+        while (resting) |rest_order| {
+            if (incoming.isFilled() or iterations.* >= MAX_MATCH_ITERATIONS) break;
+
+            iterations.* += 1;
+            const next = rest_order.next;
+
+            const result = self.executeFill(incoming, rest_order, level, client_id, output);
+
+            if (result.resting_filled) {
+                self.removeFilledOrder(rest_order, level);
+            }
+
+            resting = next;
+        }
+    }
+
+    /// Execute a fill between incoming and resting orders.
+    /// Returns fill details for caller to handle cleanup.
+    fn executeFill(
+        self: *Self,
+        incoming: *Order,
+        resting: *Order,
+        level: *PriceLevel,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) FillResult {
+        const fill_qty = @min(incoming.remaining_qty, resting.remaining_qty);
+        const fill_price = resting.price;
+
+        std.debug.assert(fill_qty > 0);
+
+        const incoming_filled = incoming.fill(fill_qty);
+        const resting_filled = resting.fill(fill_qty);
+
+        std.debug.assert(incoming_filled == fill_qty);
+        std.debug.assert(resting_filled == fill_qty);
+
+        // Update statistics
+        self.total_trades += 1;
+        self.total_fills += 2;
+        self.volume_traded += fill_qty;
+        level.reduceQuantity(fill_qty);
+
+        // Emit trade messages
+        self.emitTradeMessages(incoming, resting, fill_price, fill_qty, client_id, output);
+
+        return FillResult{
+            .fill_qty = fill_qty,
+            .fill_price = fill_price,
+            .resting_filled = resting.isFilled(),
+        };
+    }
+
+    /// Emit trade messages to both parties.
+    fn emitTradeMessages(
+        self: *Self,
+        incoming: *Order,
+        resting: *Order,
+        fill_price: u32,
+        fill_qty: u32,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) void {
+        const is_incoming_buyer = (incoming.side == .buy);
+
+        const buyer_uid = if (is_incoming_buyer) incoming.user_id else resting.user_id;
+        const buyer_oid = if (is_incoming_buyer) incoming.user_order_id else resting.user_order_id;
+        const buyer_client = if (is_incoming_buyer) client_id else resting.client_id;
+
+        const seller_uid = if (!is_incoming_buyer) incoming.user_id else resting.user_id;
+        const seller_oid = if (!is_incoming_buyer) incoming.user_order_id else resting.user_order_id;
+        const seller_client = if (!is_incoming_buyer) client_id else resting.client_id;
+
+        // Trade to buyer (CRITICAL - must not drop)
+        output.addChecked(msg.OutputMsg.makeTrade(
+            buyer_uid,
+            buyer_oid,
+            seller_uid,
+            seller_oid,
+            fill_price,
+            fill_qty,
+            self.symbol,
+            buyer_client,
+        ));
+
+        // Trade to seller if different client (CRITICAL - must not drop)
+        if (seller_client != buyer_client) {
+            output.addChecked(msg.OutputMsg.makeTrade(
+                buyer_uid,
+                buyer_oid,
+                seller_uid,
+                seller_oid,
+                fill_price,
+                fill_qty,
+                self.symbol,
+                seller_client,
+            ));
+        }
+    }
+
+    /// Remove a fully filled order from level and map.
+    fn removeFilledOrder(self: *Self, order: *Order, level: *PriceLevel) void {
+        level.removeOrder(order);
+
+        const key = OrderMap.makeKey(order.user_id, order.user_order_id);
+        const removed = self.order_map.remove(key);
+        std.debug.assert(removed);
+
+        self.pools.order_pool.release(order);
     }
 
     // ========================================================================
@@ -846,12 +945,15 @@ pub const OrderBook = struct {
     /// - One to client_id (originator of the action)
     /// - One to client_id=0 (multicast market data feed)
     fn checkTopOfBookChange(self: *Self, output: *OutputBuffer, client_id: u32) void {
-        // Check bid side
+        self.checkBidTopOfBook(output, client_id);
+        self.checkAskTopOfBook(output, client_id);
+    }
+
+    fn checkBidTopOfBook(self: *Self, output: *OutputBuffer, client_id: u32) void {
         if (self.getBestLevel(.buy)) |bid| {
             if (bid.price != self.prev_best_bid_price or
                 bid.total_quantity != self.prev_best_bid_qty)
             {
-                // To originator
                 output.addChecked(msg.OutputMsg.makeTopOfBook(
                     self.symbol,
                     .buy,
@@ -859,7 +961,6 @@ pub const OrderBook = struct {
                     bid.total_quantity,
                     client_id,
                 ));
-                // To multicast feed
                 output.addChecked(msg.OutputMsg.makeTopOfBook(
                     self.symbol,
                     .buy,
@@ -871,19 +972,18 @@ pub const OrderBook = struct {
                 self.prev_best_bid_qty = bid.total_quantity;
             }
         } else if (self.prev_best_bid_price != 0) {
-            // Book went empty on bid side
             output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, client_id));
             output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .buy, 0, 0, 0));
             self.prev_best_bid_price = 0;
             self.prev_best_bid_qty = 0;
         }
+    }
 
-        // Check ask side
+    fn checkAskTopOfBook(self: *Self, output: *OutputBuffer, client_id: u32) void {
         if (self.getBestLevel(.sell)) |ask| {
             if (ask.price != self.prev_best_ask_price or
                 ask.total_quantity != self.prev_best_ask_qty)
             {
-                // To originator
                 output.addChecked(msg.OutputMsg.makeTopOfBook(
                     self.symbol,
                     .sell,
@@ -891,7 +991,6 @@ pub const OrderBook = struct {
                     ask.total_quantity,
                     client_id,
                 ));
-                // To multicast feed
                 output.addChecked(msg.OutputMsg.makeTopOfBook(
                     self.symbol,
                     .sell,
@@ -903,7 +1002,6 @@ pub const OrderBook = struct {
                 self.prev_best_ask_qty = ask.total_quantity;
             }
         } else if (self.prev_best_ask_price != 0) {
-            // Book went empty on ask side
             output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, client_id));
             output.addChecked(msg.OutputMsg.makeTopOfBook(self.symbol, .sell, 0, 0, 0));
             self.prev_best_ask_price = 0;
