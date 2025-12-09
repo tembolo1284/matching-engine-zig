@@ -9,11 +9,12 @@
 //! - CSV codec parses to/from these types
 //! - FIX codec maps FIX tags to these types
 //!
-//! Design principles:
+//! Design principles (NASA Power of Ten):
 //! - Fixed-size types for predictable memory layout
 //! - No heap allocation
 //! - Cache-friendly field ordering
-//! - Explicit padding where needed
+//! - Explicit zero padding (never undefined - prevents info leaks)
+//! - Comptime size verification for wire compatibility
 
 const std = @import("std");
 
@@ -189,6 +190,9 @@ pub const RejectReason = enum(u8) {
 // ============================================================================
 
 /// New order submission.
+///
+/// Wire format: 28 bytes, packed.
+/// Padding is explicitly zeroed to prevent information leakage.
 pub const NewOrderMsg = extern struct {
     /// User identifier.
     user_id: u32,
@@ -202,8 +206,8 @@ pub const NewOrderMsg = extern struct {
     symbol: Symbol,
     /// Buy or sell.
     side: Side,
-    /// Padding for alignment.
-    _pad: [3]u8 = undefined,
+    /// Padding for alignment - MUST be zero for wire format safety.
+    _pad: [3]u8 = .{ 0, 0, 0 },
 
     const Self = @This();
 
@@ -227,6 +231,8 @@ pub const NewOrderMsg = extern struct {
 };
 
 /// Cancel order request.
+///
+/// Wire format: 16 bytes, packed.
 pub const CancelMsg = extern struct {
     /// User identifier.
     user_id: u32,
@@ -249,7 +255,7 @@ pub const CancelMsg = extern struct {
 
 /// Flush/reset message (testing only).
 pub const FlushMsg = extern struct {
-    /// Reserved for future use.
+    /// Reserved for future use - explicitly zeroed.
     _reserved: u32 = 0,
 
     comptime {
@@ -272,6 +278,7 @@ pub const InputMsg = struct {
 
     /// Create new order message.
     pub fn newOrder(order: NewOrderMsg) Self {
+        std.debug.assert(order.quantity > 0);
         return .{
             .msg_type = .new_order,
             .data = .{ .new_order = order },
@@ -362,11 +369,13 @@ pub const TradeMsg = extern struct {
 };
 
 /// Top of book update (market data).
+///
+/// Padding is explicitly zeroed for wire format safety.
 pub const TopOfBookMsg = extern struct {
     /// Side being updated.
     side: Side,
-    /// Padding.
-    _pad: [3]u8 = undefined,
+    /// Padding - MUST be zero.
+    _pad: [3]u8 = .{ 0, 0, 0 },
     /// Best price (0 if empty).
     price: u32,
     /// Total quantity at best price.
@@ -393,11 +402,14 @@ pub const CancelAckMsg = extern struct {
 };
 
 /// Order rejection.
+///
+/// Padding is explicitly zeroed for wire format safety.
 pub const RejectMsg = extern struct {
     user_id: u32,
     user_order_id: u32,
     reason: RejectReason,
-    _pad: [3]u8 = undefined,
+    /// Padding - MUST be zero.
+    _pad: [3]u8 = .{ 0, 0, 0 },
 
     comptime {
         std.debug.assert(@sizeOf(RejectMsg) == 12);
@@ -449,6 +461,8 @@ pub const OutputMsg = struct {
         symbol: Symbol,
         client_id: u32,
     ) Self {
+        std.debug.assert(quantity > 0);
+        std.debug.assert(price > 0);
         return .{
             .msg_type = .trade,
             .client_id = client_id,
@@ -597,6 +611,37 @@ test "NewOrderMsg validation" {
         .side = .buy,
     };
     try std.testing.expect(!invalid_qty.isValid());
+}
+
+test "NewOrderMsg padding is zero" {
+    const order = NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .price = 5000,
+        .quantity = 50,
+        .symbol = makeSymbol("IBM"),
+        .side = .buy,
+    };
+    // Verify padding is explicitly zero (not undefined)
+    try std.testing.expectEqual(@as([3]u8, .{ 0, 0, 0 }), order._pad);
+}
+
+test "TopOfBookMsg padding is zero" {
+    const tob = TopOfBookMsg{
+        .side = .buy,
+        .price = 100,
+        .quantity = 500,
+    };
+    try std.testing.expectEqual(@as([3]u8, .{ 0, 0, 0 }), tob._pad);
+}
+
+test "RejectMsg padding is zero" {
+    const reject = RejectMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .reason = .invalid_price,
+    };
+    try std.testing.expectEqual(@as([3]u8, .{ 0, 0, 0 }), reject._pad);
 }
 
 test "InputMsg factories" {

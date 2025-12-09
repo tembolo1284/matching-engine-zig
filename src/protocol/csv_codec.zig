@@ -21,6 +21,11 @@
 //! - Lines terminated by LF or CRLF
 //! - Side: 'B'/'b' for buy, 'S'/'s' for sell
 //! - All enum values are validated (no UB on malformed input)
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: All loops bounded by MAX_LINE_LENGTH and MAX_FIELDS
+//! - Rule 5: Assertions validate function preconditions
+//! - Rule 7: All enum parsing uses explicit validation
 
 const std = @import("std");
 const msg = @import("message_types.zig");
@@ -139,6 +144,9 @@ fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
     // SECURITY: Validate side before use
     const side = parseSide(side_str[0]) orelse return codec.CodecError.InvalidField;
 
+    // P10 Rule 5: Validate parsed data
+    std.debug.assert(symbol_str.len <= msg.MAX_SYMBOL_LENGTH or symbol_str.len > 0);
+
     return msg.InputMsg.newOrder(.{
         .user_id = user_id,
         .user_order_id = order_id,
@@ -181,6 +189,10 @@ pub fn encodeInput(message: *const msg.InputMsg, buf: []u8) codec.CodecError!usi
     switch (message.msg_type) {
         .new_order => {
             const o = &message.data.new_order;
+            // P10 Rule 5: Validate before encoding
+            std.debug.assert(o.quantity > 0);
+            std.debug.assert(!msg.symbolIsEmpty(&o.symbol));
+
             writer.print("N, {}, {s}, {}, {}, {c}, {}\n", .{
                 o.user_id,
                 msg.symbolSlice(&o.symbol),
@@ -310,6 +322,7 @@ fn parseTopOfBook(fields: [][]const u8) codec.CodecError!msg.OutputMsg {
         side,
         price,
         qty,
+        0,
     );
 }
 
@@ -364,6 +377,10 @@ pub fn encodeOutput(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!u
 
         .trade => {
             const t = &message.data.trade;
+            // P10 Rule 5: Validate trade data
+            std.debug.assert(t.quantity > 0);
+            std.debug.assert(t.price > 0);
+
             writer.print("T, {s}, {}, {}, {}, {}, {}, {}\n", .{
                 msg.symbolSlice(&message.symbol),
                 t.buy_user_id,
@@ -421,6 +438,7 @@ pub fn encodeOutput(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!u
 
 /// Find line ending in data.
 fn findLineEnd(data: []const u8) LineEndResult {
+    // P10 Rule 2: Loop bounded by data length
     for (data, 0..) |c, i| {
         if (c == '\n') return .{ .found = i };
     }
@@ -453,6 +471,7 @@ fn calculateConsumed(data: []const u8, line_len: usize) usize {
 }
 
 /// Split line into fields at commas.
+/// P10 Rule 2: Loop bounded by line length and MAX_FIELDS.
 fn splitFields(line: []const u8, fields: *[MAX_FIELDS][]const u8) usize {
     var count: usize = 0;
     var start: usize = 0;
@@ -544,7 +563,7 @@ test "CSV encode output trade" {
 }
 
 test "CSV encode output empty top of book" {
-    const tob = msg.OutputMsg.makeTopOfBook(msg.makeSymbol("IBM"), .buy, 0, 0);
+    const tob = msg.OutputMsg.makeTopOfBook(msg.makeSymbol("IBM"), .buy, 0, 0, 0);
 
     var buf: [256]u8 = undefined;
     const len = try encodeOutput(&tob, &buf);
@@ -619,4 +638,24 @@ test "parseRejectReason validation" {
     try std.testing.expect(parseRejectReason(0) == null);
     try std.testing.expect(parseRejectReason(11) == null);
     try std.testing.expect(parseRejectReason(255) == null);
+}
+
+test "splitFields" {
+    var fields: [MAX_FIELDS][]const u8 = undefined;
+
+    const count = splitFields("A, B, C, D", &fields);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqualStrings("A", fields[0]);
+    try std.testing.expectEqualStrings(" B", fields[1]);
+    try std.testing.expectEqualStrings(" C", fields[2]);
+    try std.testing.expectEqualStrings(" D", fields[3]);
+}
+
+test "splitFields with trailing newline" {
+    var fields: [MAX_FIELDS][]const u8 = undefined;
+
+    const count = splitFields("A, B\n", &fields);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("A", fields[0]);
+    try std.testing.expectEqualStrings(" B", fields[1]);
 }

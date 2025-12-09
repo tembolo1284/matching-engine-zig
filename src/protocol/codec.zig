@@ -24,6 +24,11 @@
 //! var codec = Codec.init(.binary);
 //! const len = try codec.encodeInput(&msg, &buf);
 //! ```
+//!
+//! NASA Power of Ten Compliance:
+//! - All parsing functions handle overflow explicitly
+//! - No recursion or unbounded loops
+//! - All errors are propagated (no silent failures)
 
 const std = @import("std");
 const msg = @import("message_types.zig");
@@ -158,7 +163,7 @@ pub const Codec = struct {
         return switch (proto) {
             .binary => @import("binary_codec.zig").decode(data),
             .csv => @import("csv_codec.zig").decodeInput(data),
-            .fix => CodecError.UnknownMessageType, // FIX not implemented
+            .fix => @import("fix_codec.zig").decodeInput(data),
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -169,7 +174,7 @@ pub const Codec = struct {
         return switch (proto) {
             .binary => @import("binary_codec.zig").decodeOutput(data),
             .csv => @import("csv_codec.zig").decodeOutput(data),
-            .fix => CodecError.UnknownMessageType, // FIX not implemented
+            .fix => @import("fix_codec.zig").decodeOutput(data),
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -179,7 +184,7 @@ pub const Codec = struct {
         return switch (self.protocol) {
             .binary => @import("binary_codec.zig").encode(message, buf),
             .csv => @import("csv_codec.zig").encodeInput(message, buf),
-            .fix => CodecError.UnknownMessageType, // FIX not implemented
+            .fix => @import("fix_codec.zig").encodeInput(message, buf),
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -189,7 +194,7 @@ pub const Codec = struct {
         return switch (self.protocol) {
             .binary => @import("binary_codec.zig").encodeOutput(message, buf),
             .csv => @import("csv_codec.zig").encodeOutput(message, buf),
-            .fix => CodecError.UnknownMessageType, // FIX not implemented
+            .fix => @import("fix_codec.zig").encodeOutput(message, buf),
             .unknown => CodecError.UnknownMessageType,
         };
     }
@@ -199,22 +204,31 @@ pub const Codec = struct {
 // Parsing Utilities
 // ============================================================================
 
-/// Maximum digits in a u32.
+/// Maximum digits in a u32 (4294967295 = 10 digits).
 const MAX_U32_DIGITS: usize = 10;
 
+/// Maximum digits in a u64 (18446744073709551615 = 20 digits).
+const MAX_U64_DIGITS: usize = 20;
+
 /// Parse u32 from decimal string.
+///
 /// Returns null if:
 /// - String is empty
+/// - String is too long (>10 digits)
 /// - Contains non-digit characters
 /// - Value overflows u32
+///
+/// Uses u64 intermediate to detect overflow without UB.
 pub fn parseU32(str: []const u8) ?u32 {
     if (str.len == 0) return null;
     if (str.len > MAX_U32_DIGITS) return null;
 
-    var result: u64 = 0; // Use u64 to detect overflow
+    // Use u64 intermediate to safely detect overflow
+    var result: u64 = 0;
     for (str) |c| {
         if (c < '0' or c > '9') return null;
         result = result * 10 + (c - '0');
+        // Check overflow after each digit
         if (result > std.math.maxInt(u32)) return null;
     }
 
@@ -222,18 +236,35 @@ pub fn parseU32(str: []const u8) ?u32 {
 }
 
 /// Parse u64 from decimal string.
+///
+/// Returns null if:
+/// - String is empty
+/// - String is too long (>20 digits)
+/// - Contains non-digit characters
+/// - Value overflows u64
+///
+/// Overflow detection:
+/// Before computing `result * 10 + digit`, we check if this would overflow:
+///   result * 10 + digit > MAX_U64
+///   result > (MAX_U64 - digit) / 10
+///
+/// This check happens BEFORE the multiplication, so we never overflow.
 pub fn parseU64(str: []const u8) ?u64 {
     if (str.len == 0) return null;
-    if (str.len > 20) return null;
+    if (str.len > MAX_U64_DIGITS) return null;
 
     var result: u64 = 0;
     for (str) |c| {
         if (c < '0' or c > '9') return null;
-        // Check for overflow before multiplication
+
         const digit: u64 = c - '0';
+
+        // Overflow check BEFORE multiplication:
+        // If result > (MAX - digit) / 10, then result * 10 + digit > MAX
         if (result > (std.math.maxInt(u64) - digit) / 10) {
             return null;
         }
+
         result = result * 10 + digit;
     }
 
@@ -348,6 +379,18 @@ test "parseU32 - overflow" {
     try std.testing.expectEqual(@as(?u32, null), parseU32("99999999999"));
 }
 
+test "parseU64 - valid" {
+    try std.testing.expectEqual(@as(?u64, 0), parseU64("0"));
+    try std.testing.expectEqual(@as(?u64, 18446744073709551615), parseU64("18446744073709551615"));
+}
+
+test "parseU64 - overflow" {
+    // This is u64 max + 1
+    try std.testing.expectEqual(@as(?u64, null), parseU64("18446744073709551616"));
+    // Way too big
+    try std.testing.expectEqual(@as(?u64, null), parseU64("99999999999999999999999"));
+}
+
 test "writeU32" {
     var buf: [16]u8 = undefined;
 
@@ -394,4 +437,24 @@ test "Codec unified interface" {
     // Verify auto-detect works
     const result = try Codec.decodeInput(buf[0..len]);
     try std.testing.expectEqual(msg.InputMsgType.new_order, result.message.msg_type);
+}
+
+test "writeSymbol" {
+    var buf: [16]u8 = undefined;
+
+    const sym = msg.makeSymbol("IBM");
+    const len = writeSymbol(&buf, &sym);
+
+    try std.testing.expectEqual(@as(usize, 3), len);
+    try std.testing.expectEqualStrings("IBM", buf[0..len]);
+}
+
+test "writeSymbol - full length" {
+    var buf: [16]u8 = undefined;
+
+    const sym = msg.makeSymbol("ABCDEFGH"); // Full 8 chars
+    const len = writeSymbol(&buf, &sym);
+
+    try std.testing.expectEqual(@as(usize, 8), len);
+    try std.testing.expectEqualStrings("ABCDEFGH", buf[0..len]);
 }

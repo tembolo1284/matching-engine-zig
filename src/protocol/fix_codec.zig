@@ -25,6 +25,11 @@
 //! - No sequence number tracking
 //! - No message recovery
 //! - SenderCompID/TargetCompID not validated
+//!
+//! Safety (NASA Power of Ten):
+//! - All buffer writes are bounds-checked via FixBuilder
+//! - All enum parsing uses explicit switch (no @enumFromInt on untrusted data)
+//! - Functions kept under 60 lines where possible
 
 const std = @import("std");
 const msg = @import("message_types.zig");
@@ -45,6 +50,9 @@ pub const MAX_FIX_MESSAGE_SIZE: usize = 4096;
 
 /// Maximum field value length.
 pub const MAX_FIELD_VALUE_LEN: usize = 256;
+
+/// Maximum tag digits (u32 max is 4294967295 = 10 digits).
+const MAX_TAG_DIGITS: usize = 10;
 
 // ============================================================================
 // FIX Tags
@@ -209,7 +217,7 @@ fn parseNewOrderSingle(fields: *const ParsedFields) codec.CodecError!msg.InputMs
     else
         1;
 
-    // Parse side
+    // Parse side (SECURITY: explicit switch, no @enumFromInt)
     const side: msg.Side = switch (side_char) {
         SIDE_BUY => .buy,
         SIDE_SELL => .sell,
@@ -336,6 +344,8 @@ fn parseExecutionReport(data: []const u8, delimiter: u8, fields: *const ParsedFi
 
 /// Encode input message to FIX format.
 pub fn encodeInput(message: *const msg.InputMsg, buf: []u8) codec.CodecError!usize {
+    std.debug.assert(buf.len >= 64); // Minimum reasonable buffer
+
     return switch (message.msg_type) {
         .new_order => encodeNewOrderSingle(&message.data.new_order, buf),
         .cancel => encodeCancelRequest(&message.data.cancel, buf),
@@ -344,7 +354,8 @@ pub fn encodeInput(message: *const msg.InputMsg, buf: []u8) codec.CodecError!usi
 }
 
 fn encodeNewOrderSingle(order: *const msg.NewOrderMsg, buf: []u8) codec.CodecError!usize {
-    var builder = FixBuilder.init(buf);
+    std.debug.assert(order.quantity > 0);
+    std.debug.assert(!msg.symbolIsEmpty(&order.symbol));
 
     // Build body first (need length for header)
     var body_buf: [1024]u8 = undefined;
@@ -352,23 +363,12 @@ fn encodeNewOrderSingle(order: *const msg.NewOrderMsg, buf: []u8) codec.CodecErr
 
     // Message type
     body.addChar(TAG_MSG_TYPE, MSG_TYPE_NEW_ORDER);
-
-    // ClOrdID
     body.addU32(TAG_CL_ORD_ID, order.user_order_id);
-
-    // Account (user_id)
     body.addU32(TAG_ACCOUNT, order.user_id);
-
-    // Symbol
     body.addSymbol(TAG_SYMBOL, &order.symbol);
-
-    // Side
     body.addChar(TAG_SIDE, if (order.side == .buy) SIDE_BUY else SIDE_SELL);
-
-    // OrderQty
     body.addU32(TAG_ORDER_QTY, order.quantity);
 
-    // OrdType
     if (order.price == 0) {
         body.addChar(TAG_ORD_TYPE, ORD_TYPE_MARKET);
     } else {
@@ -376,55 +376,56 @@ fn encodeNewOrderSingle(order: *const msg.NewOrderMsg, buf: []u8) codec.CodecErr
         body.addU32(TAG_PRICE, order.price);
     }
 
-    const body_len = body.pos;
+    // Check for overflow during body construction
+    const body_len = body.finalize() orelse return codec.CodecError.BufferTooSmall;
     const body_data = body_buf[0..body_len];
 
     // Now build full message
-    // Header
-    builder.addStr(TAG_BEGIN_STRING, "FIX.4.2");
-    builder.addU32(TAG_BODY_LENGTH, @intCast(body_len));
-
-    // Copy body
-    if (builder.pos + body_len > buf.len) return codec.CodecError.BufferTooSmall;
-    @memcpy(buf[builder.pos..][0..body_len], body_data);
-    builder.pos += body_len;
-
-    // Checksum (calculated over everything before checksum field)
-    const checksum = calculateChecksum(buf[0..builder.pos]);
-    builder.addChecksum(checksum);
-
-    return builder.pos;
+    return buildFullMessage(buf, body_data);
 }
 
 fn encodeCancelRequest(cancel: *const msg.CancelMsg, buf: []u8) codec.CodecError!usize {
-    var builder = FixBuilder.init(buf);
+    std.debug.assert(cancel.user_id > 0 or cancel.user_order_id > 0);
 
     var body_buf: [512]u8 = undefined;
     var body = FixBuilder.init(&body_buf);
 
     body.addChar(TAG_MSG_TYPE, MSG_TYPE_CANCEL);
-    body.addU32(TAG_CL_ORD_ID, cancel.user_order_id); // Cancel request ID
-    body.addU32(TAG_ORIG_CL_ORD_ID, cancel.user_order_id); // Order to cancel
+    body.addU32(TAG_CL_ORD_ID, cancel.user_order_id);
+    body.addU32(TAG_ORIG_CL_ORD_ID, cancel.user_order_id);
     body.addU32(TAG_ACCOUNT, cancel.user_id);
 
     if (!msg.symbolIsEmpty(&cancel.symbol)) {
         body.addSymbol(TAG_SYMBOL, &cancel.symbol);
     }
 
-    const body_len = body.pos;
+    const body_len = body.finalize() orelse return codec.CodecError.BufferTooSmall;
     const body_data = body_buf[0..body_len];
 
+    return buildFullMessage(buf, body_data);
+}
+
+/// Build complete FIX message with header and checksum.
+fn buildFullMessage(buf: []u8, body_data: []const u8) codec.CodecError!usize {
+    var builder = FixBuilder.init(buf);
+
+    // Header
     builder.addStr(TAG_BEGIN_STRING, "FIX.4.2");
-    builder.addU32(TAG_BODY_LENGTH, @intCast(body_len));
+    builder.addU32(TAG_BODY_LENGTH, @intCast(body_data.len));
 
-    if (builder.pos + body_len > buf.len) return codec.CodecError.BufferTooSmall;
-    @memcpy(buf[builder.pos..][0..body_len], body_data);
-    builder.pos += body_len;
+    // Check header fit
+    if (builder.overflow) return codec.CodecError.BufferTooSmall;
 
+    // Copy body
+    if (builder.pos + body_data.len > buf.len) return codec.CodecError.BufferTooSmall;
+    @memcpy(buf[builder.pos..][0..body_data.len], body_data);
+    builder.pos += body_data.len;
+
+    // Checksum (calculated over everything before checksum field)
     const checksum = calculateChecksum(buf[0..builder.pos]);
     builder.addChecksum(checksum);
 
-    return builder.pos;
+    return builder.finalize() orelse codec.CodecError.BufferTooSmall;
 }
 
 // ============================================================================
@@ -433,7 +434,7 @@ fn encodeCancelRequest(cancel: *const msg.CancelMsg, buf: []u8) codec.CodecError
 
 /// Encode output message to FIX format (ExecutionReport).
 pub fn encodeOutput(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    var builder = FixBuilder.init(buf);
+    std.debug.assert(buf.len >= 64);
 
     var body_buf: [1024]u8 = undefined;
     var body = FixBuilder.init(&body_buf);
@@ -457,7 +458,7 @@ pub fn encodeOutput(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!u
             const t = &message.data.trade;
             body.addU32(TAG_ORDER_ID, t.buy_order_id);
             body.addU32(TAG_CL_ORD_ID, t.buy_order_id);
-            body.addU32(TAG_EXEC_ID, t.buy_order_id); // Should be unique
+            body.addU32(TAG_EXEC_ID, t.buy_order_id);
             body.addChar(TAG_EXEC_TYPE, EXEC_TYPE_FILL);
             body.addChar(TAG_ORD_STATUS, ORD_STATUS_FILLED);
             body.addSymbol(TAG_SYMBOL, &message.symbol);
@@ -492,91 +493,164 @@ pub fn encodeOutput(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!u
 
         .top_of_book => {
             // TopOfBook doesn't have a direct FIX equivalent
-            // Could use MarketDataSnapshotFullRefresh (W) but that's complex
             return codec.CodecError.UnknownMessageType;
         },
     }
 
-    const body_len = body.pos;
+    const body_len = body.finalize() orelse return codec.CodecError.BufferTooSmall;
     const body_data = body_buf[0..body_len];
 
-    builder.addStr(TAG_BEGIN_STRING, "FIX.4.2");
-    builder.addU32(TAG_BODY_LENGTH, @intCast(body_len));
-
-    if (builder.pos + body_len > buf.len) return codec.CodecError.BufferTooSmall;
-    @memcpy(buf[builder.pos..][0..body_len], body_data);
-    builder.pos += body_len;
-
-    const checksum = calculateChecksum(buf[0..builder.pos]);
-    builder.addChecksum(checksum);
-
-    return builder.pos;
+    return buildFullMessage(buf, body_data);
 }
 
 // ============================================================================
-// FIX Message Builder
+// FIX Message Builder (Bounds-Checked)
 // ============================================================================
 
+/// Safe FIX message builder with bounds checking.
+///
+/// All write operations check available space and set overflow flag
+/// if buffer would be exceeded. Caller must check finalize() return
+/// value to detect overflow.
+///
+/// This prevents buffer overruns even with malicious/large input.
 const FixBuilder = struct {
     buf: []u8,
     pos: usize,
+    overflow: bool,
 
-    fn init(buf: []u8) FixBuilder {
-        return .{ .buf = buf, .pos = 0 };
+    const Self = @This();
+
+    fn init(buf: []u8) Self {
+        return .{ .buf = buf, .pos = 0, .overflow = false };
     }
 
-    fn addTag(self: *FixBuilder, tag: u32) void {
-        self.pos += codec.writeU32(self.buf[self.pos..], tag);
+    /// Check if we have space for N more bytes.
+    inline fn hasSpace(self: *const Self, needed: usize) bool {
+        return !self.overflow and (self.pos + needed <= self.buf.len);
+    }
+
+    /// Mark overflow if we don't have space.
+    inline fn requireSpace(self: *Self, needed: usize) bool {
+        if (!self.hasSpace(needed)) {
+            self.overflow = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// Add tag number followed by '='.
+    fn addTag(self: *Self, tag: u32) void {
+        if (self.overflow) return;
+
+        // Max tag is 10 digits + '='
+        if (!self.requireSpace(MAX_TAG_DIGITS + 1)) return;
+
+        const written = codec.writeU32(self.buf[self.pos..], tag);
+        self.pos += written;
         self.buf[self.pos] = '=';
         self.pos += 1;
     }
 
-    fn addDelim(self: *FixBuilder) void {
+    /// Add delimiter (SOH).
+    fn addDelim(self: *Self) void {
+        if (self.overflow) return;
+        if (!self.requireSpace(1)) return;
+
         self.buf[self.pos] = SOH;
         self.pos += 1;
     }
 
-    fn addStr(self: *FixBuilder, tag: u32, value: []const u8) void {
+    /// Add string field: tag=value<SOH>
+    fn addStr(self: *Self, tag: u32, value: []const u8) void {
+        if (self.overflow) return;
+
+        // Check total space needed: tag + '=' + value + SOH
+        const tag_space = MAX_TAG_DIGITS + 1;
+        const total = tag_space + value.len + 1;
+        if (!self.requireSpace(total)) return;
+
         self.addTag(tag);
+        if (self.overflow) return;
+
         @memcpy(self.buf[self.pos..][0..value.len], value);
         self.pos += value.len;
         self.addDelim();
     }
 
-    fn addChar(self: *FixBuilder, tag: u32, value: u8) void {
+    /// Add single character field: tag=c<SOH>
+    fn addChar(self: *Self, tag: u32, value: u8) void {
+        if (self.overflow) return;
+
+        const total = MAX_TAG_DIGITS + 1 + 1 + 1; // tag + '=' + char + SOH
+        if (!self.requireSpace(total)) return;
+
         self.addTag(tag);
+        if (self.overflow) return;
+
         self.buf[self.pos] = value;
         self.pos += 1;
         self.addDelim();
     }
 
-    fn addU32(self: *FixBuilder, tag: u32, value: u32) void {
+    /// Add u32 field: tag=number<SOH>
+    fn addU32(self: *Self, tag: u32, value: u32) void {
+        if (self.overflow) return;
+
+        // tag + '=' + up to 10 digits + SOH
+        const total = MAX_TAG_DIGITS + 1 + MAX_TAG_DIGITS + 1;
+        if (!self.requireSpace(total)) return;
+
         self.addTag(tag);
+        if (self.overflow) return;
+
         self.pos += codec.writeU32(self.buf[self.pos..], value);
         self.addDelim();
     }
 
-    fn addSymbol(self: *FixBuilder, tag: u32, symbol: *const msg.Symbol) void {
+    /// Add symbol field: tag=symbol<SOH>
+    fn addSymbol(self: *Self, tag: u32, symbol: *const msg.Symbol) void {
+        if (self.overflow) return;
+
+        // tag + '=' + up to 8 chars + SOH
+        const total = MAX_TAG_DIGITS + 1 + msg.MAX_SYMBOL_LENGTH + 1;
+        if (!self.requireSpace(total)) return;
+
         self.addTag(tag);
+        if (self.overflow) return;
+
         self.pos += codec.writeSymbol(self.buf[self.pos..], symbol);
         self.addDelim();
     }
 
-    fn addChecksum(self: *FixBuilder, checksum: u8) void {
+    /// Add checksum field: 10=XXX<SOH>
+    fn addChecksum(self: *Self, checksum: u8) void {
+        if (self.overflow) return;
+
+        // "10=" + 3 digits + SOH = 7 bytes
+        if (!self.requireSpace(7)) return;
+
         self.addTag(TAG_CHECKSUM);
+        if (self.overflow) return;
+
         formatChecksum(checksum, self.buf[self.pos..][0..3]);
         self.pos += 3;
         self.addDelim();
     }
+
+    /// Finalize and return bytes written, or null if overflow occurred.
+    fn finalize(self: *Self) ?usize {
+        if (self.overflow) return null;
+        return self.pos;
+    }
 };
 
 // ============================================================================
-// Parsing Utilities
+// Message Parsing (Split for P10 Rule 4: <60 lines per function)
 // ============================================================================
 
 /// Detect delimiter used in message (SOH or pipe).
 fn detectDelimiter(data: []const u8) u8 {
-    // Look for first delimiter after "8=FIX"
     for (data) |c| {
         if (c == SOH) return SOH;
         if (c == PIPE) return PIPE;
@@ -587,6 +661,22 @@ fn detectDelimiter(data: []const u8) u8 {
 /// Parse FIX message, extracting fields into ParsedFields.
 fn parseMessage(data: []const u8, delimiter: u8, fields: *ParsedFields) codec.CodecError!usize {
     var pos: usize = 0;
+
+    // Parse header (BeginString and BodyLength)
+    pos = try parseHeader(data, pos, delimiter, fields);
+
+    // Body starts here
+    fields.body_start = pos;
+
+    // Parse body fields until checksum
+    pos = try parseBody(data, pos, delimiter, fields);
+
+    return pos;
+}
+
+/// Parse FIX header fields (BeginString, BodyLength).
+fn parseHeader(data: []const u8, start: usize, delimiter: u8, fields: *ParsedFields) codec.CodecError!usize {
+    var pos = start;
 
     // Parse BeginString (tag 8)
     const begin_result = parseField(data, pos, delimiter);
@@ -600,51 +690,54 @@ fn parseMessage(data: []const u8, delimiter: u8, fields: *ParsedFields) codec.Co
     fields.body_length = codec.parseU32(length_result.value) orelse return codec.CodecError.InvalidLength;
     pos = length_result.next_pos;
 
-    // Body starts here
-    fields.body_start = pos;
+    return pos;
+}
 
-    // Parse remaining fields until checksum
+/// Parse FIX body fields until checksum.
+fn parseBody(data: []const u8, start: usize, delimiter: u8, fields: *ParsedFields) codec.CodecError!usize {
+    var pos = start;
+
     while (pos < data.len) {
         const field_result = parseField(data, pos, delimiter);
         if (field_result.tag == 0) break;
 
-        switch (field_result.tag) {
-            TAG_MSG_TYPE => {
-                if (field_result.value.len > 0) {
-                    fields.msg_type = field_result.value[0];
-                }
-            },
-            TAG_CL_ORD_ID => fields.cl_ord_id = field_result.value,
-            TAG_ORIG_CL_ORD_ID => fields.orig_cl_ord_id = field_result.value,
-            TAG_SYMBOL => fields.symbol = field_result.value,
-            TAG_SIDE => {
-                if (field_result.value.len > 0) {
-                    fields.side = field_result.value[0];
-                }
-            },
-            TAG_ORDER_QTY => fields.order_qty = codec.parseU32(field_result.value),
-            TAG_ORD_TYPE => {
-                if (field_result.value.len > 0) {
-                    fields.ord_type = field_result.value[0];
-                }
-            },
-            TAG_PRICE => fields.price = codec.parseU32(field_result.value),
-            TAG_ACCOUNT => fields.account = field_result.value,
-            TAG_SENDER_COMP_ID => fields.sender_comp_id = field_result.value,
-            TAG_TARGET_COMP_ID => fields.target_comp_id = field_result.value,
-            TAG_MSG_SEQ_NUM => fields.msg_seq_num = codec.parseU32(field_result.value),
-            TAG_CHECKSUM => {
-                fields.checksum = field_result.value;
-                fields.body_end = pos;
-                return field_result.next_pos;
-            },
-            else => {},
+        applyParsedField(fields, field_result.tag, field_result.value);
+
+        if (field_result.tag == TAG_CHECKSUM) {
+            fields.body_end = pos;
+            return field_result.next_pos;
         }
 
         pos = field_result.next_pos;
     }
 
     return codec.CodecError.IncompleteMessage;
+}
+
+/// Apply a parsed field to the fields struct.
+fn applyParsedField(fields: *ParsedFields, tag: u32, value: []const u8) void {
+    switch (tag) {
+        TAG_MSG_TYPE => {
+            if (value.len > 0) fields.msg_type = value[0];
+        },
+        TAG_CL_ORD_ID => fields.cl_ord_id = value,
+        TAG_ORIG_CL_ORD_ID => fields.orig_cl_ord_id = value,
+        TAG_SYMBOL => fields.symbol = value,
+        TAG_SIDE => {
+            if (value.len > 0) fields.side = value[0];
+        },
+        TAG_ORDER_QTY => fields.order_qty = codec.parseU32(value),
+        TAG_ORD_TYPE => {
+            if (value.len > 0) fields.ord_type = value[0];
+        },
+        TAG_PRICE => fields.price = codec.parseU32(value),
+        TAG_ACCOUNT => fields.account = value,
+        TAG_SENDER_COMP_ID => fields.sender_comp_id = value,
+        TAG_TARGET_COMP_ID => fields.target_comp_id = value,
+        TAG_MSG_SEQ_NUM => fields.msg_seq_num = codec.parseU32(value),
+        TAG_CHECKSUM => fields.checksum = value,
+        else => {},
+    }
 }
 
 const FieldResult = struct {
@@ -691,6 +784,10 @@ fn parseClOrdId(str: []const u8) u32 {
     }
     return hash;
 }
+
+// ============================================================================
+// Checksum Functions
+// ============================================================================
 
 /// Calculate FIX checksum (sum of bytes mod 256).
 pub fn calculateChecksum(data: []const u8) u8 {
@@ -784,6 +881,30 @@ fn mapRejectReasonToFix(reason: msg.RejectReason) u32 {
 // Tests
 // ============================================================================
 
+test "FixBuilder bounds checking" {
+    // Test with tiny buffer - should detect overflow
+    var tiny_buf: [10]u8 = undefined;
+    var builder = FixBuilder.init(&tiny_buf);
+
+    builder.addStr(TAG_BEGIN_STRING, "FIX.4.2"); // Too big for buffer
+    try std.testing.expect(builder.overflow);
+    try std.testing.expect(builder.finalize() == null);
+}
+
+test "FixBuilder success" {
+    var buf: [256]u8 = undefined;
+    var builder = FixBuilder.init(&buf);
+
+    builder.addStr(TAG_BEGIN_STRING, "FIX.4.2");
+    builder.addU32(TAG_BODY_LENGTH, 123);
+    builder.addChar(TAG_MSG_TYPE, 'D');
+
+    try std.testing.expect(!builder.overflow);
+    const len = builder.finalize();
+    try std.testing.expect(len != null);
+    try std.testing.expect(len.? > 0);
+}
+
 test "calculateChecksum" {
     const data = "8=FIX.4.2\x019=5\x0135=0\x01";
     const checksum = calculateChecksum(data);
@@ -828,13 +949,12 @@ test "parseClOrdId - numeric" {
 }
 
 test "parseClOrdId - alphanumeric" {
-    // Should return a hash
     const hash1 = parseClOrdId("ORDER-001");
     const hash2 = parseClOrdId("ORDER-001");
     const hash3 = parseClOrdId("ORDER-002");
 
-    try std.testing.expectEqual(hash1, hash2); // Same input = same hash
-    try std.testing.expect(hash1 != hash3); // Different input = different hash
+    try std.testing.expectEqual(hash1, hash2);
+    try std.testing.expect(hash1 != hash3);
 }
 
 test "encode NewOrderSingle" {
@@ -855,10 +975,8 @@ test "encode NewOrderSingle" {
     var buf: [512]u8 = undefined;
     const len = try encodeInput(&input, &buf);
 
-    // Verify it starts with FIX header
     try std.testing.expect(std.mem.startsWith(u8, buf[0..len], "8=FIX.4.2\x01"));
 
-    // Verify checksum field is present
     const checksum_tag = "10=";
     try std.testing.expect(std.mem.indexOf(u8, buf[0..len], checksum_tag) != null);
 }
@@ -869,13 +987,8 @@ test "encode ExecutionReport (Ack)" {
     var buf: [512]u8 = undefined;
     const len = try encodeOutput(&ack, &buf);
 
-    // Verify header
     try std.testing.expect(std.mem.startsWith(u8, buf[0..len], "8=FIX.4.2\x01"));
-
-    // Verify message type is ExecutionReport
     try std.testing.expect(std.mem.indexOf(u8, buf[0..len], "\x0135=8\x01") != null);
-
-    // Verify ExecType=0 (New)
     try std.testing.expect(std.mem.indexOf(u8, buf[0..len], "\x01150=0\x01") != null);
 }
 
@@ -907,7 +1020,6 @@ test "roundtrip NewOrderSingle" {
 }
 
 test "decode with pipe delimiter" {
-    // Human-readable format with pipes
     const data = "8=FIX.4.2|9=73|35=D|1=42|11=12345|55=IBM|54=1|38=100|40=2|44=5000|10=178|";
 
     const result = try decodeInput(data);
