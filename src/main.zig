@@ -290,7 +290,7 @@ fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config, verbose: bool) 
     }
 
     // Print statistics before stopping
-    printThreadedStats(&server);
+    printThreadedStats(server);
     server.stop();
 }
 

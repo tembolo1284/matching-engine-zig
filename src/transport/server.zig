@@ -13,8 +13,12 @@ const MatchingEngine = @import("../core/matching_engine.zig").MatchingEngine;
 const OutputBuffer = @import("../core/order_book.zig").OutputBuffer;
 const tcp_server = @import("tcp_server.zig");
 const TcpServer = tcp_server.TcpServer;
-const UdpServer = @import("udp_server.zig").UdpServer;
-const MulticastPublisher = @import("multicast.zig").MulticastPublisher;
+const udp = @import("udp_server.zig");
+const UdpServer = udp.UdpServer;
+const UdpServerStats = udp.UdpServerStats;
+const multicast = @import("multicast.zig");
+const MulticastPublisher = multicast.MulticastPublisher;
+const PublisherStats = multicast.PublisherStats;
 const config = @import("config.zig");
 
 /// Single-threaded server for testing and simple deployments.
@@ -187,7 +191,7 @@ pub const Server = struct {
         messages_processed: u64,
         encode_errors: u64,
         tcp_stats: tcp_server.ServerStats,
-        udp_stats: UdpServer.UdpServerStats,
-        multicast_stats: MulticastPublisher.PublisherStats,
+        udp_stats: UdpServerStats,
+        multicast_stats: PublisherStats,
     };
 };
