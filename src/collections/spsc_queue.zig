@@ -38,6 +38,11 @@
 //! - Safe for exactly ONE producer and ONE consumer
 //! - Multiple producers or consumers will cause data races
 //! - Use separate queues for multi-producer/multi-consumer
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: All loops bounded by capacity
+//! - Rule 5: Assertions validate invariants
+//! - Rule 9: Unsafe pointer access clearly marked
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -53,6 +58,10 @@ pub const CACHE_LINE_SIZE: usize = 64;
 /// Whether to track statistics (adds ~5-10ns overhead per operation).
 /// Disabled in ReleaseFast for maximum performance.
 pub const TRACK_STATS: bool = builtin.mode != .ReleaseFast;
+
+/// Warning threshold for item size relative to cache line.
+/// Items larger than this may cause cache thrashing.
+const LARGE_ITEM_THRESHOLD: usize = CACHE_LINE_SIZE * 2;
 
 // ============================================================================
 // Statistics
@@ -119,6 +128,10 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         }
         if (capacity > 1 << 30) {
             @compileError("SpscQueue capacity too large (max 2^30)");
+        }
+        // Warn about large items (compile-time note via assert message)
+        if (@sizeOf(T) > LARGE_ITEM_THRESHOLD) {
+            @compileLog("SpscQueue: Item size exceeds 2 cache lines, consider using pointers");
         }
     }
 
@@ -227,6 +240,10 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             const tail = self.tail.value.load(.monotonic);
             const next_tail = (tail +% 1) & MASK;
 
+            // P10 Rule 5: Verify index is in bounds
+            std.debug.assert(tail < capacity);
+            std.debug.assert(next_tail < capacity);
+
             // Check if full: next_tail would collide with head
             // Acquire ensures we see consumer's latest head update
             const head = self.head.value.load(.acquire);
@@ -260,6 +277,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
                 // Prefetch next write location
                 const tail = self.tail.value.load(.monotonic);
                 const next = (tail +% 1) & MASK;
+                std.debug.assert(next < capacity);
                 @prefetch(&self.buffer[next], .{ .locality = 3, .cache = .data });
             }
             return result;
@@ -274,6 +292,9 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         /// items are counted in `pushed`. If zero items fit, `push_failures` is
         /// incremented by 1 (not by `items.len`).
         pub fn pushBatch(self: *Self, items: []const T) usize {
+            // P10 Rule 5: Validate input
+            std.debug.assert(items.len <= USABLE_CAPACITY);
+
             const tail = self.tail.value.load(.monotonic);
             const head = self.head.value.load(.acquire);
 
@@ -291,6 +312,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             // Copy items to buffer
             var pos = tail;
             for (items[0..to_push]) |item| {
+                std.debug.assert(pos < capacity);
                 self.buffer[pos] = item;
                 pos = (pos +% 1) & MASK;
             }
@@ -320,6 +342,9 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         pub fn pop(self: *Self) ?T {
             const head = self.head.value.load(.monotonic);
 
+            // P10 Rule 5: Verify index is in bounds
+            std.debug.assert(head < capacity);
+
             // Check if empty: head equals tail
             // Acquire ensures we see producer's item write
             const tail = self.tail.value.load(.acquire);
@@ -335,7 +360,9 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
 
             // Advance head
             // Release ensures our read completes before head update
-            self.head.value.store((head +% 1) & MASK, .release);
+            const next_head = (head +% 1) & MASK;
+            std.debug.assert(next_head < capacity);
+            self.head.value.store(next_head, .release);
 
             if (TRACK_STATS) {
                 _ = self.stats.popped.fetchAdd(1, .monotonic);
@@ -344,11 +371,27 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             return item;
         }
 
-        /// Peek at front item without removing.
+        /// Peek at front item and return a copy (safe version).
+        ///
+        /// Returns null if empty.
+        /// Returns a copy of the item, safe to use after pop().
+        pub fn peek(self: *Self) ?T {
+            const head = self.head.value.load(.monotonic);
+            const tail = self.tail.value.load(.acquire);
+
+            if (head == tail) {
+                return null;
+            }
+
+            std.debug.assert(head < capacity);
+            return self.buffer[head];
+        }
+
+        /// Peek at front item without removing (returns pointer).
         ///
         /// Returns null if empty.
         ///
-        /// **WARNING: Pointer lifetime is limited!**
+        /// **WARNING: UNSAFE - Pointer lifetime is limited!**
         /// The returned pointer points directly into the ring buffer.
         /// It is only valid until the next call to `pop()`, `popBatch()`,
         /// or `drain()`. After popping, the producer may overwrite the slot
@@ -356,7 +399,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         ///
         /// Safe usage:
         /// ```zig
-        /// if (queue.peek()) |item| {
+        /// if (queue.peekPtr()) |item| {
         ///     // Use item immediately
         ///     process(item.*);
         /// }
@@ -365,11 +408,14 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         ///
         /// Unsafe usage:
         /// ```zig
-        /// const ptr = queue.peek().?;  // Get pointer
-        /// _ = queue.pop();              // Slot now available to producer
-        /// use(ptr.*);                   // DANGER: may be overwritten!
+        /// const ptr = queue.peekPtr().?;  // Get pointer
+        /// _ = queue.pop();                 // Slot now available to producer
+        /// use(ptr.*);                      // DANGER: may be overwritten!
         /// ```
-        pub fn peek(self: *Self) ?*const T {
+        ///
+        /// Prefer `peek()` which returns a safe copy unless you need to avoid
+        /// copying large items and understand the lifetime constraints.
+        pub fn peekPtr(self: *Self) ?*const T {
             const head = self.head.value.load(.monotonic);
             const tail = self.tail.value.load(.acquire);
 
@@ -377,6 +423,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
                 return null;
             }
 
+            std.debug.assert(head < capacity);
             return &self.buffer[head];
         }
 
@@ -388,6 +435,9 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         /// Statistics note: If queue is empty, `pop_failures` is incremented
         /// by 1 (not by `out.len`).
         pub fn popBatch(self: *Self, out: []T) usize {
+            // P10 Rule 5: Validate output buffer
+            std.debug.assert(out.len > 0);
+
             const head = self.head.value.load(.monotonic);
             const tail = self.tail.value.load(.acquire);
 
@@ -405,6 +455,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             // Copy items from buffer
             var pos = head;
             for (out[0..to_pop]) |*slot| {
+                std.debug.assert(pos < capacity);
                 slot.* = self.buffer[pos];
                 pos = (pos +% 1) & MASK;
             }
@@ -427,6 +478,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             var count: usize = 0;
             const max_drain = USABLE_CAPACITY;
 
+            // P10 Rule 2: Loop bounded by max_drain
             while (count < max_drain) {
                 if (self.pop()) |item| {
                     handler(item);
@@ -448,6 +500,7 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             var count: usize = 0;
             const max_drain = USABLE_CAPACITY;
 
+            // P10 Rule 2: Loop bounded by max_drain
             while (count < max_drain) {
                 if (self.pop()) |item| {
                     handler(ctx, item);
@@ -536,7 +589,11 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             const current = self.size();
             var high = self.stats.high_water_mark.load(.monotonic);
 
-            while (current > high) {
+            // P10 Rule 2: CAS loop bounded by practical limit
+            var attempts: usize = 0;
+            const max_attempts: usize = 10;
+
+            while (current > high and attempts < max_attempts) : (attempts += 1) {
                 const result = self.stats.high_water_mark.cmpxchgWeak(
                     high,
                     current,
@@ -664,7 +721,7 @@ test "SpscQueue - batch operations" {
     try std.testing.expectEqualSlices(u32, &items, out[0..5]);
 }
 
-test "SpscQueue - peek" {
+test "SpscQueue - peek (safe copy)" {
     var queue = SpscQueue(u32, 16).init();
 
     try std.testing.expect(queue.peek() == null);
@@ -672,6 +729,24 @@ test "SpscQueue - peek" {
     _ = queue.push(42);
 
     const peeked = queue.peek();
+    try std.testing.expect(peeked != null);
+    try std.testing.expectEqual(@as(u32, 42), peeked.?);
+
+    // Peek doesn't consume
+    try std.testing.expectEqual(@as(usize, 1), queue.size());
+
+    // Pop returns same value
+    try std.testing.expectEqual(@as(?u32, 42), queue.pop());
+}
+
+test "SpscQueue - peekPtr (unsafe pointer)" {
+    var queue = SpscQueue(u32, 16).init();
+
+    try std.testing.expect(queue.peekPtr() == null);
+
+    _ = queue.push(42);
+
+    const peeked = queue.peekPtr();
     try std.testing.expect(peeked != null);
     try std.testing.expectEqual(@as(u32, 42), peeked.?.*);
 

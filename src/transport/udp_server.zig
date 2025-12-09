@@ -10,6 +10,11 @@
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Use from I/O thread only.
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: All loops bounded by HASH_TABLE_SIZE or MAX_SENDMMSG_BATCH
+//! - Rule 5: Assertions validate critical invariants
+//! - Rule 9: BatchSender pointer lifetime documented and asserted
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,11 +51,18 @@ const SOCKET_SEND_BUF_SIZE: u32 = 4 * 1024 * 1024;
 /// Maximum packets to batch in sendmmsg (Linux only).
 const MAX_SENDMMSG_BATCH: usize = 64;
 
+/// Maximum packets to process per poll() call.
+/// Prevents starvation of other work.
+const MAX_PACKETS_PER_POLL: usize = 1000;
+
 // Compile-time validation
 comptime {
     std.debug.assert(MAX_UDP_CLIENTS > 0);
     std.debug.assert((MAX_UDP_CLIENTS & (MAX_UDP_CLIENTS - 1)) == 0); // Power of 2
     std.debug.assert(HASH_TABLE_SIZE >= MAX_UDP_CLIENTS);
+    std.debug.assert((HASH_TABLE_SIZE & (HASH_TABLE_SIZE - 1)) == 0); // Power of 2
+    std.debug.assert(MAX_SENDMMSG_BATCH > 0 and MAX_SENDMMSG_BATCH <= 256);
+    std.debug.assert(MAX_PACKETS_PER_POLL > 0);
 }
 
 // ============================================================================
@@ -78,6 +90,13 @@ const UdpClientEntry = struct {
 
 /// Hash map for UDP client address → client ID mapping.
 /// Uses open addressing with linear probing for cache-friendly lookups.
+///
+/// Performance:
+/// - getOrCreate(): O(1) average, O(n) worst case
+/// - findAddr(): O(n) - called on send, but table is small
+/// - evictOldest(): O(n) - called rarely when table full
+///
+/// P10 Note: All loops bounded by HASH_TABLE_SIZE.
 const UdpClientMap = struct {
     /// Client entries (hash table with open addressing).
     entries: [HASH_TABLE_SIZE]UdpClientEntry = undefined,
@@ -100,8 +119,8 @@ const UdpClientMap = struct {
     }
 
     /// Hash function for UDP address.
+    /// Uses FNV-1a inspired mixing for good distribution.
     fn hashAddr(addr: config.UdpClientAddr) u32 {
-        // FNV-1a inspired hash combining addr and port
         var h: u32 = 2166136261;
         h ^= addr.addr;
         h *%= 16777619;
@@ -112,14 +131,17 @@ const UdpClientMap = struct {
 
     /// Find slot for address (existing or empty).
     /// Returns index and whether it's an existing entry.
+    ///
+    /// P10 Rule 2: Loop bounded by HASH_TABLE_SIZE.
     fn findSlot(self: *Self, addr: config.UdpClientAddr) struct { idx: u32, exists: bool } {
         const hash = hashAddr(addr);
         var idx = hash & (HASH_TABLE_SIZE - 1);
         var first_empty: ?u32 = null;
 
-        // Linear probing
+        // P10 Rule 2: Linear probing bounded by table size
         var probes: u32 = 0;
         while (probes < HASH_TABLE_SIZE) : (probes += 1) {
+            std.debug.assert(idx < HASH_TABLE_SIZE);
             const entry = &self.entries[idx];
 
             if (entry.active) {
@@ -149,6 +171,7 @@ const UdpClientMap = struct {
 
         if (slot.exists) {
             // Update last seen
+            std.debug.assert(slot.idx < HASH_TABLE_SIZE);
             self.entries[slot.idx].last_seen = now;
             return self.entries[slot.idx].client_id;
         }
@@ -160,6 +183,7 @@ const UdpClientMap = struct {
         }
 
         // Insert new entry
+        std.debug.assert(slot.idx < HASH_TABLE_SIZE);
         const entry = &self.entries[slot.idx];
         entry.* = .{
             .addr = addr,
@@ -170,24 +194,35 @@ const UdpClientMap = struct {
         };
         self.count += 1;
 
+        std.debug.assert(self.count <= MAX_UDP_CLIENTS);
+        std.debug.assert(config.isUdpClient(entry.client_id));
+
         return entry.client_id;
     }
 
     /// Evict oldest (LRU) entry.
+    ///
+    /// P10 Rule 2: Loop bounded by HASH_TABLE_SIZE.
+    /// Called rarely - only when table is full.
     fn evictOldest(self: *Self) void {
         var oldest_idx: u32 = 0;
         var oldest_time: i64 = std.math.maxInt(i64);
+        var found_any = false;
 
+        // P10 Rule 2: Bounded by HASH_TABLE_SIZE
         for (self.entries, 0..) |entry, i| {
             if (entry.active and entry.last_seen < oldest_time) {
                 oldest_time = entry.last_seen;
                 oldest_idx = @intCast(i);
+                found_any = true;
             }
         }
 
-        if (self.entries[oldest_idx].active) {
+        if (found_any and self.entries[oldest_idx].active) {
             self.entries[oldest_idx].active = false;
-            self.count -= 1;
+            if (self.count > 0) {
+                self.count -= 1;
+            }
 
             // Note: With open addressing, we'd normally use tombstones.
             // For simplicity, we accept that this may require rehashing.
@@ -195,8 +230,14 @@ const UdpClientMap = struct {
         }
     }
 
-    /// Find entry by client ID. O(n) but rarely called (only for send).
+    /// Find entry by client ID.
+    ///
+    /// P10 Rule 2: O(n) scan bounded by HASH_TABLE_SIZE.
+    /// Called on send operations.
     fn findByClientId(self: *Self, client_id: config.ClientId) ?*UdpClientEntry {
+        std.debug.assert(config.isUdpClient(client_id));
+
+        // P10 Rule 2: Bounded by HASH_TABLE_SIZE
         for (&self.entries) |*entry| {
             if (entry.active and entry.client_id == client_id) {
                 return entry;
@@ -206,7 +247,12 @@ const UdpClientMap = struct {
     }
 
     /// Find address by client ID.
+    ///
+    /// P10 Rule 2: O(n) scan bounded by HASH_TABLE_SIZE.
     fn findAddr(self: *const Self, client_id: config.ClientId) ?config.UdpClientAddr {
+        std.debug.assert(config.isUdpClient(client_id));
+
+        // P10 Rule 2: Bounded by HASH_TABLE_SIZE
         for (self.entries) |entry| {
             if (entry.active and entry.client_id == client_id) {
                 return entry.addr;
@@ -216,7 +262,10 @@ const UdpClientMap = struct {
     }
 
     /// Get protocol for client ID.
+    ///
+    /// P10 Rule 2: O(n) scan bounded by HASH_TABLE_SIZE.
     fn getProtocol(self: *const Self, client_id: config.ClientId) Protocol {
+        // P10 Rule 2: Bounded by HASH_TABLE_SIZE
         for (self.entries) |entry| {
             if (entry.active and entry.client_id == client_id) {
                 return entry.protocol;
@@ -229,6 +278,7 @@ const UdpClientMap = struct {
     fn setProtocolForAddr(self: *Self, addr: config.UdpClientAddr, protocol: Protocol) void {
         const slot = self.findSlot(addr);
         if (slot.exists) {
+            std.debug.assert(slot.idx < HASH_TABLE_SIZE);
             const entry = &self.entries[slot.idx];
             // Only set if unknown (first packet determines protocol)
             if (entry.protocol == .unknown) {
@@ -243,8 +293,41 @@ const UdpClientMap = struct {
         if (self.next_id < config.CLIENT_ID_UDP_BASE) {
             self.next_id = config.CLIENT_ID_UDP_BASE + 1;
         }
+
+        std.debug.assert(config.isUdpClient(id));
         return id;
     }
+
+    /// Get statistics about the hash table.
+    fn getTableStats(self: *const Self) TableStats {
+        var active: u32 = 0;
+        var max_probe_len: u32 = 0;
+        var current_probe: u32 = 0;
+
+        for (self.entries) |entry| {
+            if (entry.active) {
+                active += 1;
+                current_probe += 1;
+            } else {
+                if (current_probe > max_probe_len) {
+                    max_probe_len = current_probe;
+                }
+                current_probe = 0;
+            }
+        }
+
+        return .{
+            .active_entries = active,
+            .max_probe_length = max_probe_len,
+            .load_factor_percent = @intCast((active * 100) / HASH_TABLE_SIZE),
+        };
+    }
+
+    const TableStats = struct {
+        active_entries: u32,
+        max_probe_length: u32,
+        load_factor_percent: u8,
+    };
 };
 
 // ============================================================================
@@ -314,6 +397,7 @@ pub const UdpServer = struct {
     /// Start listening on address:port.
     pub fn start(self: *Self, address: []const u8, port: u16) !void {
         std.debug.assert(self.fd == null);
+        std.debug.assert(port > 0);
 
         // Create UDP socket
         const fd = try posix.socket(
@@ -357,11 +441,14 @@ pub const UdpServer = struct {
     }
 
     /// Poll for incoming packets (non-blocking).
+    ///
+    /// P10 Rule 2: Loop bounded by MAX_PACKETS_PER_POLL.
     pub fn poll(self: *Self) !usize {
         const fd = self.fd orelse return 0;
         var count: usize = 0;
 
-        while (true) {
+        // P10 Rule 2: Bounded by MAX_PACKETS_PER_POLL
+        while (count < MAX_PACKETS_PER_POLL) : (count += 1) {
             self.last_recv_len = @sizeOf(@TypeOf(self.last_recv_addr));
 
             const n = posix.recvfrom(
@@ -379,7 +466,6 @@ pub const UdpServer = struct {
 
             self.packets_received += 1;
             self.bytes_received += n;
-            count += 1;
 
             // Get client ID (O(1) hash lookup)
             const client_addr = config.UdpClientAddr{
@@ -387,6 +473,8 @@ pub const UdpServer = struct {
                 .port = self.last_recv_addr.port,
             };
             const client_id = self.clients.getOrCreate(client_addr);
+
+            std.debug.assert(config.isUdpClient(client_id));
 
             // Process packet (also detects and stores protocol)
             self.processPacket(self.recv_buf[0..n], client_id, client_addr);
@@ -403,6 +491,8 @@ pub const UdpServer = struct {
     /// Send to client by ID.
     pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
         std.debug.assert(config.isUdpClient(client_id));
+        std.debug.assert(data.len > 0);
+        std.debug.assert(data.len <= RECV_BUFFER_SIZE);
 
         const addr = self.clients.findAddr(client_id) orelse {
             self.send_errors += 1;
@@ -414,6 +504,9 @@ pub const UdpServer = struct {
 
     /// Send to last received address (fastest path).
     pub fn sendToLast(self: *Self, data: []const u8) bool {
+        std.debug.assert(data.len > 0);
+        std.debug.assert(data.len <= RECV_BUFFER_SIZE);
+
         if (self.last_recv_len == 0) return false;
 
         const fd = self.fd orelse return false;
@@ -436,6 +529,8 @@ pub const UdpServer = struct {
 
     /// Send to specific address.
     pub fn sendToAddr(self: *Self, addr: config.UdpClientAddr, data: []const u8) bool {
+        std.debug.assert(data.len > 0);
+
         const fd = self.fd orelse return false;
 
         var sock_addr = posix.sockaddr.in{
@@ -466,6 +561,9 @@ pub const UdpServer = struct {
     }
 
     fn processPacket(self: *Self, data: []const u8, client_id: config.ClientId, client_addr: config.UdpClientAddr) void {
+        std.debug.assert(data.len > 0);
+        std.debug.assert(config.isUdpClient(client_id));
+
         // Detect protocol from raw data BEFORE decoding using codec's detection
         const codec_protocol = codec.detectProtocol(data);
         const detected_protocol: Protocol = switch (codec_protocol) {
@@ -512,6 +610,17 @@ pub const UdpServer = struct {
 ///
 /// SAFETY: Data pointers passed to add() MUST remain valid until flush() is called.
 /// The batch sender stores raw pointers and does NOT copy data.
+///
+/// Usage pattern:
+/// ```zig
+/// var batch = BatchSender.init(&server);
+/// defer batch.flush();  // Ensure flush even on error
+///
+/// // All data buffers must outlive the batch
+/// batch.add(client1, data1);
+/// batch.add(client2, data2);
+/// batch.flush();
+/// ```
 pub const BatchSender = struct {
     server: *UdpServer,
 
@@ -520,14 +629,20 @@ pub const BatchSender = struct {
     iovecs: [MAX_SENDMMSG_BATCH]std.posix.iovec_const,
     count: usize,
 
+    /// Track if we're in a valid batch state (debug only).
+    in_batch: bool,
+
     const Self = @This();
 
     pub fn init(server: *UdpServer) Self {
+        std.debug.assert(server.fd != null);
+
         return .{
             .server = server,
             .addrs = undefined,
             .iovecs = undefined,
             .count = 0,
+            .in_batch = true,
         };
     }
 
@@ -536,11 +651,17 @@ pub const BatchSender = struct {
     /// SAFETY: `data` must remain valid and unchanged until flush() is called.
     /// The batch sender stores a raw pointer to data, not a copy.
     pub fn add(self: *Self, client_id: config.ClientId, data: []const u8) void {
+        std.debug.assert(self.in_batch);
+        std.debug.assert(config.isUdpClient(client_id));
+        std.debug.assert(data.len > 0);
+
         const addr = self.server.clients.findAddr(client_id) orelse return;
 
         if (self.count >= MAX_SENDMMSG_BATCH) {
             self.flush();
         }
+
+        std.debug.assert(self.count < MAX_SENDMMSG_BATCH);
 
         self.addrs[self.count] = .{
             .family = posix.AF.INET,
@@ -556,9 +677,14 @@ pub const BatchSender = struct {
 
     /// Flush all pending packets.
     pub fn flush(self: *Self) void {
+        std.debug.assert(self.in_batch);
+
         if (self.count == 0) return;
 
-        const fd = self.server.fd orelse return;
+        const fd = self.server.fd orelse {
+            self.count = 0;
+            return;
+        };
 
         if (is_linux) {
             self.flushLinux(fd);
@@ -569,7 +695,16 @@ pub const BatchSender = struct {
         self.count = 0;
     }
 
+    /// Mark batch as finished (debug validation).
+    pub fn finish(self: *Self) void {
+        self.flush();
+        self.in_batch = false;
+    }
+
     fn flushLinux(self: *Self, fd: posix.fd_t) void {
+        std.debug.assert(self.count > 0);
+        std.debug.assert(self.count <= MAX_SENDMMSG_BATCH);
+
         // Build mmsghdr array
         var msghdrs: [MAX_SENDMMSG_BATCH]std.os.linux.mmsghdr_const = undefined;
 
@@ -606,6 +741,9 @@ pub const BatchSender = struct {
     }
 
     fn flushFallback(self: *Self, fd: posix.fd_t) void {
+        std.debug.assert(self.count > 0);
+
+        // P10 Rule 2: Bounded by self.count which is <= MAX_SENDMMSG_BATCH
         for (0..self.count) |i| {
             const sent = posix.sendto(
                 fd,
@@ -706,4 +844,28 @@ test "UdpClientMap hash distribution" {
     try std.testing.expect(h1 != h2);
     try std.testing.expect(h1 != h3);
     try std.testing.expect(h2 != h3);
+}
+
+test "UdpClientMap table stats" {
+    var map = UdpClientMap.init();
+
+    // Empty table
+    var stats = map.getTableStats();
+    try std.testing.expectEqual(@as(u32, 0), stats.active_entries);
+    try std.testing.expectEqual(@as(u8, 0), stats.load_factor_percent);
+
+    // Add some entries
+    for (0..100) |i| {
+        const addr = config.UdpClientAddr.init(@intCast(i), @intCast(i));
+        _ = map.getOrCreate(addr);
+    }
+
+    stats = map.getTableStats();
+    try std.testing.expectEqual(@as(u32, 100), stats.active_entries);
+    try std.testing.expect(stats.load_factor_percent > 0);
+}
+
+test "MAX_PACKETS_PER_POLL is bounded" {
+    try std.testing.expect(MAX_PACKETS_PER_POLL > 0);
+    try std.testing.expect(MAX_PACKETS_PER_POLL <= 10000);
 }

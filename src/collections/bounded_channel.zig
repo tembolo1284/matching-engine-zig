@@ -26,6 +26,10 @@
 //!   non-blocking `send()`/`tryRecv()` or bounded-spin variants.
 //! - Spin-based operations burn CPU but avoid syscall overhead.
 //!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: All loops have iteration bounds as safety nets
+//! - Rule 5: Assertions validate function preconditions
+//!
 //! Example:
 //! ```zig
 //! const Channel = BoundedChannel(Message, 1024);
@@ -61,6 +65,11 @@ pub const MIN_SLEEP_NS: u64 = 1_000; // 1μs
 
 /// Maximum sleep duration (nanoseconds).
 pub const MAX_SLEEP_NS: u64 = 1_000_000; // 1ms
+
+/// Maximum iterations for timeout loops (safety bound).
+/// Prevents infinite loops if system clock jumps backward.
+/// At 1μs minimum sleep, 10M iterations = ~10 seconds worst case.
+pub const MAX_TIMEOUT_ITERATIONS: usize = 10_000_000;
 
 // ============================================================================
 // Receive Result
@@ -169,6 +178,9 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         /// Send multiple messages (batch).
         /// Returns number of messages sent.
         pub fn sendBatch(self: *Self, messages: []const T) usize {
+            // P10 Rule 5: Validate input
+            std.debug.assert(messages.len <= CAPACITY);
+
             if (self.isClosed()) return 0;
             return self.queue.pushBatch(messages);
         }
@@ -181,8 +193,12 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         /// CPU cost: Burns CPU during spin. Use when latency matters more than
         /// throughput, and when you expect the queue to drain quickly.
         pub fn sendSpin(self: *Self, message: T, max_spins: u32) bool {
+            // P10 Rule 5: Validate spin bound is reasonable
+            std.debug.assert(max_spins <= 1_000_000);
+
             var spins: u32 = 0;
 
+            // P10 Rule 2: Loop bounded by max_spins
             while (spins < max_spins) : (spins += 1) {
                 if (self.isClosed()) return false;
 
@@ -203,14 +219,23 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         ///
         /// Performance note: Uses `nanoTimestamp()` which is a syscall on Linux.
         /// For tighter latency bounds, use `sendSpin()` with a fixed iteration count.
+        ///
+        /// Safety: Has iteration bound to prevent infinite loops if system clock
+        /// jumps backward.
         pub fn sendBackoff(self: *Self, message: T, timeout_ns: u64) bool {
+            // P10 Rule 5: Validate timeout is reasonable
+            std.debug.assert(timeout_ns > 0);
+            std.debug.assert(timeout_ns <= 60_000_000_000); // Max 60 seconds
+
             const deadline = std.time.nanoTimestamp() + @as(i128, timeout_ns);
 
             var sleep_ns: u64 = MIN_SLEEP_NS;
             var spins: u32 = 0;
             var yields: u32 = 0;
+            var iterations: usize = 0;
 
-            while (std.time.nanoTimestamp() < deadline) {
+            // P10 Rule 2: Loop bounded by both time AND iteration count
+            while (std.time.nanoTimestamp() < deadline and iterations < MAX_TIMEOUT_ITERATIONS) : (iterations += 1) {
                 if (self.isClosed()) return false;
 
                 if (self.queue.push(message)) {
@@ -263,6 +288,9 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         /// Receive multiple messages (batch).
         /// Returns number of messages received.
         pub fn recvBatch(self: *Self, out: []T) usize {
+            // P10 Rule 5: Validate output buffer
+            std.debug.assert(out.len > 0);
+
             return self.queue.popBatch(out);
         }
 
@@ -273,8 +301,12 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         /// CPU cost: Burns CPU during spin. Use sparingly, only when you expect
         /// messages to arrive very soon and latency is critical.
         pub fn recvSpin(self: *Self, max_spins: u32) ?T {
+            // P10 Rule 5: Validate spin bound is reasonable
+            std.debug.assert(max_spins <= 1_000_000);
+
             var spins: u32 = 0;
 
+            // P10 Rule 2: Loop bounded by max_spins
             while (spins < max_spins) : (spins += 1) {
                 if (self.queue.pop()) |message| {
                     return message;
@@ -297,14 +329,23 @@ pub fn BoundedChannel(comptime T: type, comptime capacity: usize) type {
         ///
         /// Performance note: Uses `nanoTimestamp()` which is a syscall on Linux.
         /// For tighter latency bounds, use `recvSpin()` with a fixed iteration count.
+        ///
+        /// Safety: Has iteration bound to prevent infinite loops if system clock
+        /// jumps backward.
         pub fn recvTimeout(self: *Self, timeout_ns: u64) ?T {
+            // P10 Rule 5: Validate timeout is reasonable
+            std.debug.assert(timeout_ns > 0);
+            std.debug.assert(timeout_ns <= 60_000_000_000); // Max 60 seconds
+
             const deadline = std.time.nanoTimestamp() + @as(i128, timeout_ns);
 
             var sleep_ns: u64 = MIN_SLEEP_NS;
             var spins: u32 = 0;
             var yields: u32 = 0;
+            var iterations: usize = 0;
 
-            while (std.time.nanoTimestamp() < deadline) {
+            // P10 Rule 2: Loop bounded by both time AND iteration count
+            while (std.time.nanoTimestamp() < deadline and iterations < MAX_TIMEOUT_ITERATIONS) : (iterations += 1) {
                 if (self.queue.pop()) |message| {
                     return message;
                 }
@@ -522,6 +563,24 @@ test "BoundedChannel - recv spin bounded" {
     try std.testing.expectEqual(@as(?u32, 42), result2);
 }
 
+test "BoundedChannel - send spin bounded" {
+    var channel = BoundedChannel(u32, 4).init();
+
+    // Fill channel
+    _ = channel.send(1);
+    _ = channel.send(2);
+    _ = channel.send(3);
+
+    // Should fail after bounded spins (channel full)
+    const result = channel.sendSpin(100, 10);
+    try std.testing.expect(!result);
+
+    // Drain one and try again
+    _ = channel.tryRecv();
+    const result2 = channel.sendSpin(100, 10);
+    try std.testing.expect(result2);
+}
+
 test "BoundedChannel - capacity" {
     try std.testing.expectEqual(@as(usize, 15), BoundedChannel(u32, 16).CAPACITY);
     try std.testing.expectEqual(@as(usize, 15), BoundedChannel(u32, 16).getCapacity());
@@ -552,4 +611,11 @@ test "BoundedChannel - fill percent" {
 
     const percent = channel.getFillPercent();
     try std.testing.expect(percent >= 50 and percent <= 55);
+}
+
+test "BoundedChannel - timeout iteration bound" {
+    // This test verifies the iteration bound exists
+    // We don't actually test clock jumps, but verify the constant is set
+    try std.testing.expect(MAX_TIMEOUT_ITERATIONS > 0);
+    try std.testing.expect(MAX_TIMEOUT_ITERATIONS <= 100_000_000);
 }

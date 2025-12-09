@@ -19,6 +19,11 @@
 //! _ = publisher.publish(&trade_msg);
 //! publisher.stop();
 //! ```
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 5: Assertions validate inputs and state
+//! - Rule 7: All errors checked and handled
+//! - Rule 9: receiveInto() provides safe buffer management
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,6 +43,17 @@ pub const SEQUENCE_HEADER_SIZE: usize = 8;
 
 const SEND_BUFFER_SIZE: u32 = 4096;
 const RECV_BUFFER_SIZE: u32 = 4096;
+
+/// Maximum payload size (buffer - sequence header).
+const MAX_PAYLOAD_SIZE: usize = SEND_BUFFER_SIZE - SEQUENCE_HEADER_SIZE;
+
+// Compile-time validation
+comptime {
+    std.debug.assert(SEQUENCE_HEADER_SIZE == 8);
+    std.debug.assert(SEND_BUFFER_SIZE > SEQUENCE_HEADER_SIZE);
+    std.debug.assert(RECV_BUFFER_SIZE > SEQUENCE_HEADER_SIZE);
+    std.debug.assert(MAX_PAYLOAD_SIZE > 0);
+}
 
 // ============================================================================
 // Platform-specific socket option constants
@@ -117,6 +133,8 @@ pub const MulticastPublisher = struct {
     /// Start publishing to multicast group.
     pub fn start(self: *Self, group: []const u8, port: u16, ttl: u8) !void {
         std.debug.assert(self.fd == null);
+        std.debug.assert(group.len > 0);
+        std.debug.assert(port > 0);
 
         // Create UDP socket
         const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
@@ -146,6 +164,7 @@ pub const MulticastPublisher = struct {
         if (self.fd) |fd| {
             posix.close(fd);
             self.fd = null;
+
             std.log.info("Multicast publisher stopped (sent {} messages, last seq={})", .{
                 self.messages_sent,
                 self.sequence,
@@ -183,6 +202,8 @@ pub const MulticastPublisher = struct {
             },
         };
 
+        std.debug.assert(msg_len <= MAX_PAYLOAD_SIZE);
+
         const total_len = SEQUENCE_HEADER_SIZE + msg_len;
 
         // Send to multicast group
@@ -209,6 +230,9 @@ pub const MulticastPublisher = struct {
     /// Useful for forwarding pre-encoded messages.
     pub fn publishRaw(self: *Self, data: []const u8) bool {
         const fd = self.fd orelse return false;
+
+        // P10 Rule 5: Validate input bounds
+        std.debug.assert(data.len <= MAX_PAYLOAD_SIZE);
 
         if (data.len + SEQUENCE_HEADER_SIZE > SEND_BUFFER_SIZE) {
             self.send_errors += 1;
@@ -287,7 +311,21 @@ pub const ReceivedMessage = struct {
     /// Sequence number from wire.
     sequence: u64,
     /// Payload data (without sequence header).
+    /// WARNING: This slice points into the subscriber's internal buffer.
+    /// It is only valid until the next call to receive() or receiveRaw().
     payload: []const u8,
+    /// Whether this message created a gap.
+    is_gap: bool,
+    /// Number of missing messages if gap.
+    gap_size: u64,
+};
+
+/// Result from receiveInto() - copies payload to caller's buffer.
+pub const ReceivedMessageOwned = struct {
+    /// Sequence number from wire.
+    sequence: u64,
+    /// Number of payload bytes copied to output buffer.
+    payload_len: usize,
     /// Whether this message created a gap.
     is_gap: bool,
     /// Number of missing messages if gap.
@@ -336,6 +374,8 @@ pub const MulticastSubscriber = struct {
     /// Start receiving from multicast group.
     pub fn start(self: *Self, group: []const u8, port: u16) !void {
         std.debug.assert(self.fd == null);
+        std.debug.assert(group.len > 0);
+        std.debug.assert(port > 0);
 
         // Create UDP socket
         const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
@@ -354,7 +394,6 @@ pub const MulticastSubscriber = struct {
             .multiaddr = group_addr,
             .interface = 0, // INADDR_ANY
         };
-
         try posix.setsockopt(fd, posix.IPPROTO.IP, IP_ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
 
         self.fd = fd;
@@ -396,6 +435,10 @@ pub const MulticastSubscriber = struct {
     /// Receive next message (non-blocking).
     /// Returns null if no message available.
     /// Automatically extracts sequence and detects gaps.
+    ///
+    /// WARNING: The returned payload slice points into the subscriber's
+    /// internal buffer and is only valid until the next receive call.
+    /// Use receiveInto() for a safer API that copies to caller's buffer.
     pub fn receive(self: *Self) ?ReceivedMessage {
         const fd = self.fd orelse return null;
 
@@ -419,6 +462,58 @@ pub const MulticastSubscriber = struct {
         const payload = self.recv_buf[SEQUENCE_HEADER_SIZE..n];
 
         // Gap detection
+        const gap_info = self.detectGap(sequence);
+
+        return ReceivedMessage{
+            .sequence = sequence,
+            .payload = payload,
+            .is_gap = gap_info.is_gap,
+            .gap_size = gap_info.gap_size,
+        };
+    }
+
+    /// Receive next message into caller-provided buffer (safer API).
+    /// Returns null if no message available.
+    /// Copies payload into output_buf, avoiding dangling pointer issues.
+    pub fn receiveInto(self: *Self, output_buf: []u8) ?ReceivedMessageOwned {
+        const fd = self.fd orelse return null;
+
+        const n = posix.recv(fd, &self.recv_buf, 0) catch |err| {
+            if (net_utils.isWouldBlock(err)) return null;
+            std.log.warn("Multicast recv error: {}", .{err});
+            return null;
+        };
+
+        // Need at least sequence header
+        if (n < SEQUENCE_HEADER_SIZE) {
+            std.log.debug("Multicast packet too small: {} bytes", .{n});
+            return null;
+        }
+
+        self.messages_received += 1;
+        self.bytes_received += n;
+
+        // Extract sequence number
+        const sequence = std.mem.readInt(u64, self.recv_buf[0..8], .big);
+        const payload_len = n - SEQUENCE_HEADER_SIZE;
+
+        // Copy payload to output buffer
+        const copy_len = @min(payload_len, output_buf.len);
+        @memcpy(output_buf[0..copy_len], self.recv_buf[SEQUENCE_HEADER_SIZE..][0..copy_len]);
+
+        // Gap detection
+        const gap_info = self.detectGap(sequence);
+
+        return ReceivedMessageOwned{
+            .sequence = sequence,
+            .payload_len = copy_len,
+            .is_gap = gap_info.is_gap,
+            .gap_size = gap_info.gap_size,
+        };
+    }
+
+    /// Internal gap detection logic.
+    fn detectGap(self: *Self, sequence: u64) struct { is_gap: bool, gap_size: u64 } {
         var is_gap = false;
         var gap_size: u64 = 0;
 
@@ -438,7 +533,6 @@ pub const MulticastSubscriber = struct {
                 sequence,
                 gap_size,
             });
-
             self.last_sequence = sequence;
         } else if (sequence <= self.last_sequence) {
             // Out of order or duplicate
@@ -449,16 +543,13 @@ pub const MulticastSubscriber = struct {
             self.last_sequence = sequence;
         }
 
-        return ReceivedMessage{
-            .sequence = sequence,
-            .payload = payload,
-            .is_gap = is_gap,
-            .gap_size = gap_size,
-        };
+        return .{ .is_gap = is_gap, .gap_size = gap_size };
     }
 
     /// Receive raw bytes without sequence extraction.
     /// Use this if you need to handle sequence parsing yourself.
+    ///
+    /// WARNING: The returned slice points into the subscriber's internal buffer.
     pub fn receiveRaw(self: *Self) ?[]const u8 {
         const fd = self.fd orelse return null;
 
@@ -480,6 +571,12 @@ pub const MulticastSubscriber = struct {
     pub fn getExpectedSequence(self: *const Self) u64 {
         if (!self.first_received) return 0;
         return self.last_sequence + 1;
+    }
+
+    /// Reset gap detection state (e.g., after reconnect).
+    pub fn resetGapDetection(self: *Self) void {
+        self.first_received = false;
+        self.last_sequence = 0;
     }
 
     /// Get statistics.
@@ -533,10 +630,9 @@ test "MulticastSubscriber gap detection - sequential" {
     sub.last_sequence = 100;
 
     // Sequential message (no gap)
-    const next_seq: u64 = 101;
-    if (next_seq > sub.last_sequence + 1) {
-        sub.gaps_detected += 1;
-    }
+    const gap_info = sub.detectGap(101);
+    try std.testing.expect(!gap_info.is_gap);
+    try std.testing.expectEqual(@as(u64, 0), gap_info.gap_size);
     try std.testing.expectEqual(@as(u64, 0), sub.gaps_detected);
 }
 
@@ -548,14 +644,9 @@ test "MulticastSubscriber gap detection - gap of 2" {
     sub.last_sequence = 100;
 
     // Message with gap (skipped 101, 102)
-    const gap_seq: u64 = 103;
-    if (gap_seq > sub.last_sequence + 1) {
-        const gap_size = gap_seq - sub.last_sequence - 1;
-        sub.gaps_detected += 1;
-        sub.total_missing += gap_size;
-        sub.last_sequence = gap_seq;
-    }
-
+    const gap_info = sub.detectGap(103);
+    try std.testing.expect(gap_info.is_gap);
+    try std.testing.expectEqual(@as(u64, 2), gap_info.gap_size);
     try std.testing.expectEqual(@as(u64, 1), sub.gaps_detected);
     try std.testing.expectEqual(@as(u64, 2), sub.total_missing);
     try std.testing.expectEqual(@as(u64, 103), sub.last_sequence);
@@ -563,21 +654,34 @@ test "MulticastSubscriber gap detection - gap of 2" {
 
 test "MulticastSubscriber gap detection - out of order" {
     var sub = MulticastSubscriber.init();
-
     sub.first_received = true;
     sub.last_sequence = 105;
 
     // Late arrival (out of order)
-    const late_seq: u64 = 102;
-    if (late_seq <= sub.last_sequence) {
-        sub.out_of_order += 1;
-        // Don't update last_sequence
-    }
-
+    const gap_info = sub.detectGap(102);
+    try std.testing.expect(!gap_info.is_gap);
     try std.testing.expectEqual(@as(u64, 1), sub.out_of_order);
     try std.testing.expectEqual(@as(u64, 105), sub.last_sequence); // Unchanged
 }
 
+test "MulticastSubscriber reset gap detection" {
+    var sub = MulticastSubscriber.init();
+    sub.first_received = true;
+    sub.last_sequence = 100;
+    sub.gaps_detected = 5;
+
+    sub.resetGapDetection();
+
+    try std.testing.expect(!sub.first_received);
+    try std.testing.expectEqual(@as(u64, 0), sub.last_sequence);
+    // Note: gaps_detected is NOT reset - it's cumulative statistics
+    try std.testing.expectEqual(@as(u64, 5), sub.gaps_detected);
+}
+
 test "SEQUENCE_HEADER_SIZE constant" {
     try std.testing.expectEqual(@as(usize, 8), SEQUENCE_HEADER_SIZE);
+}
+
+test "MAX_PAYLOAD_SIZE calculation" {
+    try std.testing.expectEqual(SEND_BUFFER_SIZE - SEQUENCE_HEADER_SIZE, MAX_PAYLOAD_SIZE);
 }

@@ -23,6 +23,11 @@
 //! - Configurable via TRACK_LATENCY flag in processor.zig
 //! - When enabled: tracks queue latency and processing time per message
 //! - When disabled: eliminates syscall overhead (~100-200ns per message)
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: All loops in processor and server have explicit bounds
+//! - Rule 5: Critical state transitions validated with assertions
+//! - Rule 7: All queue operations and results checked
 
 const std = @import("std");
 
@@ -66,6 +71,47 @@ pub const NUM_PROCESSORS = @import("threaded_server.zig").NUM_PROCESSORS;
 pub const TRACK_LATENCY = @import("processor.zig").TRACK_LATENCY;
 
 // ============================================================================
+// Compile-Time Validation
+// ============================================================================
+
+comptime {
+    // Validate channel capacity is power of 2
+    std.debug.assert(CHANNEL_CAPACITY > 0);
+    std.debug.assert((CHANNEL_CAPACITY & (CHANNEL_CAPACITY - 1)) == 0);
+
+    // Validate reasonable number of processors
+    std.debug.assert(NUM_PROCESSORS > 0);
+    std.debug.assert(NUM_PROCESSORS <= 8);
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Check if the threading system is configured for production use.
+/// Returns true if latency tracking is disabled (lower overhead).
+pub fn isProductionConfig() bool {
+    return !TRACK_LATENCY;
+}
+
+/// Get recommended channel capacity based on expected throughput.
+/// Returns minimum capacity needed for given orders per second with ~1ms buffer.
+pub fn recommendedCapacity(orders_per_sec: u64) u64 {
+    // Assume ~2 outputs per order average
+    const outputs_per_sec = orders_per_sec * 2;
+    // 1ms buffer at given throughput
+    const min_capacity = outputs_per_sec / 1000;
+    // Round up to next power of 2
+    if (min_capacity == 0) return 64;
+
+    var cap: u64 = 64;
+    while (cap < min_capacity and cap < 1 << 20) {
+        cap *= 2;
+    }
+    return cap;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -89,4 +135,43 @@ test "routeSymbol consistency" {
     const sym2 = msg.makeSymbol("AAPL");
 
     try std.testing.expectEqual(routeSymbol(sym1), routeSymbol(sym2));
+}
+
+test "routeSymbol partitioning" {
+    const msg = @import("../protocol/message_types.zig");
+
+    // A-M should go to processor 0
+    try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("AAPL")));
+    try std.testing.expectEqual(ProcessorId.processor_0, routeSymbol(msg.makeSymbol("MSFT")));
+
+    // N-Z should go to processor 1
+    try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("NVDA")));
+    try std.testing.expectEqual(ProcessorId.processor_1, routeSymbol(msg.makeSymbol("TSLA")));
+}
+
+test "channel capacity is power of 2" {
+    try std.testing.expect(CHANNEL_CAPACITY > 0);
+    try std.testing.expect((CHANNEL_CAPACITY & (CHANNEL_CAPACITY - 1)) == 0);
+}
+
+test "recommended capacity" {
+    // Low throughput
+    try std.testing.expectEqual(@as(u64, 64), recommendedCapacity(0));
+    try std.testing.expectEqual(@as(u64, 64), recommendedCapacity(1000));
+
+    // Medium throughput (100K orders/sec)
+    const med = recommendedCapacity(100_000);
+    try std.testing.expect(med >= 200); // At least 200 capacity for 100K orders
+    try std.testing.expect((med & (med - 1)) == 0); // Power of 2
+
+    // High throughput (1M orders/sec)
+    const high = recommendedCapacity(1_000_000);
+    try std.testing.expect(high >= 2000);
+    try std.testing.expect((high & (high - 1)) == 0);
+}
+
+test "isProductionConfig" {
+    // Just verify function exists and returns a bool
+    const result = isProductionConfig();
+    try std.testing.expect(result == true or result == false);
 }

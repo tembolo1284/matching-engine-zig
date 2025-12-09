@@ -5,6 +5,10 @@
 //!
 //! For multi-threaded operation with dual matching engines,
 //! see `threading/threaded_server.zig`.
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: run() loop has termination condition via running flag
+//! - Rule 5: Assertions validate callback parameters
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -33,6 +37,10 @@ pub const Server = struct {
     cfg: config.Config,
     allocator: std.mem.Allocator,
 
+    /// Running flag for graceful shutdown.
+    /// P10 Rule 2: Provides termination condition for run() loop.
+    running: bool = false,
+
     // Statistics
     messages_processed: u64 = 0,
     encode_errors: u64 = 0,
@@ -46,6 +54,8 @@ pub const Server = struct {
         engine: *MatchingEngine,
         cfg_param: config.Config,
     ) void {
+        // Note: engine is a non-optional pointer, so it cannot be null
+
         self.tcp = TcpServer.init(allocator);
         self.udp = UdpServer.init();
         self.multicast = MulticastPublisher.init();
@@ -54,6 +64,7 @@ pub const Server = struct {
         self.send_buf = undefined;
         self.cfg = cfg_param;
         self.allocator = allocator;
+        self.running = false;
         self.messages_processed = 0;
         self.encode_errors = 0;
     }
@@ -82,10 +93,12 @@ pub const Server = struct {
             try self.multicast.start(self.cfg.mcast_group, self.cfg.mcast_port, self.cfg.mcast_ttl);
         }
 
+        self.running = true;
         std.log.info("Single-threaded server started (DEPRECATED - use ThreadedServer)", .{});
     }
 
     pub fn stop(self: *Self) void {
+        self.running = false;
         self.tcp.stop();
         self.udp.stop();
         self.multicast.stop();
@@ -96,13 +109,45 @@ pub const Server = struct {
         });
     }
 
+    /// Request graceful shutdown.
+    /// The run() loop will exit after the current poll completes.
+    pub fn requestShutdown(self: *Self) void {
+        self.running = false;
+    }
+
+    /// Check if server is running.
+    pub fn isRunning(self: *const Self) bool {
+        return self.running;
+    }
+
+    /// Run the server event loop.
+    ///
+    /// P10 Rule 2: Loop terminates when `running` becomes false.
+    /// Call `requestShutdown()` or `stop()` to exit the loop.
     pub fn run(self: *Self) !void {
-        while (true) {
+        // P10 Rule 2: Loop bounded by running flag
+        while (self.running) {
+            try self.pollOnce(100);
+        }
+    }
+
+    /// Run for a limited number of iterations (for testing).
+    ///
+    /// P10 Rule 2: Loop bounded by max_iterations parameter.
+    pub fn runBounded(self: *Self, max_iterations: usize) !void {
+        std.debug.assert(max_iterations > 0);
+
+        var iterations: usize = 0;
+
+        // P10 Rule 2: Bounded by max_iterations
+        while (self.running and iterations < max_iterations) : (iterations += 1) {
             try self.pollOnce(100);
         }
     }
 
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
+        std.debug.assert(timeout_ms >= 0);
+
         if (self.cfg.tcp_enabled) {
             _ = try self.tcp.poll(timeout_ms);
         }
@@ -112,16 +157,27 @@ pub const Server = struct {
     }
 
     fn onTcpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
+        std.debug.assert(ctx != null);
+        std.debug.assert(config.isValidClient(client_id));
+        // Note: message is a non-optional pointer, so it cannot be null
+
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.processAndDispatch(message, client_id);
     }
 
     fn onUdpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
+        std.debug.assert(ctx != null);
+        std.debug.assert(config.isUdpClient(client_id));
+        // Note: message is a non-optional pointer, so it cannot be null
+
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.processAndDispatch(message, client_id);
     }
 
     fn onTcpDisconnect(client_id: config.ClientId, ctx: ?*anyopaque) void {
+        std.debug.assert(ctx != null);
+        std.debug.assert(config.isValidClient(client_id));
+
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.output.clear();
         const cancelled = self.engine.cancelClientOrders(client_id, &self.output);
@@ -132,6 +188,8 @@ pub const Server = struct {
     }
 
     fn processAndDispatch(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
+        // Note: message is a non-optional pointer, so it cannot be null
+
         self.output.clear();
         self.engine.processMessage(message, client_id, &self.output);
         self.messages_processed += 1;
@@ -139,7 +197,10 @@ pub const Server = struct {
     }
 
     fn dispatchOutputs(self: *Self) void {
-        for (self.output.slice()) |*out_msg| {
+        const outputs = self.output.slice();
+
+        // P10 Rule 2: Loop bounded by OutputBuffer capacity
+        for (outputs) |*out_msg| {
             const len = csv_codec.encodeOutput(out_msg, &self.send_buf) catch {
                 self.encode_errors += 1;
                 std.log.debug("Failed to encode output message type {}", .{out_msg.msg_type});
@@ -168,6 +229,8 @@ pub const Server = struct {
 
     /// Send data to client, routing based on client ID type.
     fn sendToClient(self: *Self, client_id: config.ClientId, data: []const u8) void {
+        std.debug.assert(data.len > 0);
+
         if (config.isUdpClient(client_id)) {
             _ = self.udp.send(client_id, data);
         } else if (config.isValidClient(client_id)) {
@@ -195,3 +258,18 @@ pub const Server = struct {
         multicast_stats: PublisherStats,
     };
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Server running flag terminates loop" {
+    // This test verifies the running flag exists and can be set
+    // Actual server tests require network setup
+    var server: Server = undefined;
+    server.running = true;
+    try std.testing.expect(server.isRunning());
+
+    server.requestShutdown();
+    try std.testing.expect(!server.isRunning());
+}

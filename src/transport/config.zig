@@ -13,6 +13,10 @@
 //! - ENGINE_MCAST_ENABLED: "true" or "false"
 //! - ENGINE_MCAST_GROUP: multicast IP (e.g., "239.255.0.1")
 //! - ENGINE_MCAST_PORT: port number
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 5: Assertions validate configuration values
+//! - Rule 7: All validation errors returned explicitly
 
 const std = @import("std");
 
@@ -23,6 +27,27 @@ const std = @import("std");
 /// Default channel capacity for SPSC queues.
 /// Used by threading module - keep in sync with processor.zig CHANNEL_CAPACITY.
 pub const DEFAULT_CHANNEL_CAPACITY: u32 = 65536;
+
+/// Minimum allowed channel capacity.
+const MIN_CHANNEL_CAPACITY: u32 = 64;
+
+/// Maximum allowed channel capacity (16M entries).
+const MAX_CHANNEL_CAPACITY: u32 = 16 * 1024 * 1024;
+
+/// Minimum buffer size for TCP/UDP.
+const MIN_BUFFER_SIZE: u32 = 1024;
+
+/// Maximum buffer size (64MB).
+const MAX_BUFFER_SIZE: u32 = 64 * 1024 * 1024;
+
+// Compile-time validation
+comptime {
+    // DEFAULT_CHANNEL_CAPACITY must be power of 2
+    std.debug.assert(DEFAULT_CHANNEL_CAPACITY > 0);
+    std.debug.assert((DEFAULT_CHANNEL_CAPACITY & (DEFAULT_CHANNEL_CAPACITY - 1)) == 0);
+    std.debug.assert(DEFAULT_CHANNEL_CAPACITY >= MIN_CHANNEL_CAPACITY);
+    std.debug.assert(DEFAULT_CHANNEL_CAPACITY <= MAX_CHANNEL_CAPACITY);
+}
 
 // ============================================================================
 // Client Identification
@@ -68,13 +93,14 @@ pub const UdpClientAddr = extern struct {
     /// Port in network byte order.
     port: u16,
     /// Padding for alignment.
+    /// P10: Explicitly zero-initialized to prevent information leakage.
     _pad: u16 = 0,
 
     const Self = @This();
 
     /// Create from components.
     pub fn init(addr: u32, port: u16) Self {
-        return .{ .addr = addr, .port = port };
+        return .{ .addr = addr, .port = port, ._pad = 0 };
     }
 
     /// Check equality.
@@ -99,6 +125,11 @@ pub const UdpClientAddr = extern struct {
         try writer.print("{}.{}.{}.{}:{}", .{ a[0], a[1], a[2], a[3], port_host });
     }
 };
+
+// Compile-time size verification
+comptime {
+    std.debug.assert(@sizeOf(UdpClientAddr) == 8);
+}
 
 // ============================================================================
 // Configuration
@@ -187,11 +218,17 @@ pub const Config = struct {
         }
 
         // Buffer size validation
-        if (self.tcp_recv_buffer_size < 1024) {
+        if (self.tcp_recv_buffer_size < MIN_BUFFER_SIZE) {
             return error.BufferTooSmall;
         }
-        if (self.udp_recv_buffer_size < 1024) {
+        if (self.tcp_recv_buffer_size > MAX_BUFFER_SIZE) {
+            return error.BufferTooLarge;
+        }
+        if (self.udp_recv_buffer_size < MIN_BUFFER_SIZE) {
             return error.BufferTooSmall;
+        }
+        if (self.udp_recv_buffer_size > MAX_BUFFER_SIZE) {
+            return error.BufferTooLarge;
         }
 
         // Multicast address validation
@@ -210,12 +247,30 @@ pub const Config = struct {
             return error.InvalidClientLimit;
         }
 
-        // Channel capacity must be power of 2
-        if (self.channel_capacity == 0 or
-            (self.channel_capacity & (self.channel_capacity - 1)) != 0)
-        {
+        // Channel capacity must be power of 2 and within bounds
+        if (self.channel_capacity < MIN_CHANNEL_CAPACITY) {
             return error.InvalidChannelCapacity;
         }
+        if (self.channel_capacity > MAX_CHANNEL_CAPACITY) {
+            return error.InvalidChannelCapacity;
+        }
+        if ((self.channel_capacity & (self.channel_capacity - 1)) != 0) {
+            return error.InvalidChannelCapacity;
+        }
+
+        // Timeout validation
+        if (self.tcp_idle_timeout_secs < 0) {
+            return error.InvalidTimeout;
+        }
+    }
+
+    /// Check if configuration uses default values (for testing).
+    pub fn isDefault(self: *const Self) bool {
+        const default = Self{};
+        return self.tcp_port == default.tcp_port and
+            self.udp_port == default.udp_port and
+            self.mcast_port == default.mcast_port and
+            self.channel_capacity == default.channel_capacity;
     }
 
     /// Log configuration summary.
@@ -242,8 +297,10 @@ pub const ConfigError = error{
     InvalidMcastPort,
     InvalidMcastGroup,
     BufferTooSmall,
+    BufferTooLarge,
     InvalidClientLimit,
     InvalidChannelCapacity,
+    InvalidTimeout,
 };
 
 // ============================================================================
@@ -276,6 +333,8 @@ fn envI64(name: []const u8, default: i64) i64 {
 }
 
 fn parseFirstOctet(addr: []const u8) !u8 {
+    std.debug.assert(addr.len > 0);
+
     var iter = std.mem.splitScalar(u8, addr, '.');
     const first = iter.next() orelse return error.InvalidAddress;
     return std.fmt.parseInt(u8, first, 10);
@@ -299,6 +358,17 @@ test "ClientId utilities" {
     try std.testing.expect(!isValidClient(CLIENT_ID_NONE));
 }
 
+test "ClientId boundary values" {
+    // Maximum TCP client ID
+    try std.testing.expect(isTcpClient(CLIENT_ID_TCP_MAX));
+    try std.testing.expect(!isUdpClient(CLIENT_ID_TCP_MAX));
+
+    // Minimum UDP client ID
+    const min_udp = CLIENT_ID_UDP_BASE;
+    try std.testing.expect(isUdpClient(min_udp));
+    try std.testing.expect(!isTcpClient(min_udp));
+}
+
 test "UdpClientAddr equality and hash" {
     const addr1 = UdpClientAddr.init(0x0100007F, 1234);
     const addr2 = UdpClientAddr.init(0x0100007F, 1234);
@@ -307,6 +377,15 @@ test "UdpClientAddr equality and hash" {
     try std.testing.expect(addr1.eql(addr2));
     try std.testing.expect(!addr1.eql(addr3));
     try std.testing.expectEqual(addr1.hash(), addr2.hash());
+}
+
+test "UdpClientAddr size" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(UdpClientAddr));
+}
+
+test "UdpClientAddr padding is zero" {
+    const addr = UdpClientAddr.init(0x12345678, 9999);
+    try std.testing.expectEqual(@as(u16, 0), addr._pad);
 }
 
 test "Config validation" {
@@ -331,7 +410,38 @@ test "Config channel capacity validation" {
     cfg.channel_capacity = 1000;
     try std.testing.expectError(error.InvalidChannelCapacity, cfg.validate());
 
-    // Invalid: zero
+    // Invalid: zero (would fail < MIN_CHANNEL_CAPACITY)
     cfg.channel_capacity = 0;
     try std.testing.expectError(error.InvalidChannelCapacity, cfg.validate());
+
+    // Invalid: too small
+    cfg.channel_capacity = 32;
+    try std.testing.expectError(error.InvalidChannelCapacity, cfg.validate());
+}
+
+test "Config buffer size validation" {
+    var cfg = Config{};
+
+    // Valid
+    cfg.tcp_recv_buffer_size = 4 * 1024 * 1024;
+    try cfg.validate();
+
+    // Too small
+    cfg.tcp_recv_buffer_size = 512;
+    try std.testing.expectError(error.BufferTooSmall, cfg.validate());
+}
+
+test "Config isDefault" {
+    const cfg = Config{};
+    try std.testing.expect(cfg.isDefault());
+
+    var modified = Config{};
+    modified.tcp_port = 9999;
+    try std.testing.expect(!modified.isDefault());
+}
+
+test "DEFAULT_CHANNEL_CAPACITY is power of 2" {
+    // Compile-time assertion already validates this
+    try std.testing.expect(DEFAULT_CHANNEL_CAPACITY > 0);
+    try std.testing.expect((DEFAULT_CHANNEL_CAPACITY & (DEFAULT_CHANNEL_CAPACITY - 1)) == 0);
 }

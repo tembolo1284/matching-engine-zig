@@ -20,6 +20,11 @@
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Each client owned by single I/O thread.
+//!
+//! NASA Power of Ten Compliance:
+//! - Rule 2: All loops bounded by capacity constants
+//! - Rule 5: Assertions validate state and inputs
+//! - Rule 7: All buffer operations bounds-checked
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -65,7 +70,9 @@ comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(SEND_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(MAX_MESSAGE_SIZE > 0);
+    std.debug.assert(MAX_MESSAGE_SIZE <= 65535); // Reasonable limit
     std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
+    std.debug.assert(FRAME_HEADER_SIZE == 4);
 }
 
 // ============================================================================
@@ -197,6 +204,7 @@ pub const TcpClient = struct {
     pub fn init(fd: posix.fd_t, client_id: config.ClientId) Self {
         std.debug.assert(fd >= 0);
         std.debug.assert(client_id != 0);
+        std.debug.assert(config.isValidClient(client_id));
 
         const now = std.time.timestamp();
 
@@ -270,6 +278,8 @@ pub const TcpClient = struct {
     /// Call in loop until WouldBlock (edge-triggered epoll).
     pub fn receive(self: *Self) !usize {
         std.debug.assert(self.state == .connected);
+        std.debug.assert(self.fd >= 0);
+        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
 
         const available = RECV_BUFFER_SIZE - self.recv_len;
         if (available == 0) {
@@ -292,11 +302,14 @@ pub const TcpClient = struct {
         self.stats.bytes_received += n;
         self.touch();
 
+        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
+
         return n;
     }
 
     /// Get available data in receive buffer (for raw protocol).
     pub fn getReceivedData(self: *const Self) []const u8 {
+        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
         return self.recv_buf[0..self.recv_len];
     }
 
@@ -324,6 +337,8 @@ pub const TcpClient = struct {
     /// - .oversized: Frame too large, was skipped
     /// - .empty: No data in buffer
     pub fn extractFrame(self: *Self) FrameResult {
+        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
+
         if (self.recv_len == 0) {
             return .empty;
         }
@@ -356,6 +371,9 @@ pub const TcpClient = struct {
             return .incomplete;
         }
 
+        std.debug.assert(total_len <= self.recv_len);
+        std.debug.assert(total_len <= RECV_BUFFER_SIZE);
+
         // Return payload slice (caller must call consumeFrame after processing)
         return .{ .frame = self.recv_buf[FRAME_HEADER_SIZE..total_len] };
     }
@@ -363,8 +381,11 @@ pub const TcpClient = struct {
     /// Consume a frame after successful processing.
     /// Call after extractFrame returns .frame and message is handled.
     pub fn consumeFrame(self: *Self, payload_len: usize) void {
+        std.debug.assert(payload_len <= MAX_MESSAGE_SIZE);
+
         const total_len = FRAME_HEADER_SIZE + @as(u32, @intCast(payload_len));
         std.debug.assert(total_len <= self.recv_len);
+
         self.compactRecvBuffer(total_len);
         self.stats.messages_received += 1;
         self.resetErrors(); // Successful frame resets error counter
@@ -373,6 +394,7 @@ pub const TcpClient = struct {
     /// Compact receive buffer by removing bytes from front.
     pub fn compactRecvBuffer(self: *Self, bytes: u32) void {
         std.debug.assert(bytes <= self.recv_len);
+        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
 
         if (bytes >= self.recv_len) {
             self.recv_len = 0;
@@ -386,6 +408,8 @@ pub const TcpClient = struct {
             self.recv_buf[bytes..self.recv_len],
         );
         self.recv_len = remaining;
+
+        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
     }
 
     // ========================================================================
@@ -397,6 +421,8 @@ pub const TcpClient = struct {
     /// Returns true if data was queued, false if buffer full.
     pub fn queueFramedSend(self: *Self, data: []const u8) bool {
         std.debug.assert(self.state.isActive());
+        std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
+        std.debug.assert(self.send_pos <= self.send_len);
 
         if (data.len > MAX_MESSAGE_SIZE) {
             std.log.warn("Client {}: attempted to send oversized message {} bytes", .{
@@ -423,6 +449,8 @@ pub const TcpClient = struct {
         @memcpy(self.send_buf[self.send_len..][0..data.len], data);
         self.send_len += @intCast(data.len);
 
+        std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
+
         return true;
     }
 
@@ -431,6 +459,9 @@ pub const TcpClient = struct {
     /// Returns true if data was queued, false if buffer full.
     pub fn queueRawSend(self: *Self, data: []const u8) bool {
         std.debug.assert(self.state.isActive());
+        std.debug.assert(data.len > 0);
+        std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
+        std.debug.assert(self.send_pos <= self.send_len);
 
         const available = SEND_BUFFER_SIZE - self.send_len;
 
@@ -442,6 +473,8 @@ pub const TcpClient = struct {
         @memcpy(self.send_buf[self.send_len..][0..data.len], data);
         self.send_len += @intCast(data.len);
 
+        std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
+
         return true;
     }
 
@@ -450,6 +483,9 @@ pub const TcpClient = struct {
     /// May partially flush. Call repeatedly until hasPendingSend() is false.
     pub fn flushSend(self: *Self) !void {
         std.debug.assert(self.state.isActive());
+        std.debug.assert(self.fd >= 0);
+        std.debug.assert(self.send_pos <= self.send_len);
+        std.debug.assert(self.send_len <= SEND_BUFFER_SIZE);
 
         while (self.send_pos < self.send_len) {
             const sent = posix.send(
@@ -535,7 +571,14 @@ pub const TcpClient = struct {
 
 /// Pre-allocated pool of client slots.
 /// Provides O(1) allocation and lookup by index.
+///
+/// P10 Note: All loops bounded by `capacity` parameter.
 pub fn ClientPool(comptime capacity: u32) type {
+    comptime {
+        std.debug.assert(capacity > 0);
+        std.debug.assert(capacity <= 65536); // Reasonable limit
+    }
+
     return struct {
         clients: [capacity]TcpClient = [_]TcpClient{.{}} ** capacity,
         active_count: u32 = 0,
@@ -543,7 +586,10 @@ pub fn ClientPool(comptime capacity: u32) type {
         const Self = @This();
 
         /// Find a free client slot.
+        ///
+        /// P10 Rule 2: O(n) scan bounded by `capacity`.
         pub fn allocate(self: *Self) ?*TcpClient {
+            // P10 Rule 2: Bounded by capacity
             for (&self.clients) |*client| {
                 if (client.isDisconnected()) {
                     return client;
@@ -553,7 +599,12 @@ pub fn ClientPool(comptime capacity: u32) type {
         }
 
         /// Find client by file descriptor.
+        ///
+        /// P10 Rule 2: O(n) scan bounded by `capacity`.
         pub fn findByFd(self: *Self, fd: posix.fd_t) ?*TcpClient {
+            std.debug.assert(fd >= 0);
+
+            // P10 Rule 2: Bounded by capacity
             for (&self.clients) |*client| {
                 if (client.fd == fd and client.state.isActive()) {
                     return client;
@@ -563,7 +614,12 @@ pub fn ClientPool(comptime capacity: u32) type {
         }
 
         /// Find client by ID.
+        ///
+        /// P10 Rule 2: O(n) scan bounded by `capacity`.
         pub fn findById(self: *Self, client_id: config.ClientId) ?*TcpClient {
+            std.debug.assert(client_id != 0);
+
+            // P10 Rule 2: Bounded by capacity
             for (&self.clients) |*client| {
                 if (client.client_id == client_id and client.state.isActive()) {
                     return client;
@@ -578,11 +634,14 @@ pub fn ClientPool(comptime capacity: u32) type {
         }
 
         /// Iterator over active clients.
+        ///
+        /// P10 Rule 2: Iteration bounded by `capacity`.
         pub const ActiveIterator = struct {
             pool: *Self,
             index: u32,
 
             pub fn next(self: *ActiveIterator) ?*TcpClient {
+                // P10 Rule 2: Bounded by capacity
                 while (self.index < capacity) {
                     const client = &self.pool.clients[self.index];
                     self.index += 1;
@@ -595,9 +654,12 @@ pub fn ClientPool(comptime capacity: u32) type {
         };
 
         /// Get aggregate statistics.
+        ///
+        /// P10 Rule 2: O(n) scan bounded by `capacity`.
         pub fn getAggregateStats(self: *const Self) AggregateStats {
             var stats = AggregateStats{};
 
+            // P10 Rule 2: Bounded by capacity
             for (self.clients) |client| {
                 if (!client.state.isActive()) continue;
 
@@ -810,4 +872,13 @@ test "ClientPool allocation" {
     c2.?.reset();
     const c5 = pool.allocate();
     try std.testing.expect(c5 != null);
+}
+
+test "TcpClient init validation" {
+    const client = TcpClient.init(5, 100);
+    try std.testing.expectEqual(@as(posix.fd_t, 5), client.fd);
+    try std.testing.expectEqual(@as(config.ClientId, 100), client.client_id);
+    try std.testing.expectEqual(ClientState.connected, client.state);
+    try std.testing.expectEqual(@as(u32, 0), client.recv_len);
+    try std.testing.expectEqual(@as(u32, 0), client.send_len);
 }

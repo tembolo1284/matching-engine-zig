@@ -36,6 +36,11 @@
 //! - Cache-line aligned (no false sharing)
 //! - Wait-free push/pop (bounded time)
 //! - Zero allocation after init
+//!
+//! NASA Power of Ten Compliance:
+//! - All loops bounded by capacity or iteration limits
+//! - No dynamic memory allocation
+//! - Assertions validate invariants in debug builds
 
 const std = @import("std");
 
@@ -60,6 +65,9 @@ pub const BoundedChannel = @import("bounded_channel.zig").BoundedChannel;
 
 /// Receive result type.
 pub const RecvResult = @import("bounded_channel.zig").RecvResult;
+
+/// Maximum iterations for timeout loops (safety bound).
+pub const MAX_TIMEOUT_ITERATIONS = @import("bounded_channel.zig").MAX_TIMEOUT_ITERATIONS;
 
 // ============================================================================
 // Type Aliases for Semantic Clarity
@@ -133,4 +141,8 @@ test "type aliases" {
 test "custom capacity channel" {
     const SmallChannel = @TypeOf(createChannel(u32, 256));
     try std.testing.expectEqual(@as(usize, 255), SmallChannel.CAPACITY);
+}
+
+test "max timeout iterations exported" {
+    try std.testing.expect(MAX_TIMEOUT_ITERATIONS > 0);
 }
