@@ -28,6 +28,10 @@ pub const Server = struct {
     cfg: config.Config,
     allocator: std.mem.Allocator,
 
+    // Statistics
+    messages_processed: u64 = 0,
+    encode_errors: u64 = 0,
+
     const Self = @This();
 
     /// Initialize server in-place. Required due to large embedded structs.
@@ -45,6 +49,8 @@ pub const Server = struct {
         self.send_buf = undefined;
         self.cfg = cfg;
         self.allocator = allocator;
+        self.messages_processed = 0;
+        self.encode_errors = 0;
     }
 
     pub fn deinit(self: *Self) void {
@@ -78,6 +84,11 @@ pub const Server = struct {
         self.tcp.stop();
         self.udp.stop();
         self.multicast.stop();
+
+        std.log.info("Server stopped: processed {} messages, {} encode errors", .{
+            self.messages_processed,
+            self.encode_errors,
+        });
     }
 
     pub fn run(self: *Self) !void {
@@ -118,28 +129,25 @@ pub const Server = struct {
     fn processAndDispatch(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
         self.output.clear();
         self.engine.processMessage(message, client_id, &self.output);
+        self.messages_processed += 1;
         self.dispatchOutputs();
     }
 
     fn dispatchOutputs(self: *Self) void {
         for (self.output.slice()) |*out_msg| {
-            const len = csv_codec.encodeOutput(out_msg, &self.send_buf) catch continue;
+            const len = csv_codec.encodeOutput(out_msg, &self.send_buf) catch {
+                self.encode_errors += 1;
+                std.log.debug("Failed to encode output message type {}", .{out_msg.msg_type});
+                continue;
+            };
             const data = self.send_buf[0..len];
 
             switch (out_msg.msg_type) {
                 .ack, .cancel_ack, .reject => {
-                    if (config.isUdpClient(out_msg.client_id)) {
-                        _ = self.udp.send(out_msg.client_id, data);
-                    } else if (config.isValidClient(out_msg.client_id)) {
-                        _ = self.tcp.send(out_msg.client_id, data);
-                    }
+                    self.sendToClient(out_msg.client_id, data);
                 },
                 .trade => {
-                    if (config.isUdpClient(out_msg.client_id)) {
-                        _ = self.udp.send(out_msg.client_id, data);
-                    } else if (config.isValidClient(out_msg.client_id)) {
-                        _ = self.tcp.send(out_msg.client_id, data);
-                    }
+                    self.sendToClient(out_msg.client_id, data);
                     if (self.cfg.mcast_enabled) {
                         _ = self.multicast.publish(out_msg);
                     }
@@ -152,4 +160,32 @@ pub const Server = struct {
             }
         }
     }
+
+    /// Send data to client, routing based on client ID type.
+    fn sendToClient(self: *Self, client_id: config.ClientId, data: []const u8) void {
+        if (config.isUdpClient(client_id)) {
+            _ = self.udp.send(client_id, data);
+        } else if (config.isValidClient(client_id)) {
+            _ = self.tcp.send(client_id, data);
+        }
+    }
+
+    /// Get server statistics.
+    pub fn getStats(self: *const Self) ServerStats {
+        return .{
+            .messages_processed = self.messages_processed,
+            .encode_errors = self.encode_errors,
+            .tcp_stats = self.tcp.getStats(),
+            .udp_stats = self.udp.getStats(),
+            .multicast_stats = self.multicast.getStats(),
+        };
+    }
+
+    pub const ServerStats = struct {
+        messages_processed: u64,
+        encode_errors: u64,
+        tcp_stats: TcpServer.ServerStats,
+        udp_stats: UdpServer.UdpServerStats,
+        multicast_stats: MulticastPublisher.PublisherStats,
+    };
 };

@@ -13,6 +13,8 @@ const posix = std.posix;
 // ============================================================================
 
 /// Parse IPv4 address string to network byte order u32.
+/// Accepts standard dotted-decimal notation: "192.168.1.1"
+/// Note: Does not accept leading zeros (e.g., "192.168.001.001" is invalid).
 pub fn parseIPv4(addr: []const u8) !u32 {
     var parts: [4]u8 = undefined;
     var iter = std.mem.splitScalar(u8, addr, '.');
@@ -20,6 +22,11 @@ pub fn parseIPv4(addr: []const u8) !u32 {
 
     while (iter.next()) |part| : (i += 1) {
         if (i >= 4) return error.InvalidAddress;
+        if (part.len == 0) return error.InvalidAddress;
+
+        // Reject leading zeros (except "0" itself)
+        if (part.len > 1 and part[0] == '0') return error.InvalidAddress;
+
         parts[i] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
     }
 
@@ -76,7 +83,7 @@ pub fn setLowLatencyOptions(fd: posix.fd_t) void {
 pub fn setBufferSizes(fd: posix.fd_t, recv_size: u32, send_size: u32) u32 {
     // Set receive buffer
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, @intCast(recv_size)))) catch {};
-    
+
     // Set send buffer
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, @intCast(send_size)))) catch {};
 
@@ -88,7 +95,7 @@ pub fn setBufferSizes(fd: posix.fd_t, recv_size: u32, send_size: u32) u32 {
 pub fn getSocketRecvBufSize(fd: posix.fd_t) u32 {
     var buf: [@sizeOf(c_int)]u8 = undefined;
     var len: posix.socklen_t = @sizeOf(c_int);
-    
+
     const rc = std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf, &len);
     if (rc == 0 and len == @sizeOf(c_int)) {
         const val: c_int = @bitCast(buf);
@@ -101,7 +108,7 @@ pub fn getSocketRecvBufSize(fd: posix.fd_t) u32 {
 pub fn getSocketSendBufSize(fd: posix.fd_t) u32 {
     var buf: [@sizeOf(c_int)]u8 = undefined;
     var len: posix.socklen_t = @sizeOf(c_int);
-    
+
     const rc = std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf, &len);
     if (rc == 0 and len == @sizeOf(c_int)) {
         const val: c_int = @bitCast(buf);
@@ -141,21 +148,40 @@ pub fn isConnectionReset(err: anyerror) bool {
 // Tests
 // ============================================================================
 
-test "parseIPv4" {
-    // Valid addresses
+test "parseIPv4 valid addresses" {
     try std.testing.expectEqual(@as(u32, 0x0100007F), try parseIPv4("127.0.0.1"));
     try std.testing.expectEqual(@as(u32, 0x00000000), try parseIPv4("0.0.0.0"));
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), try parseIPv4("255.255.255.255"));
+    try std.testing.expectEqual(@as(u32, 0x0101A8C0), try parseIPv4("192.168.1.1"));
+}
 
-    // Invalid addresses
+test "parseIPv4 invalid addresses" {
+    // Out of range
     try std.testing.expectError(error.InvalidAddress, parseIPv4("256.0.0.1"));
+
+    // Wrong number of octets
     try std.testing.expectError(error.InvalidAddress, parseIPv4("1.2.3"));
     try std.testing.expectError(error.InvalidAddress, parseIPv4("1.2.3.4.5"));
+
+    // Non-numeric
     try std.testing.expectError(error.InvalidAddress, parseIPv4("abc.def.ghi.jkl"));
+
+    // Leading zeros (ambiguous - could be octal)
+    try std.testing.expectError(error.InvalidAddress, parseIPv4("192.168.01.1"));
+    try std.testing.expectError(error.InvalidAddress, parseIPv4("192.168.001.001"));
+
+    // Empty octets
+    try std.testing.expectError(error.InvalidAddress, parseIPv4("192..1.1"));
+    try std.testing.expectError(error.InvalidAddress, parseIPv4(".168.1.1"));
 }
 
 test "parseSockAddr" {
     const addr = try parseSockAddr("192.168.1.1", 8080);
     try std.testing.expectEqual(posix.AF.INET, addr.family);
     try std.testing.expectEqual(std.mem.nativeToBig(u16, 8080), addr.port);
+}
+
+test "parseSockAddr zero address" {
+    const addr = try parseSockAddr("0.0.0.0", 1234);
+    try std.testing.expectEqual(@as(u32, 0), addr.addr);
 }

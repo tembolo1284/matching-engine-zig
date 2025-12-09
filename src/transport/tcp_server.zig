@@ -7,6 +7,7 @@
 //! - Event loop for non-blocking I/O
 //! - Client lifecycle management
 //! - Message dispatch via callbacks
+//! - Idle timeout enforcement
 //!
 //! Thread Safety:
 //! - NOT thread-safe. Use from single I/O thread only.
@@ -135,7 +136,9 @@ const Poller = struct {
     /// Remove fd from poller
     pub fn remove(self: *Self, fd: posix.fd_t) void {
         if (is_linux) {
-            epollCtl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+            epollCtl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch |err| {
+                std.log.debug("epoll_ctl DEL failed for fd {}: {}", .{ fd, err });
+            };
         } else if (is_darwin or is_bsd) {
             // kqueue automatically removes events when fd is closed
             // But we can explicitly remove if needed
@@ -202,10 +205,12 @@ const Poller = struct {
         }
     }
 
-    // Helper for Linux epoll_ctl with proper type handling
+    // Helper for Linux epoll_ctl with proper type handling and logging
     fn epollCtl(epfd: posix.fd_t, op: u32, fd: posix.fd_t, event: ?*linux.epoll_event) !void {
         const rc = linux.epoll_ctl(epfd, op, fd, event);
         if (rc != 0) {
+            const errno = std.posix.errno(rc);
+            std.log.debug("epoll_ctl failed: op={} fd={} errno={}", .{ op, fd, errno });
             return error.EpollCtlFailed;
         }
     }
@@ -241,6 +246,9 @@ const MAX_EVENTS: u32 = 64;
 
 /// Listen backlog size.
 const LISTEN_BACKLOG: u31 = 128;
+
+/// How often to check for idle clients (in poll cycles).
+const IDLE_CHECK_INTERVAL: u32 = 100;
 
 // ============================================================================
 // Callback Types
@@ -283,6 +291,10 @@ pub const ServerStats = struct {
     accept_errors: u64,
     /// Decode errors.
     decode_errors: u64,
+    /// Idle timeout disconnects.
+    idle_timeouts: u64,
+    /// Error threshold disconnects.
+    error_disconnects: u64,
 };
 
 // ============================================================================
@@ -319,11 +331,19 @@ pub const TcpServer = struct {
     /// Whether to use length-prefix framing.
     use_framing: bool = true,
 
+    /// Idle timeout in seconds (0 = disabled).
+    idle_timeout_secs: i64 = 300,
+
     // === Statistics ===
     total_connections: u64 = 0,
     total_disconnections: u64 = 0,
     accept_errors: u64 = 0,
     decode_errors: u64 = 0,
+    idle_timeouts: u64 = 0,
+    error_disconnects: u64 = 0,
+
+    /// Poll cycle counter for periodic tasks.
+    poll_cycles: u64 = 0,
 
     // === Allocator ===
     allocator: std.mem.Allocator,
@@ -378,12 +398,13 @@ pub const TcpServer = struct {
         self.poller = poller;
 
         const platform = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
-        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={s})", .{
+        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={s}, idle_timeout={}s)", .{
             address,
             port,
             self.use_framing,
             MAX_CLIENTS,
             platform,
+            self.idle_timeout_secs,
         });
     }
 
@@ -444,7 +465,28 @@ pub const TcpServer = struct {
             }
         }
 
+        // Periodic idle timeout check
+        self.poll_cycles += 1;
+        if (self.idle_timeout_secs > 0 and self.poll_cycles % IDLE_CHECK_INTERVAL == 0) {
+            self.checkIdleClients();
+        }
+
         return processed;
+    }
+
+    /// Check for and disconnect idle clients.
+    fn checkIdleClients(self: *Self) void {
+        var iter = self.clients.getActive();
+        while (iter.next()) |client| {
+            if (client.getIdleDuration() > self.idle_timeout_secs) {
+                std.log.info("Client {} idle timeout ({}s)", .{
+                    client.client_id,
+                    client.getIdleDuration(),
+                });
+                self.idle_timeouts += 1;
+                self.disconnectClient(client);
+            }
+        }
     }
 
     /// Accept all pending connections.
@@ -491,7 +533,7 @@ pub const TcpServer = struct {
             return;
         };
 
-        // Initialize client
+        // Initialize client with collision-free ID
         const client_id = self.allocateClientId();
         client.* = TcpClient.init(client_fd, client_id);
 
@@ -585,7 +627,13 @@ pub const TcpServer = struct {
                 .incomplete, .empty => break,
 
                 .oversized => {
-                    // Already handled in extractFrame, continue processing
+                    // Check if too many errors
+                    if (client.recordDecodeError()) {
+                        std.log.warn("Client {} exceeded error threshold, disconnecting", .{client.client_id});
+                        self.error_disconnects += 1;
+                        self.disconnectClient(client);
+                        return;
+                    }
                     continue;
                 },
             }
@@ -612,9 +660,21 @@ pub const TcpServer = struct {
 
                 self.decode_errors += 1;
                 std.log.debug("Client {} decode error: {}", .{ client.client_id, err });
+
+                // Track consecutive errors
+                if (client.recordDecodeError()) {
+                    std.log.warn("Client {} exceeded error threshold, disconnecting", .{client.client_id});
+                    self.error_disconnects += 1;
+                    self.disconnectClient(client);
+                    return;
+                }
+
                 processed += 1; // Skip one byte and retry
                 continue;
             };
+
+            // Successful decode - reset error counter
+            client.resetErrors();
 
             // Dispatch message
             if (self.on_message) |callback| {
@@ -636,8 +696,14 @@ pub const TcpServer = struct {
         const result = codec.Codec.decodeInput(payload) catch |err| {
             self.decode_errors += 1;
             std.log.debug("Client {} decode error: {}", .{ client.client_id, err });
+
+            // Track consecutive errors (but don't disconnect here - let caller handle)
+            _ = client.recordDecodeError();
             return;
         };
+
+        // Successful decode - reset error counter
+        client.resetErrors();
 
         if (self.on_message) |callback| {
             callback(client.client_id, &result.message, self.callback_ctx);
@@ -736,19 +802,31 @@ pub const TcpServer = struct {
         try poller.updateClient(client.fd, want_write);
     }
 
-    /// Allocate next client ID.
+    /// Allocate next client ID, ensuring no collision with active clients.
     fn allocateClientId(self: *Self) config.ClientId {
-        const id = self.next_client_id;
+        // Try up to MAX_CLIENTS times to find unused ID
+        var attempts: u32 = 0;
+        while (attempts < MAX_CLIENTS + 10) : (attempts += 1) {
+            const id = self.next_client_id;
 
-        self.next_client_id +%= 1;
+            // Advance to next ID
+            self.next_client_id +%= 1;
+            if (self.next_client_id == 0 or
+                self.next_client_id >= config.CLIENT_ID_UDP_BASE)
+            {
+                self.next_client_id = 1;
+            }
 
-        // Skip invalid IDs
-        if (self.next_client_id == 0 or
-            self.next_client_id >= config.CLIENT_ID_UDP_BASE)
-        {
-            self.next_client_id = 1;
+            // Check if ID is already in use
+            if (self.clients.findById(id) == null) {
+                return id;
+            }
         }
 
+        // Fallback (should never happen with MAX_CLIENTS=64)
+        std.log.warn("Client ID allocation exhausted, using next ID", .{});
+        const id = self.next_client_id;
+        self.next_client_id +%= 1;
         return id;
     }
 
@@ -770,6 +848,8 @@ pub const TcpServer = struct {
             .total_bytes_out = client_stats.total_bytes_out,
             .accept_errors = self.accept_errors,
             .decode_errors = self.decode_errors,
+            .idle_timeouts = self.idle_timeouts,
+            .error_disconnects = self.error_disconnects,
         };
     }
 
@@ -791,18 +871,23 @@ test "TcpServer initialization" {
     try std.testing.expectEqual(@as(u32, 0), server.getClientCount());
 }
 
-test "TcpServer client ID allocation" {
+test "TcpServer client ID allocation no collision" {
     var server = TcpServer.init(std.testing.allocator);
     defer server.deinit();
 
-    const id1 = server.allocateClientId();
-    const id2 = server.allocateClientId();
-    const id3 = server.allocateClientId();
+    // Allocate several IDs
+    var ids: [10]config.ClientId = undefined;
+    for (&ids) |*id| {
+        id.* = server.allocateClientId();
+    }
 
-    try std.testing.expect(id1 != id2);
-    try std.testing.expect(id2 != id3);
-    try std.testing.expect(config.isTcpClient(id1));
-    try std.testing.expect(config.isTcpClient(id2));
+    // Verify all unique
+    for (ids, 0..) |id1, i| {
+        for (ids[i + 1 ..]) |id2| {
+            try std.testing.expect(id1 != id2);
+        }
+        try std.testing.expect(config.isTcpClient(id1));
+    }
 }
 
 test "TcpServer statistics initialization" {
@@ -814,6 +899,8 @@ test "TcpServer statistics initialization" {
     try std.testing.expectEqual(@as(u32, 0), stats.current_clients);
     try std.testing.expectEqual(@as(u64, 0), stats.total_connections);
     try std.testing.expectEqual(@as(u64, 0), stats.total_messages_in);
+    try std.testing.expectEqual(@as(u64, 0), stats.idle_timeouts);
+    try std.testing.expectEqual(@as(u64, 0), stats.error_disconnects);
 }
 
 test "Poller creation" {

@@ -5,6 +5,7 @@
 //! - Send buffer with optional length-prefix framing
 //! - Protocol auto-detection
 //! - Per-connection statistics
+//! - Consecutive error tracking for disconnect decision
 //!
 //! Wire format (with framing enabled):
 //! ```
@@ -55,11 +56,16 @@ pub const FRAME_HEADER_SIZE: u32 = 4;
 /// Prevents memory exhaustion from malformed length headers.
 pub const MAX_MESSAGE_SIZE: u32 = 16384;
 
+/// Maximum consecutive decode errors before disconnect.
+/// Prevents infinite loops on malformed data streams.
+pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
 // Compile-time validation
 comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(SEND_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(MAX_MESSAGE_SIZE > 0);
+    std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
 }
 
 // ============================================================================
@@ -92,6 +98,7 @@ pub const ClientStats = struct {
     bytes_sent: u64,
     frames_dropped: u64,
     buffer_overflows: u64,
+    decode_errors: u64,
 
     pub fn init() ClientStats {
         return .{
@@ -101,6 +108,7 @@ pub const ClientStats = struct {
             .bytes_sent = 0,
             .frames_dropped = 0,
             .buffer_overflows = 0,
+            .decode_errors = 0,
         };
     }
 };
@@ -165,6 +173,10 @@ pub const TcpClient = struct {
     /// Detected protocol (CSV, binary, etc.).
     protocol: codec.Protocol = .unknown,
 
+    // === Error Tracking ===
+    /// Consecutive decode errors (reset on success).
+    consecutive_errors: u32 = 0,
+
     // === Statistics ===
     stats: ClientStats = ClientStats.init(),
 
@@ -196,6 +208,7 @@ pub const TcpClient = struct {
             .send_len = 0,
             .send_pos = 0,
             .protocol = .unknown,
+            .consecutive_errors = 0,
             .stats = ClientStats.init(),
             .connect_time = now,
             .last_active = now,
@@ -224,6 +237,27 @@ pub const TcpClient = struct {
     /// Update last activity timestamp.
     pub fn touch(self: *Self) void {
         self.last_active = std.time.timestamp();
+    }
+
+    // ========================================================================
+    // Error Tracking
+    // ========================================================================
+
+    /// Record a decode error. Returns true if client should be disconnected.
+    pub fn recordDecodeError(self: *Self) bool {
+        self.consecutive_errors += 1;
+        self.stats.decode_errors += 1;
+        return self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS;
+    }
+
+    /// Reset consecutive error counter (call on successful decode).
+    pub fn resetErrors(self: *Self) void {
+        self.consecutive_errors = 0;
+    }
+
+    /// Check if client has exceeded error threshold.
+    pub fn shouldDisconnect(self: *const Self) bool {
+        return self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS;
     }
 
     // ========================================================================
@@ -333,6 +367,7 @@ pub const TcpClient = struct {
         std.debug.assert(total_len <= self.recv_len);
         self.compactRecvBuffer(total_len);
         self.stats.messages_received += 1;
+        self.resetErrors(); // Successful frame resets error counter
     }
 
     /// Compact receive buffer by removing bytes from front.
@@ -420,7 +455,7 @@ pub const TcpClient = struct {
             const sent = posix.send(
                 self.fd,
                 self.send_buf[self.send_pos..self.send_len],
-                SEND_FLAGS, // MSG.NOSIGNAL on Linux, 0 on macOS (SIGPIPE ignored at process level)
+                SEND_FLAGS,
             ) catch |err| {
                 if (net_utils.isWouldBlock(err)) return;
                 return err;
@@ -571,6 +606,7 @@ pub fn ClientPool(comptime capacity: u32) type {
                 stats.total_messages_out += client.stats.messages_sent;
                 stats.total_bytes_in += client.stats.bytes_received;
                 stats.total_bytes_out += client.stats.bytes_sent;
+                stats.total_decode_errors += client.stats.decode_errors;
             }
 
             return stats;
@@ -582,6 +618,7 @@ pub fn ClientPool(comptime capacity: u32) type {
             total_messages_out: u64 = 0,
             total_bytes_in: u64 = 0,
             total_bytes_out: u64 = 0,
+            total_decode_errors: u64 = 0,
         };
     };
 }
@@ -713,6 +750,37 @@ test "TcpClient buffer overflow detection" {
     const success = client.queueFramedSend("this is too long to fit");
     try std.testing.expect(!success);
     try std.testing.expectEqual(@as(u64, 1), client.stats.buffer_overflows);
+}
+
+test "TcpClient consecutive error tracking" {
+    var client = TcpClient{};
+    client.state = .connected;
+
+    // Record errors up to threshold
+    for (0..MAX_CONSECUTIVE_ERRORS - 1) |_| {
+        try std.testing.expect(!client.recordDecodeError());
+        try std.testing.expect(!client.shouldDisconnect());
+    }
+
+    // One more triggers disconnect
+    try std.testing.expect(client.recordDecodeError());
+    try std.testing.expect(client.shouldDisconnect());
+    try std.testing.expectEqual(MAX_CONSECUTIVE_ERRORS, client.consecutive_errors);
+}
+
+test "TcpClient error reset on success" {
+    var client = TcpClient{};
+    client.state = .connected;
+
+    // Accumulate some errors
+    _ = client.recordDecodeError();
+    _ = client.recordDecodeError();
+    _ = client.recordDecodeError();
+    try std.testing.expectEqual(@as(u32, 3), client.consecutive_errors);
+
+    // Reset on success
+    client.resetErrors();
+    try std.testing.expectEqual(@as(u32, 0), client.consecutive_errors);
 }
 
 test "ClientPool allocation" {

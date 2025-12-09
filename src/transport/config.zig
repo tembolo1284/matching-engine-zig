@@ -17,6 +17,14 @@
 const std = @import("std");
 
 // ============================================================================
+// Shared Constants
+// ============================================================================
+
+/// Default channel capacity for SPSC queues.
+/// Used by threading module - keep in sync with processor.zig CHANNEL_CAPACITY.
+pub const DEFAULT_CHANNEL_CAPACITY: u32 = 65536;
+
+// ============================================================================
 // Client Identification
 // ============================================================================
 
@@ -111,7 +119,7 @@ pub const Config = struct {
     udp_enabled: bool = true,
     udp_addr: []const u8 = "0.0.0.0",
     udp_port: u16 = 1235,
-    udp_recv_buffer_size: u32 = 4 * 1024 * 1024, // 1MB for burst handling
+    udp_recv_buffer_size: u32 = 4 * 1024 * 1024,
     udp_send_buffer_size: u32 = 4 * 1024 * 1024,
     udp_max_clients: u32 = 1024,
 
@@ -124,9 +132,15 @@ pub const Config = struct {
     mcast_loopback: bool = true, // Enable for local testing
 
     // === General Settings ===
-    channel_capacity: u32 = 131072,
+    /// Channel capacity for processor queues.
+    /// Must match threading/processor.zig CHANNEL_CAPACITY.
+    channel_capacity: u32 = DEFAULT_CHANNEL_CAPACITY,
     use_binary_protocol: bool = false,
     use_tcp_framing: bool = true,
+
+    // === Timeout Settings ===
+    /// Idle timeout for TCP connections in seconds (0 = disabled).
+    tcp_idle_timeout_secs: i64 = 300,
 
     const Self = @This();
 
@@ -138,6 +152,7 @@ pub const Config = struct {
         cfg.tcp_enabled = envBool("ENGINE_TCP_ENABLED", cfg.tcp_enabled);
         cfg.tcp_port = envU16("ENGINE_TCP_PORT", cfg.tcp_port);
         cfg.tcp_max_clients = envU32("ENGINE_TCP_MAX_CLIENTS", cfg.tcp_max_clients);
+        cfg.tcp_idle_timeout_secs = envI64("ENGINE_TCP_IDLE_TIMEOUT", cfg.tcp_idle_timeout_secs);
 
         // UDP
         cfg.udp_enabled = envBool("ENGINE_UDP_ENABLED", cfg.udp_enabled);
@@ -153,6 +168,7 @@ pub const Config = struct {
 
         // General
         cfg.use_binary_protocol = envBool("ENGINE_BINARY_PROTOCOL", cfg.use_binary_protocol);
+        cfg.channel_capacity = envU32("ENGINE_CHANNEL_CAPACITY", cfg.channel_capacity);
 
         return cfg;
     }
@@ -193,18 +209,30 @@ pub const Config = struct {
         if (self.tcp_max_clients == 0 or self.tcp_max_clients > 65535) {
             return error.InvalidClientLimit;
         }
+
+        // Channel capacity must be power of 2
+        if (self.channel_capacity == 0 or
+            (self.channel_capacity & (self.channel_capacity - 1)) != 0)
+        {
+            return error.InvalidChannelCapacity;
+        }
     }
 
     /// Log configuration summary.
     pub fn log(self: *const Self) void {
         std.log.info("Configuration:", .{});
-        std.log.info("  TCP: {} (port {})", .{ self.tcp_enabled, self.tcp_port });
+        std.log.info("  TCP: {} (port {}, idle_timeout={}s)", .{
+            self.tcp_enabled,
+            self.tcp_port,
+            self.tcp_idle_timeout_secs,
+        });
         std.log.info("  UDP: {} (port {})", .{ self.udp_enabled, self.udp_port });
         std.log.info("  Multicast: {} ({s}:{})", .{
             self.mcast_enabled,
             self.mcast_group,
             self.mcast_port,
         });
+        std.log.info("  Channel capacity: {}", .{self.channel_capacity});
     }
 };
 
@@ -215,6 +243,7 @@ pub const ConfigError = error{
     InvalidMcastGroup,
     BufferTooSmall,
     InvalidClientLimit,
+    InvalidChannelCapacity,
 };
 
 // ============================================================================
@@ -239,6 +268,11 @@ fn envU16(name: []const u8, default: u16) u16 {
 fn envU32(name: []const u8, default: u32) u32 {
     const val = std.posix.getenv(name) orelse return default;
     return std.fmt.parseInt(u32, val, 10) catch default;
+}
+
+fn envI64(name: []const u8, default: i64) i64 {
+    const val = std.posix.getenv(name) orelse return default;
+    return std.fmt.parseInt(i64, val, 10) catch default;
 }
 
 fn parseFirstOctet(addr: []const u8) !u8 {
@@ -286,3 +320,18 @@ test "Config validation" {
     try cfg.validate();
 }
 
+test "Config channel capacity validation" {
+    var cfg = Config{};
+
+    // Valid power of 2
+    cfg.channel_capacity = 65536;
+    try cfg.validate();
+
+    // Invalid: not power of 2
+    cfg.channel_capacity = 1000;
+    try std.testing.expectError(error.InvalidChannelCapacity, cfg.validate());
+
+    // Invalid: zero
+    cfg.channel_capacity = 0;
+    try std.testing.expectError(error.InvalidChannelCapacity, cfg.validate());
+}
