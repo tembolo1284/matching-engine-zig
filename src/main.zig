@@ -60,9 +60,9 @@ fn setupSignalHandlers() void {
 
     if (is_darwin) {
         // macOS: sigaction returns void
-        std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null);
-        std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null);
-        std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null) catch {};
+        std.posix.sigaction(std.posix.SIG.TERM, &sigterm_action, null) catch {};
+        std.posix.sigaction(std.posix.SIG.PIPE, &sigpipe_action, null) catch {};
     } else {
         // Linux: sigaction returns error union
         std.posix.sigaction(std.posix.SIG.INT, &sigint_action, null) catch {};
