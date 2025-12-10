@@ -639,6 +639,14 @@ pub const TcpServer = struct {
     /// Decode payload and dispatch to callback.
     fn decodeAndDispatch(self: *Self, client: *TcpClient, payload: []const u8) void {
         std.debug.assert(payload.len > 0);
+        std.log.debug("Client {} payload ({} bytes): {X:0>2} {X:0>2} {X:0>2} {X:0>2}...", .{
+            client.client_id,
+            payload.len,
+            if (payload.len > 0) payload[0] else 0,
+            if (payload.len > 1) payload[1] else 0,
+            if (payload.len > 2) payload[2] else 0,
+            if (payload.len > 3) payload[3] else 0,
+        });
         const result = codec.Codec.decodeInput(payload) catch |err| {
             self.decode_errors += 1;
             std.log.debug("Client {} decode error: {}", .{ client.client_id, err });
