@@ -581,7 +581,7 @@ pub const ThreadedServer = struct {
         const use_binary = if (config.isUdpClient(out_msg.client_id))
             self.udp.getClientProtocol(out_msg.client_id) == .binary
         else
-            false; // TCP always uses CSV for now
+            self.cfg.use_binary_protocol;
 
         // Encode message based on client protocol
         const len = if (use_binary)
