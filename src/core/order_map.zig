@@ -109,6 +109,7 @@ pub const OrderMap = struct {
     probe_total: u64,
     max_probe: u32,
     compactions: u32,
+    duplicate_rejects: u64,
 
     const Self = @This();
 
@@ -140,6 +141,7 @@ pub const OrderMap = struct {
         self.probe_total = 0;
         self.max_probe = 0;
         self.compactions = 0;
+        self.duplicate_rejects = 0;
 
         // Initialize all slots at runtime (NOT compile-time!)
         for (&self.slots) |*slot| {
@@ -198,8 +200,8 @@ pub const OrderMap = struct {
     // ========================================================================
 
     /// Insert a key-location pair.
-    /// Returns false if map is full (probe length exceeded).
-    /// Panics on duplicate key (logic error).
+    /// Returns false if map is full (probe length exceeded) OR if key already exists.
+    /// Duplicate keys are logged and rejected gracefully (no panic).
     pub fn insert(self: *Self, key: u64, location: OrderLocation) bool {
         std.debug.assert(key != HASH_SLOT_EMPTY);
         std.debug.assert(key != HASH_SLOT_TOMBSTONE);
@@ -235,7 +237,17 @@ pub const OrderMap = struct {
             }
 
             if (slot_key == key) {
-                std.debug.panic("OrderMap.insert: duplicate key {d}", .{key});
+                // FIXED: Don't panic on duplicate key - log and reject gracefully.
+                // This can happen due to client bugs, replay attacks, or protocol issues.
+                // The caller (order_book) will generate a REJECT message.
+                std.log.warn("OrderMap.insert: duplicate key {d} (user={d}, order={d}) - rejecting", .{
+                    key,
+                    @as(u32, @truncate(key >> 32)),
+                    @as(u32, @truncate(key)),
+                });
+                self.duplicate_rejects += 1;
+                self.recordProbe(probe);
+                return false;
             }
 
             idx = (idx + 1) & ORDER_MAP_MASK;
@@ -403,6 +415,11 @@ pub const OrderMap = struct {
     pub fn getMemoryFootprint() usize {
         return @sizeOf(Self);
     }
+
+    /// Get number of duplicate key rejections (for monitoring).
+    pub fn getDuplicateRejects(self: *const Self) u64 {
+        return self.duplicate_rejects;
+    }
 };
 
 // ============================================================================
@@ -431,6 +448,41 @@ test "OrderMap basic operations" {
 
     try std.testing.expect(map.remove(key1));
     try std.testing.expectEqual(@as(u32, 0), map.count);
+}
+
+test "OrderMap duplicate key rejection" {
+    var map: OrderMap = undefined;
+    map.initInPlace(std.testing.allocator);
+
+    const key1 = OrderMap.makeKey(1, 100);
+
+    var order1 = std.mem.zeroes(Order);
+    order1.price = 5000;
+    order1.side = .buy;
+    order1.remaining_qty = 10;
+
+    var order2 = std.mem.zeroes(Order);
+    order2.price = 6000;
+    order2.side = .buy;
+    order2.remaining_qty = 20;
+
+    const loc1 = OrderLocation{ .side = .buy, .price = 5000, .order_ptr = &order1 };
+    const loc2 = OrderLocation{ .side = .buy, .price = 6000, .order_ptr = &order2 };
+
+    // First insert should succeed
+    try std.testing.expect(map.insert(key1, loc1));
+    try std.testing.expectEqual(@as(u32, 1), map.count);
+    try std.testing.expectEqual(@as(u64, 0), map.duplicate_rejects);
+
+    // Duplicate insert should fail gracefully (not panic!)
+    try std.testing.expect(!map.insert(key1, loc2));
+    try std.testing.expectEqual(@as(u32, 1), map.count); // Count unchanged
+    try std.testing.expectEqual(@as(u64, 1), map.duplicate_rejects);
+
+    // Original order should still be there
+    const found = map.find(key1);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqual(@as(u32, 5000), found.?.price); // Original price, not 6000
 }
 
 test "OrderMap key validation" {
