@@ -11,7 +11,26 @@
 //! - Rule 7: All errors returned, never ignored silently
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
+
+// ============================================================================
+// Platform Detection
+// ============================================================================
+const is_linux = builtin.os.tag == .linux;
+const is_darwin = builtin.os.tag.isDarwin();
+
+// ============================================================================
+// Cross-Platform TCP Socket Option Constants
+// ============================================================================
+// TCP_NODELAY is 1 on both Linux and macOS
+const TCP_NODELAY: u32 = 1;
+
+// TCP_QUICKACK is Linux-only (value 12)
+const TCP_QUICKACK: u32 = 12;
+
+// IPPROTO_TCP value
+const IPPROTO_TCP: u32 = 6;
 
 // ============================================================================
 // IP Address Parsing
@@ -96,12 +115,26 @@ fn formatSockAddrImpl(
 pub fn setLowLatencyOptions(fd: posix.fd_t) void {
     std.debug.assert(fd >= 0);
 
-    // Disable Nagle's algorithm
-    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    // Disable Nagle's algorithm (TCP_NODELAY)
+    // Use raw setsockopt since posix.TCP doesn't exist on macOS
+    _ = std.c.setsockopt(
+        fd,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        &std.mem.toBytes(@as(c_int, 1)),
+        @sizeOf(c_int),
+    );
 
     // Enable quick ack (Linux only, ignored on macOS)
-    const TCP_QUICKACK = 12;
-    posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_QUICKACK, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    if (is_linux) {
+        _ = std.c.setsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_QUICKACK,
+            &std.mem.toBytes(@as(c_int, 1)),
+            @sizeOf(c_int),
+        );
+    }
 }
 
 /// Set socket buffer sizes and return actual receive buffer size achieved.
