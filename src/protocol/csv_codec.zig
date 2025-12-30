@@ -145,7 +145,7 @@ fn parseNewOrder(fields: [][]const u8) codec.CodecError!msg.InputMsg {
     const side = parseSide(side_str[0]) orelse return codec.CodecError.InvalidField;
 
     // P10 Rule 5: Validate parsed data
-    std.debug.assert(symbol_str.len <= msg.MAX_SYMBOL_LENGTH or symbol_str.len > 0);
+    std.debug.assert(symbol_str.len <= msg.MAX_SYMBOL_LENGTH and symbol_str.len > 0);
 
     return msg.InputMsg.newOrder(.{
         .user_id = user_id,

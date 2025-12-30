@@ -311,7 +311,7 @@ pub const ThreadedServer = struct {
         // Initialize queues
         for (0..NUM_PROCESSORS) |i| {
             self.input_queues[i] = try allocator.create(proc.InputQueue);
-            self.input_queues[i].* = proc.InputQueue.init();
+            self.input_queues[i].* = .{}; // old temp copy way -> proc.InputQueue.init();
         }
         errdefer {
             for (0..NUM_PROCESSORS) |i| {
@@ -321,7 +321,7 @@ pub const ThreadedServer = struct {
 
         for (0..NUM_PROCESSORS) |i| {
             self.output_queues[i] = try allocator.create(proc.OutputQueue);
-            self.output_queues[i].* = proc.OutputQueue.init();
+            self.output_queues[i].* = .{}; // proc.OutputQueue.init();
         }
         errdefer {
             for (0..NUM_PROCESSORS) |i| {
