@@ -16,7 +16,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Builder
 # -----------------------------------------------------------------------------
-FROM alpine:3.21 AS builder
+FROM alpine:3.20 AS builder
 
 # Build arguments for architecture detection
 ARG TARGETARCH
@@ -58,19 +58,32 @@ COPY build.zig.zon ./
 COPY src/ src/
 
 # Build optimized release binary
-# ReleaseFast for maximum performance, strip for smaller binary
-RUN zig build -Doptimize=ReleaseFast \
-    && strip /build/zig-out/bin/matching_engine || true
+# ReleaseFast for maximum performance
+RUN zig build -Doptimize=ReleaseFast --summary all
 
-# Verify binary
-RUN ls -la ./zig-out/bin/ && \
-    ./zig-out/bin/matching_engine --version && \
-    file ./zig-out/bin/matching_engine
+# Find and verify binary (handles different Zig versions' output paths)
+# Zig 0.13 uses ./zig-out/bin/, Zig 0.14+ may use .zig-cache/... or custom paths
+RUN echo "=== Finding binary ===" && \
+    find . -name "matching_engine" -type f 2>/dev/null && \
+    BINARY=$(find . -name "matching_engine" -type f -executable 2>/dev/null | head -1) && \
+    if [ -z "$BINARY" ]; then \
+        echo "ERROR: Binary not found!" && \
+        ls -la . && \
+        ls -la zig-out 2>/dev/null || true && \
+        ls -la .zig-cache 2>/dev/null || true && \
+        exit 1; \
+    fi && \
+    echo "Found binary: $BINARY" && \
+    $BINARY --version && \
+    strip $BINARY || true && \
+    mkdir -p /build/out && \
+    cp $BINARY /build/out/matching_engine && \
+    file /build/out/matching_engine
 
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime (Minimal)
 # -----------------------------------------------------------------------------
-FROM alpine:3.21 AS runtime
+FROM alpine:3.20 AS runtime
 
 # Install minimal runtime dependencies
 RUN apk add --no-cache \
@@ -84,7 +97,7 @@ RUN addgroup -g 10000 -S engine \
 
 # Copy binary from builder
 COPY --from=builder --chown=engine:engine \
-    /build/zig-out/bin/matching_engine /usr/local/bin/matching_engine
+    /build/out/matching_engine /usr/local/bin/matching_engine
 
 # Ensure binary is executable
 RUN chmod 755 /usr/local/bin/matching_engine
