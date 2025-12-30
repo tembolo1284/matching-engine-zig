@@ -21,26 +21,28 @@ FROM alpine:3.20 AS builder
 # Build arguments for architecture detection
 ARG TARGETARCH
 # Zig version: Your code uses 0.15+ syntax (tuple constraints in inline asm)
-# Use 0.15.0 or later
-ARG ZIG_VERSION=0.15.0
+# Use 0.15.2 (latest stable as of Dec 2025)
+ARG ZIG_VERSION=0.15.2
 
 # Install build dependencies
 RUN apk add --no-cache \
     curl \
     xz \
     tar \
-    musl-dev
+    musl-dev \
+    file
 
 # Download and install Zig based on target architecture
+# Note: Zig 0.15.x uses format: zig-{arch}-{os}-{version}
 RUN case "${TARGETARCH}" in \
         "amd64") ZIG_ARCH="x86_64" ;; \
         "arm64") ZIG_ARCH="aarch64" ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
     echo "Installing Zig ${ZIG_VERSION} for ${ZIG_ARCH}" && \
-    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ && \
-    mv "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" /opt/zig
+    mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /opt/zig
 
 ENV PATH="/opt/zig:${PATH}"
 
