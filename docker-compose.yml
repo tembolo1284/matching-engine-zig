@@ -1,111 +1,217 @@
 # =============================================================================
-# Zig Matching Engine - Docker Compose
+# Zig Matching Engine - Docker Compose (Production)
 # =============================================================================
 #
 # Usage:
-#   docker compose up -d          # Start
-#   docker compose logs -f        # View logs
-#   docker compose down           # Stop
+#   docker compose up -d              # Start in background
+#   docker compose logs -f            # View logs
+#   docker compose down               # Stop and remove
+#   docker compose up -d --build      # Rebuild and start
 #
-# Modes:
-#   docker compose up -d                    # Single-threaded
-#   ENGINE_THREADED=true docker compose up  # Dual-processor
+# Profiles:
+#   docker compose up -d                        # Default (threaded mode)
+#   docker compose --profile monitoring up -d   # With monitoring stack
 #
 # =============================================================================
 
 services:
+  # ---------------------------------------------------------------------------
+  # Matching Engine - Core Service
+  # ---------------------------------------------------------------------------
   matching-engine:
     build:
       context: .
       dockerfile: Dockerfile
-    image: zig-matching-engine:latest
+      # Multi-platform build support
+      platforms:
+        - linux/amd64
+        - linux/arm64
+
+    image: zig-matching-engine:${TAG:-latest}
     container_name: matching-engine
-    
+    hostname: matching-engine
+
     # Port mappings (host:container)
     ports:
-      - "1234:1234"      # TCP
-      - "1235:1235/udp"  # UDP
-      - "1236:1236/udp"  # Multicast (if needed)
-    
+      - "${TCP_PORT:-1234}:1234"        # TCP (length-prefixed)
+      - "${UDP_PORT:-1235}:1235/udp"    # UDP (raw messages)
+      # Multicast typically requires host networking, see below
+
     # Environment configuration
     environment:
-      - ENGINE_TCP_ENABLED=true
+      # Transport settings
+      - ENGINE_TCP_ENABLED=${ENGINE_TCP_ENABLED:-true}
       - ENGINE_TCP_PORT=1234
-      - ENGINE_UDP_ENABLED=true
+      - ENGINE_UDP_ENABLED=${ENGINE_UDP_ENABLED:-true}
       - ENGINE_UDP_PORT=1235
-      - ENGINE_MCAST_ENABLED=true
-      - ENGINE_MCAST_GROUP=239.255.0.1
+      # Multicast disabled by default in bridge networking
+      - ENGINE_MCAST_ENABLED=${ENGINE_MCAST_ENABLED:-false}
+      - ENGINE_MCAST_GROUP=${ENGINE_MCAST_GROUP:-239.255.0.1}
       - ENGINE_MCAST_PORT=1236
-      - ENGINE_THREADED=${ENGINE_THREADED:-false}
-    
-    # Restart policy
+      # Threading
+      - ENGINE_THREADED=${ENGINE_THREADED:-true}
+
+    # Restart policy for production
     restart: unless-stopped
-    
-    # Resource limits (adjust based on your needs)
+
+    # Resource limits
     deploy:
       resources:
         limits:
-          cpus: '2.0'
-          memory: 512M
+          cpus: '${CPU_LIMIT:-2.0}'
+          memory: ${MEMORY_LIMIT:-512M}
         reservations:
           cpus: '0.5'
           memory: 128M
-    
-    # Health check
+
+    # System limits for high-performance networking
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      memlock:
+        soft: -1
+        hard: -1
+
+    # Health check - verify TCP port is accepting connections
     healthcheck:
-      test: ["CMD", "sh", "-c", "timeout 1 sh -c 'echo > /dev/tcp/localhost/9000' 2>/dev/null"]
+      test: ["CMD", "nc", "-z", "localhost", "1234"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-    
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
     # Logging configuration
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
-    
+        max-size: "50m"
+        max-file: "5"
+        tag: "{{.Name}}"
+
     # Network
     networks:
       - trading-net
 
-  # Optional: Prometheus metrics exporter (placeholder for future)
-  # metrics:
-  #   image: prom/prometheus:latest
-  #   ports:
-  #     - "9090:9090"
-  #   networks:
-  #     - trading-net
+  # ---------------------------------------------------------------------------
+  # Matching Engine - Host Network Mode (for Multicast)
+  # ---------------------------------------------------------------------------
+  # Uncomment this service and comment out the above if you need multicast
+  #
+  # matching-engine-multicast:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   image: zig-matching-engine:${TAG:-latest}
+  #   container_name: matching-engine
+  #   network_mode: host
+  #   environment:
+  #     - ENGINE_TCP_ENABLED=true
+  #     - ENGINE_TCP_PORT=${TCP_PORT:-1234}
+  #     - ENGINE_UDP_ENABLED=true
+  #     - ENGINE_UDP_PORT=${UDP_PORT:-1235}
+  #     - ENGINE_MCAST_ENABLED=true
+  #     - ENGINE_MCAST_GROUP=${ENGINE_MCAST_GROUP:-239.255.0.1}
+  #     - ENGINE_MCAST_PORT=${MCAST_PORT:-1236}
+  #     - ENGINE_THREADED=true
+  #   restart: unless-stopped
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   read_only: true
+  #   cap_drop:
+  #     - ALL
+  #   cap_add:
+  #     - NET_BIND_SERVICE
+  #     - NET_RAW
 
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
 networks:
   trading-net:
     driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 9000  # Jumbo frames if supported
     ipam:
       config:
-        - subnet: 172.28.0.0/16
+        - subnet: 172.28.0.0/24
 
 # =============================================================================
-# Usage Examples
+# AWS ECS Task Definition Notes
 # =============================================================================
 #
-# Basic start:
+# When deploying to AWS ECS/Fargate, create a task definition with:
+#
+# {
+#   "family": "matching-engine",
+#   "networkMode": "awsvpc",
+#   "requiresCompatibilities": ["FARGATE"],
+#   "cpu": "1024",
+#   "memory": "2048",
+#   "containerDefinitions": [{
+#     "name": "matching-engine",
+#     "image": "<account>.dkr.ecr.<region>.amazonaws.com/matching-engine:latest",
+#     "portMappings": [
+#       {"containerPort": 1234, "protocol": "tcp"},
+#       {"containerPort": 1235, "protocol": "udp"}
+#     ],
+#     "environment": [
+#       {"name": "ENGINE_THREADED", "value": "true"},
+#       {"name": "ENGINE_MCAST_ENABLED", "value": "false"}
+#     ],
+#     "healthCheck": {
+#       "command": ["CMD", "nc", "-z", "localhost", "1234"],
+#       "interval": 30,
+#       "timeout": 5,
+#       "retries": 3,
+#       "startPeriod": 10
+#     },
+#     "logConfiguration": {
+#       "logDriver": "awslogs",
+#       "options": {
+#         "awslogs-group": "/ecs/matching-engine",
+#         "awslogs-region": "<region>",
+#         "awslogs-stream-prefix": "ecs"
+#       }
+#     }
+#   }]
+# }
+#
+# =============================================================================
+
+# =============================================================================
+# Quick Reference
+# =============================================================================
+#
+# Start:
 #   docker compose up -d
-#
-# Threaded mode:
-#   ENGINE_THREADED=true docker compose up -d
-#
-# Custom ports:
-#   ENGINE_TCP_PORT=8000 ENGINE_UDP_PORT=8001 docker compose up -d
-#
-# View logs:
-#   docker compose logs -f matching-engine
 #
 # Stop:
 #   docker compose down
 #
-# Rebuild after code changes:
+# View logs:
+#   docker compose logs -f matching-engine
+#
+# Rebuild:
 #   docker compose build --no-cache
 #   docker compose up -d
+#
+# Scale (if using swarm):
+#   docker compose up -d --scale matching-engine=3
+#
+# Override ports:
+#   TCP_PORT=8000 UDP_PORT=8001 docker compose up -d
+#
+# Production settings:
+#   CPU_LIMIT=4.0 MEMORY_LIMIT=2G docker compose up -d
 #
 # =============================================================================

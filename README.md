@@ -1,14 +1,15 @@
 # Zig Matching Engine
 
-A high-performance order matching engine written in Zig, designed for low-latency trading systems. Features a dual-processor architecture with lock-free communication, supporting both TCP and UDP protocols with CSV and binary message formats.
+A high-performance order matching engine written in Zig, designed for low-latency trading systems. Features a dual-processor architecture with lock-free communication, supporting TCP, UDP, and multicast protocols with CSV, binary, and FIX message formats.
 
 ## Features
 
 - **High Performance**: Lock-free SPSC queues, zero-copy message passing, O(1) order operations
 - **Dual-Processor Architecture**: Symbol-based partitioning (A-M / N-Z) for parallel matching
-- **Multiple Protocols**: TCP (framed), UDP (stateless), Multicast (market data)
-- **Multiple Codecs**: CSV (human-readable), Binary (low-latency), FIX (industry standard)
+- **Multiple Transports**: TCP (length-prefixed framing), UDP (stateless), Multicast (market data)
+- **Multiple Codecs**: CSV (human-readable), Binary (low-latency), FIX 4.2 (industry standard)
 - **NASA Power of Ten Compliant**: Bounded loops, extensive assertions, no dynamic allocation in hot path
+- **Cross-Platform**: Linux (epoll) and macOS (kqueue) with optimized I/O
 - **Production Ready**: Graceful shutdown, health monitoring, comprehensive statistics
 
 ## Quick Start
@@ -27,7 +28,16 @@ make run-threaded
 make run
 ```
 
-See [QUICK_START.md](QUICK_START.md) for detailed setup instructions.
+### Send a Test Order
+
+```bash
+# UDP (no framing needed)
+echo "N, 1, AAPL, 15000, 100, B, 1" | nc -u -w1 localhost 1235
+
+# TCP requires length-prefix framing - use the Python example below
+```
+
+See [docs/QUICK_START.md](docs/QUICK_START.md) for detailed setup instructions.
 
 ## Architecture Overview
 
@@ -36,14 +46,15 @@ See [QUICK_START.md](QUICK_START.md) for detailed setup instructions.
 │                      I/O Thread                              │
 │  ┌───────────┐  ┌───────────┐  ┌─────────────────────────┐  │
 │  │TCP Server │  │UDP Server │  │ Multicast Publisher     │  │
-│  │(framed)   │  │(stateless)│  │ (market data feed)      │  │
+│  │ :1234     │  │ :1235     │  │ 239.255.0.1:1236        │  │
 │  └─────┬─────┘  └─────┬─────┘  └───────────┬─────────────┘  │
 │        │              │                    │                 │
 │        └──────────────┼────────────────────┘                 │
 │                       │                                      │
 │              ┌────────▼────────┐                             │
-│              │  Message Router │                             │
-│              │  (A-M / N-Z)    │                             │
+│              │  Symbol Router  │                             │
+│              │  (A-M → P0)     │                             │
+│              │  (N-Z → P1)     │                             │
 │              └────────┬────────┘                             │
 └───────────────────────┼─────────────────────────────────────┘
                         │
@@ -59,12 +70,12 @@ See [QUICK_START.md](QUICK_START.md) for detailed setup instructions.
 │   Symbols A-M     │       │   Symbols N-Z     │
 │  ┌─────────────┐  │       │  ┌─────────────┐  │
 │  │ OrderBooks  │  │       │  │ OrderBooks  │  │
-│  │ (hash map)  │  │       │  │ (hash map)  │  │
+│  │ MemoryPools │  │       │  │ MemoryPools │  │
 │  └─────────────┘  │       │  └─────────────┘  │
 └───────────────────┘       └───────────────────┘
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentation.
 
 ## Project Structure
 
@@ -73,23 +84,25 @@ src/
 ├── core/                   # Matching engine core
 │   ├── matching_engine.zig # Main engine orchestration
 │   ├── order_book.zig      # Price-time priority order book
+│   ├── order_map.zig       # O(1) order lookup by ID
 │   ├── memory_pool.zig     # Fixed-size memory allocators
-│   └── order.zig           # Order data structures
+│   ├── order.zig           # Order data structures
+│   └── output_buffer.zig   # Output message collection
 │
 ├── protocol/               # Message encoding/decoding
 │   ├── message_types.zig   # Input/Output message definitions
 │   ├── codec.zig           # Protocol detection & routing
 │   ├── csv_codec.zig       # Human-readable CSV format
 │   ├── binary_codec.zig    # Low-latency binary format
-│   └── fix_codec.zig       # FIX protocol support
+│   └── fix_codec.zig       # FIX 4.2 protocol support
 │
 ├── transport/              # Network I/O layer
-│   ├── tcp_server.zig      # TCP with length-prefixed framing
-│   ├── tcp_client.zig      # Client connection management
+│   ├── tcp_server.zig      # TCP with epoll/kqueue
+│   ├── tcp_client.zig      # Per-connection state & buffers
 │   ├── udp_server.zig      # Stateless UDP with client tracking
-│   ├── multicast.zig       # Market data multicast publisher
+│   ├── multicast.zig       # Market data publisher/subscriber
 │   ├── config.zig          # Configuration management
-│   └── net_utils.zig       # Network utilities
+│   └── net_utils.zig       # Cross-platform network utilities
 │
 ├── threading/              # Multi-threaded architecture
 │   ├── threaded_server.zig # I/O thread + message routing
@@ -98,46 +111,164 @@ src/
 │
 ├── collections/            # Data structures
 │   ├── spsc_queue.zig      # Lock-free single-producer/single-consumer
-│   └── object_pool.zig     # Fixed-capacity object pool
+│   └── bounded_channel.zig # Higher-level channel abstraction
 │
-└── main.zig                # Entry point
+└── main.zig                # Entry point & signal handling
 ```
 
 ## Message Formats
 
 ### CSV Format (Human-Readable)
 
+**Input Messages:**
+
 ```
-# New Order: N,<symbol>,<user_id>,<user_order_id>,<side>,<price>,<quantity>
-N,AAPL,1001,1,B,150.00,100
+# New Order: N, <user_id>, <symbol>, <price>, <qty>, <side>, <user_order_id>
+N, 1001, AAPL, 15000, 100, B, 1
 
-# Cancel: C,<symbol>,<user_id>,<user_order_id>
-C,AAPL,1001,1
+# Cancel: C, <user_id>, <user_order_id>, [symbol]
+C, 1001, 1, AAPL
 
-# Acknowledgment: A,<symbol>,<user_order_id>,<status>
-A,AAPL,1,0
-
-# Trade: T,<symbol>,<price>,<quantity>,<buy_order_id>,<sell_order_id>
-T,AAPL,150.00,100,1,2
-
-# Reject: R,<symbol>,<user_order_id>,<reason>
-R,AAPL,1,1
+# Flush (testing only)
+F
 ```
+
+**Output Messages:**
+
+```
+# Acknowledgment: A, <symbol>, <user_id>, <user_order_id>
+A, AAPL, 1001, 1
+
+# Trade: T, <symbol>, <buy_uid>, <buy_oid>, <sell_uid>, <sell_oid>, <price>, <qty>
+T, AAPL, 1001, 1, 1002, 1, 15000, 100
+
+# Top of Book: B, <symbol>, <side>, <price>, <qty>
+B, AAPL, B, 15000, 500
+
+# Cancel Ack: C, <symbol>, <user_id>, <user_order_id>
+C, AAPL, 1001, 1
+
+# Reject: R, <symbol>, <user_id>, <user_order_id>, <reason>
+R, AAPL, 1001, 1, 3
+```
+
+**Notes:**
+- Price is in integer units (e.g., cents): 15000 = $150.00
+- Side: `B` for buy, `S` for sell
+- Whitespace around commas is optional
 
 ### Binary Format (Low-Latency)
 
-Fixed 64-byte messages with native byte order for minimal parsing overhead.
+All integers are **big-endian** (network byte order). Messages are variable-length with a magic byte prefix.
 
-| Field | Offset | Size | Description |
-|-------|--------|------|-------------|
-| msg_type | 0 | 1 | Message type enum |
-| side | 1 | 1 | Buy (1) / Sell (2) |
-| symbol | 2 | 8 | Null-padded symbol |
-| user_id | 10 | 4 | User identifier |
-| user_order_id | 14 | 4 | User's order ID |
-| price | 18 | 8 | Price (scaled integer) |
-| quantity | 26 | 4 | Order quantity |
-| _padding | 30 | 34 | Reserved (zero-filled) |
+**New Order (27 bytes):**
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 1 | magic | 0x4D ('M') |
+| 1 | 1 | msg_type | 0x4E ('N') |
+| 2 | 4 | user_id | User identifier |
+| 6 | 8 | symbol | Null-padded symbol |
+| 14 | 4 | price | Price (integer) |
+| 18 | 4 | quantity | Order quantity |
+| 22 | 1 | side | 'B' (0x42) or 'S' (0x53) |
+| 23 | 4 | user_order_id | User's order ID |
+
+**Cancel (18 bytes):**
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 1 | magic (0x4D) |
+| 1 | 1 | msg_type (0x43 = 'C') |
+| 2 | 4 | user_id |
+| 6 | 8 | symbol |
+| 14 | 4 | user_order_id |
+
+**Trade (34 bytes):**
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 1 | magic (0x4D) |
+| 1 | 1 | msg_type (0x54 = 'T') |
+| 2 | 8 | symbol |
+| 10 | 4 | buy_user_id |
+| 14 | 4 | buy_order_id |
+| 18 | 4 | sell_user_id |
+| 22 | 4 | sell_order_id |
+| 26 | 4 | price |
+| 30 | 4 | quantity |
+
+### FIX 4.2 Format
+
+Standard FIX protocol with SOH (0x01) or pipe ('|') delimiters:
+
+```
+8=FIX.4.2|9=73|35=D|1=1001|11=1|55=AAPL|54=1|38=100|40=2|44=15000|10=178|
+```
+
+Supported message types:
+- `D` (NewOrderSingle)
+- `F` (OrderCancelRequest)
+- `8` (ExecutionReport)
+
+## TCP Framing
+
+TCP uses 4-byte **big-endian** length-prefix framing:
+
+```
+┌────────────────┬─────────────────────────────────┐
+│  4 bytes (BE)  │         N bytes                 │
+│  message len   │         payload                 │
+└────────────────┴─────────────────────────────────┘
+```
+
+## Configuration
+
+### Default Ports
+
+| Transport | Port | Protocol |
+|-----------|------|----------|
+| TCP | 1234 | Length-prefixed messages |
+| UDP | 1235 | Raw messages (no framing) |
+| Multicast | 1236 | Market data (239.255.0.1) |
+
+### Environment Variables
+
+```bash
+# Threading
+ENGINE_THREADED=true          # Enable dual-processor mode
+
+# TCP
+ENGINE_TCP_ENABLED=true       # Enable TCP transport
+ENGINE_TCP_PORT=1234          # TCP listen port
+ENGINE_TCP_IDLE_TIMEOUT=300   # Idle disconnect (seconds)
+
+# UDP
+ENGINE_UDP_ENABLED=true       # Enable UDP transport
+ENGINE_UDP_PORT=1235          # UDP listen port
+
+# Multicast
+ENGINE_MCAST_ENABLED=true     # Enable multicast publisher
+ENGINE_MCAST_GROUP=239.255.0.1  # Multicast group address
+ENGINE_MCAST_PORT=1236        # Multicast port
+ENGINE_MCAST_TTL=1            # TTL (1 = local subnet)
+
+# Performance
+ENGINE_CHANNEL_CAPACITY=65536 # SPSC queue size (power of 2)
+ENGINE_BINARY_PROTOCOL=false  # Use binary instead of CSV
+```
+
+### Command Line Options
+
+```bash
+matching_engine [OPTIONS]
+
+Options:
+  -h, --help       Show help message
+  -v, --version    Show version information
+  -t, --threaded   Run in dual-processor mode
+  --verbose        Enable verbose logging
+```
 
 ## Performance Characteristics
 
@@ -146,58 +277,78 @@ Fixed 64-byte messages with native byte order for minimal parsing overhead.
 | Latency (p50) | < 10 μs | Order entry to ack |
 | Latency (p99) | < 50 μs | Including queue wait |
 | Throughput | > 200K orders/sec | Per processor |
-| Memory | ~50 MB | Fixed allocation |
+| Memory | ~100 MB | Fixed allocation at startup |
 
-## Configuration
+## Client Examples
 
-Environment variables:
+### Python (CSV over TCP)
 
-```bash
-# Network
-ME_TCP_PORT=8080          # TCP server port
-ME_UDP_PORT=8081          # UDP server port
-ME_MCAST_GROUP=239.0.0.1  # Multicast group
-ME_MCAST_PORT=8082        # Multicast port
+```python
+import socket
+import struct
 
-# Performance
-ME_CHANNEL_CAPACITY=65536 # SPSC queue size (power of 2)
-ME_TRACK_LATENCY=true     # Enable latency tracking
+def send_order(sock, msg: bytes):
+    """Send with 4-byte big-endian length prefix."""
+    sock.send(struct.pack('>I', len(msg)) + msg)
+
+def recv_response(sock) -> bytes:
+    """Receive length-prefixed response."""
+    length = struct.unpack('>I', sock.recv(4))[0]
+    return sock.recv(length)
+
+# Connect
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect(('localhost', 1234))
+
+# Send new order
+msg = b"N, 1001, AAPL, 15000, 100, B, 1\n"
+send_order(sock, msg)
+
+# Receive ack
+response = recv_response(sock)
+print(response.decode())  # A, AAPL, 1001, 1
+
+sock.close()
 ```
 
-## Testing
+### Python (Binary over UDP)
 
-```bash
-# Run all tests
-make test
+```python
+import socket
+import struct
 
-# Run specific module tests
-zig build test --summary all
+def make_new_order(user_id, symbol, price, qty, side, order_id):
+    """Create binary new order message (27 bytes)."""
+    return struct.pack(
+        '>BB I 8s I I B I',
+        0x4D,                           # magic
+        ord('N'),                       # msg_type
+        user_id,
+        symbol.encode().ljust(8, b'\x00'),
+        price,
+        qty,
+        ord(side),
+        order_id
+    )
 
-# Run with verbose output
-zig build test -Dtest-filter="order_book"
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+msg = make_new_order(1001, "AAPL", 15000, 100, 'B', 1)
+sock.sendto(msg, ('localhost', 1235))
 ```
 
-## Safety & Reliability
+### netcat (CSV over UDP)
 
-This codebase follows the **NASA Power of Ten** rules for safety-critical software:
-
-1. **Simple Control Flow**: No goto, setjmp, or recursion
-2. **Bounded Loops**: All loops have explicit iteration limits
-3. **No Dynamic Allocation**: Fixed-size buffers, pool allocators
-4. **Short Functions**: All functions ≤60 lines
-5. **High Assertion Density**: ≥2 assertions per function average
-6. **Minimal Scope**: Variables declared at narrowest scope
-7. **Check All Returns**: All error codes checked
-8. **Limited Preprocessor**: Minimal comptime complexity
-9. **Pointer Discipline**: Restricted pointer usage, no pointer arithmetic
-10. **Compiler Warnings**: Treat all warnings as errors
+```bash
+# Send order
+echo "N, 1001, AAPL, 15000, 100, B, 1" | nc -u -w1 localhost 1235
+```
 
 ## Building from Source
 
 ### Requirements
 
 - Zig 0.13.0 or later
-- Linux (primary), macOS (supported), Windows (experimental)
+- Linux or macOS (Windows not currently supported)
 - Make (optional, for convenience targets)
 
 ### Build Commands
@@ -209,36 +360,56 @@ zig build
 # Release build (optimized)
 zig build -Doptimize=ReleaseFast
 
-# Run directly
-zig build run -- --mode threaded
+# Run with arguments
+zig build run -- --threaded
+
+# Run all tests
+zig build test
 
 # Generate documentation
 zig build docs
 ```
 
-## Client Examples
-
-### Python (CSV over TCP)
-
-```python
-import socket
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('localhost', 8080))
-
-# Send order (length-prefixed)
-msg = b"N,AAPL,1001,1,B,15000,100\n"
-sock.send(len(msg).to_bytes(4, 'little') + msg)
-
-# Receive response
-length = int.from_bytes(sock.recv(4), 'little')
-response = sock.recv(length)
-print(response.decode())
-```
-
-### netcat (CSV over UDP)
+## Testing
 
 ```bash
-# Send order
-echo "N,AAPL,1001,1,B,15000,100" | nc -u localhost 8081
+# Run all tests
+make test
+
+# Run with verbose output
+zig build test --summary all
+
+# Type-check without codegen (fast)
+make check
 ```
+
+## Safety & Reliability
+
+This codebase follows the **NASA Power of Ten** rules for safety-critical software:
+
+1. **Simple Control Flow**: No goto, setjmp, or recursion
+2. **Bounded Loops**: All loops have explicit iteration limits
+3. **No Dynamic Allocation in Hot Path**: Fixed-size buffers, pool allocators
+4. **Short Functions**: Most functions ≤60 lines
+5. **High Assertion Density**: Debug assertions validate invariants
+6. **Minimal Scope**: Variables declared at narrowest scope
+7. **Check All Returns**: All errors propagated or handled explicitly
+8. **Limited Preprocessor**: Minimal comptime complexity
+9. **Pointer Discipline**: No raw pointer arithmetic on untrusted data
+10. **Compiler Warnings**: ReleaseSafe mode for production
+
+## Reject Reason Codes
+
+| Code | Reason |
+|------|--------|
+| 1 | Unknown symbol |
+| 2 | Invalid quantity |
+| 3 | Invalid price |
+| 4 | Order not found |
+| 5 | Duplicate order ID |
+| 6 | Pool exhausted |
+| 7 | Unauthorized |
+| 8 | Throttled |
+| 9 | Book full |
+| 10 | Invalid order ID |
+
