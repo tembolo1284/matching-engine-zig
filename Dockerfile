@@ -20,9 +20,9 @@ FROM alpine:3.20 AS builder
 
 # Build arguments for architecture detection
 ARG TARGETARCH
-# Zig version: Use 0.14.0 (March 2025 stable) or 0.13.0 (older stable)
-# Check your build.zig API compatibility before changing
-ARG ZIG_VERSION=0.14.0
+# Zig version: Your code uses 0.15+ syntax (tuple constraints in inline asm)
+# Use 0.15.0 or later
+ARG ZIG_VERSION=0.15.0
 
 # Install build dependencies
 RUN apk add --no-cache \
