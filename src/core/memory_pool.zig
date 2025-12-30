@@ -119,11 +119,11 @@ pub const OrderPool = struct {
         if (capacity > MAX_POOL_CAPACITY) return error.CapacityTooLarge;
 
         // Allocate order storage with cache-line alignment
-        const orders = try allocator.alignedAlloc(Order, ORDER_ALIGNMENT, capacity);
+        const orders = try allocator.alignedAlloc(Order, .@"64", capacity);
         errdefer allocator.free(orders);
 
         // Allocate free list with cache-line alignment for hot path access
-        const free_list = try allocator.alignedAlloc(OrderIndex, CACHE_LINE_SIZE, capacity);
+        const free_list = try allocator.alignedAlloc(OrderIndex, .@"64", capacity);
         errdefer allocator.free(free_list);
 
         // Initialize free list in reverse order so first acquire() returns index 0.

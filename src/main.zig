@@ -7,10 +7,8 @@
 //! - TCP/UDP/Multicast transport
 //! - CSV, Binary, and FIX protocol support
 //! - Cross-platform (Linux/macOS)
-
 const std = @import("std");
 const builtin = @import("builtin");
-
 const msg = @import("protocol/message_types.zig");
 const MemoryPools = @import("core/memory_pool.zig").MemoryPools;
 const MatchingEngine = @import("core/matching_engine.zig").MatchingEngine;
@@ -24,17 +22,15 @@ pub const BUILD_MODE = @tagName(builtin.mode);
 // ============================================================================
 // Platform Detection
 // ============================================================================
-
 const is_linux = builtin.os.tag == .linux;
 const is_darwin = builtin.os.tag.isDarwin();
 
 // ============================================================================
 // Signal Handling
 // ============================================================================
-
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-fn signalHandler(sig: c_int) callconv(.C) void {
+fn signalHandler(sig: c_int) callconv(.c) void {
     _ = sig;
     shutdown_requested.store(true, .release);
 }
@@ -42,19 +38,17 @@ fn signalHandler(sig: c_int) callconv(.C) void {
 fn setupSignalHandlers() void {
     const sigint_action = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-
     const sigterm_action = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-
     const sigpipe_action = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
 
@@ -74,7 +68,6 @@ fn setupSignalHandlers() void {
 // ============================================================================
 // Configuration / Options
 // ============================================================================
-
 const RunMode = enum {
     single_threaded,
     threaded,
@@ -156,7 +149,6 @@ fn printUsage() void {
         \\  ENGINE_TCP_PORT=5000 matching_engine  # Custom TCP port
         \\
     ;
-
     std.debug.print(usage, .{ VERSION, BUILD_MODE });
 }
 
@@ -171,7 +163,6 @@ fn printVersion() void {
 // ============================================================================
 // Startup Validation
 // ============================================================================
-
 fn validateConfig(config: *const cfg.Config) !void {
     config.validate() catch |err| {
         std.log.err("Configuration error: {any}", .{err});
@@ -211,7 +202,6 @@ const SHUTDOWN_DRAIN_TIMEOUT_MS: i32 = 50;
 // ============================================================================
 // Server Runners
 // ============================================================================
-
 fn runSingleThreaded(allocator: std.mem.Allocator, config: cfg.Config, verbose: bool) !void {
     if (verbose) std.log.info("Initializing single-threaded mode...", .{});
 
@@ -291,6 +281,7 @@ fn runThreaded(allocator: std.mem.Allocator, config: cfg.Config, verbose: bool) 
 
     // Print statistics before stopping
     printThreadedStats(server);
+
     server.stop();
 }
 
@@ -301,27 +292,32 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     std.log.info("╔════════════════════════════════════════════╗", .{});
     std.log.info("║     Zig Matching Engine v{s}             ║", .{VERSION});
     std.log.info("╠════════════════════════════════════════════╣", .{});
+
     if (config.tcp_enabled) {
         std.log.info("║  TCP:       {s}:{d:<5}                  ║", .{
             config.tcp_addr,
             config.tcp_port,
         });
     }
+
     if (config.udp_enabled) {
         std.log.info("║  UDP:       {s}:{d:<5}                  ║", .{
             config.udp_addr,
             config.udp_port,
         });
     }
+
     if (config.mcast_enabled) {
         std.log.info("║  Multicast: {s}:{d:<5}              ║", .{
             config.mcast_group,
             config.mcast_port,
         });
     }
+
     const protocol_str = if (config.use_binary_protocol) "Binary" else "CSV";
     std.log.info("║  Protocol:  {s:<30} ║", .{protocol_str});
     std.log.info("║  I/O:       {s:<30} ║", .{backend});
+
     if (threaded) {
         std.log.info("║  Mode:      Dual-Processor                 ║", .{});
         std.log.info("║  Proc 0:    Symbols A-M                    ║", .{});
@@ -329,6 +325,7 @@ fn printStartupBanner(config: cfg.Config, threaded: bool) void {
     } else {
         std.log.info("║  Mode:      Single-Threaded                ║", .{});
     }
+
     std.log.info("╚════════════════════════════════════════════╝", .{});
     std.log.info("", .{});
     std.log.info("Press Ctrl+C to shutdown gracefully", .{});
@@ -355,6 +352,7 @@ fn printThreadedStats(server: *ThreadedServer) void {
         std.log.info("    Messages:    {d}", .{ps.messages_processed});
         std.log.info("    Outputs:     {d}", .{ps.outputs_generated});
         std.log.info("    Backpressure:{d}", .{ps.output_backpressure_count});
+
         if (ps.messages_processed > 0) {
             const total_time: i128 = ps.total_processing_time_ns;
             const msg_count: i128 = @intCast(ps.messages_processed);
@@ -362,6 +360,7 @@ fn printThreadedStats(server: *ThreadedServer) void {
             std.log.info("    Avg latency: {d}ns", .{avg_ns});
         }
     }
+
     std.log.info("═══════════════════════════════════════════════════", .{});
     std.log.info("", .{});
 }
@@ -369,7 +368,6 @@ fn printThreadedStats(server: *ThreadedServer) void {
 // ============================================================================
 // Main Entry Point
 // ============================================================================
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -409,7 +407,6 @@ pub fn main() !void {
 // ============================================================================
 // Tests
 // ============================================================================
-
 test "signal handler setup" {
     // Just verify it doesn't crash
     setupSignalHandlers();

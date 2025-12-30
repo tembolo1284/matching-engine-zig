@@ -83,47 +83,19 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&check_exe.step);
 
     // =========================================================================
-    // Client Tool
+    // Client Tool (DISABLED - needs module refactoring for 0.15)
     // =========================================================================
-    const client_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/client.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    client_mod.addImport("message_types", b.createModule(.{
-        .root_source_file = b.path("src/protocol/message_types.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    client_mod.addImport("codec", b.createModule(.{
-        .root_source_file = b.path("src/protocol/codec.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    client_mod.addImport("csv_codec", b.createModule(.{
-        .root_source_file = b.path("src/protocol/csv_codec.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    client_mod.addImport("binary_codec", b.createModule(.{
-        .root_source_file = b.path("src/protocol/binary_codec.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-
-    const client_exe = b.addExecutable(.{
-        .name = "engine_client",
-        .root_module = client_mod,
-    });
-    b.installArtifact(client_exe);
-
-    const run_client = b.addRunArtifact(client_exe);
-    if (b.args) |args| {
-        run_client.addArgs(args);
-    }
-    const client_step = b.step("client", "Build and run the test client");
-    client_step.dependOn(&run_client.step);
+    // TODO: Re-enable after fixing module imports for Zig 0.15
+    // const client_exe = b.addExecutable(.{
+    //     .name = "engine_client",
+    //     .root_module = b.createModule(.{
+    //         .root_source_file = b.path("src/tools/client.zig"),
+    //         .target = target,
+    //         .optimize = optimize,
+    //         .link_libc = true,
+    //     }),
+    // });
+    // b.installArtifact(client_exe);
 
     // =========================================================================
     // Documentation
