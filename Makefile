@@ -217,7 +217,6 @@ docker-run: docker
 		--name $(DOCKER_CONTAINER) \
 		-p $(TCP_PORT):$(TCP_PORT) \
 		-p $(UDP_PORT):$(UDP_PORT)/udp \
-		-p $(MCAST_PORT):$(MCAST_PORT)/udp \
 		-e ENGINE_BINARY_PROTOCOL=true \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 	@echo "Container started: $(DOCKER_CONTAINER)"
