@@ -13,17 +13,15 @@
 //!   --udp <host:port>    - Connect via UDP
 //!   --binary             - Use binary protocol
 //!   --csv                - Use CSV protocol (default)
-
 const std = @import("std");
-const msg = @import("../protocol/message_types.zig");
-const codec = @import("../protocol/codec.zig");
-const csv_codec = @import("../protocol/csv_codec.zig");
-const binary_codec = @import("../protocol/binary_codec.zig");
+const msg = @import("message_types");
+const codec = @import("codec");
+const csv_codec = @import("csv_codec");
+const binary_codec = @import("binary_codec");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-
     std.debug.print("Matching Engine Test Client\n", .{});
     std.debug.print("Usage: engine_client <host> <port> <command>\n", .{});
     std.debug.print("\nNot yet implemented - use netcat or custom client.\n", .{});

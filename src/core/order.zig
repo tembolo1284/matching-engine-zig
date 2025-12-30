@@ -81,7 +81,7 @@ pub inline fn getCurrentTimestamp() u64 {
             : [lo] "={eax}" (lo),
               [hi] "={edx}" (hi),
             :
-            : "ecx", "memory", // ECX clobbered with processor ID; memory barrier
+            : .{ .ecx = true, .memory = true }
         );
         return (@as(u64, hi) << 32) | lo;
     } else {
