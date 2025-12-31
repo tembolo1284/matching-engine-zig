@@ -277,6 +277,9 @@ const MAX_FRAMES_PER_CLIENT: u32 = 100;
 /// P10 Rule 2: Bounds raw message processing loop.
 const MAX_RAW_BYTES_PER_CLIENT: u32 = 16384;
 
+/// Socket buffer size for high throughput (2MB each direction)
+const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
+
 // Compile-time validation
 comptime {
     std.debug.assert(MAX_CLIENTS > 0);
@@ -284,6 +287,7 @@ comptime {
     std.debug.assert(MAX_ACCEPTS_PER_POLL > 0);
     std.debug.assert(MAX_FRAMES_PER_CLIENT > 0);
     std.debug.assert(MAX_RAW_BYTES_PER_CLIENT > 0);
+    std.debug.assert(SOCKET_BUFFER_SIZE >= 64 * 1024);
 }
 
 // ============================================================================
@@ -557,6 +561,18 @@ pub const TcpServer = struct {
         );
         errdefer posix.close(client_fd);
 
+        // ================================================================
+        // HIGH THROUGHPUT OPTIMIZATION: Increase socket buffer sizes
+        // This allows more pipelining before TCP flow control kicks in
+        // ================================================================
+        const sock_buf_size: u32 = SOCKET_BUFFER_SIZE;
+        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(sock_buf_size)) catch |err| {
+            std.log.debug("Failed to set SO_RCVBUF: {}", .{err});
+        };
+        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(sock_buf_size)) catch |err| {
+            std.log.debug("Failed to set SO_SNDBUF: {}", .{err});
+        };
+
         // Find free slot
         const client_slot = self.clients.allocate() orelse {
             std.log.warn("Max clients ({}) reached, rejecting connection", .{MAX_CLIENTS});
@@ -633,11 +649,17 @@ pub const TcpServer = struct {
     fn handleClientRead(self: *Self, client: *TcpClient) !void {
         std.debug.assert(client.state == .connected);
 
-        // Receive all available data (edge-triggered)
+        // Receive all available data (edge-triggered).
+        // Stop on WouldBlock (no more data) OR BufferFull (need to process first).
         while (true) {
             _ = client.receive() catch |err| {
                 if (err == error.WouldBlock) break;
-                if (err == error.BufferFull) break;
+                if (err == error.BufferFull) {
+                    // Buffer full - process what we have before receiving more.
+                    // This provides natural backpressure to fast clients.
+                    std.log.debug("Client {} buffer full, processing before receiving more", .{client.client_id});
+                    break;
+                }
                 return err;
             };
         }
@@ -974,6 +996,7 @@ test "Constants are valid" {
     try std.testing.expect(MAX_ACCEPTS_PER_POLL > 0);
     try std.testing.expect(MAX_FRAMES_PER_CLIENT > 0);
     try std.testing.expect(MAX_RAW_BYTES_PER_CLIENT > 0);
+    try std.testing.expect(SOCKET_BUFFER_SIZE >= 64 * 1024);
 }
 
 test "TcpServer struct size is reasonable" {
