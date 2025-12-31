@@ -637,6 +637,7 @@ pub const TcpServer = struct {
         while (true) {
             _ = client.receive() catch |err| {
                 if (err == error.WouldBlock) break;
+                if (err == error.BufferFull) break;
                 return err;
             };
         }
