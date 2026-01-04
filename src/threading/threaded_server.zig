@@ -377,9 +377,27 @@ pub const ThreadedServer = struct {
     /// Call stop() or set running to false to exit.
     pub fn run(self: *Self) !void {
         std.log.info("Threaded server running...", .{});
+        
+        var last_stats_time = std.time.milliTimestamp();
+        const stats_interval_ms: i64 = 5000; // Print stats every 5 seconds
+        
         // P10 Rule 2: Loop bounded by running flag
         while (self.running.load(.acquire)) {
             try self.pollOnce(DEFAULT_POLL_TIMEOUT_MS);
+            
+            // Periodic stats logging
+            const now = std.time.milliTimestamp();
+            if (now - last_stats_time >= stats_interval_ms) {
+                const dispatched = self.outputs_dispatched.load(.monotonic);
+                const failures = self.tcp_send_failures.load(.monotonic);
+                const dropped = self.messages_dropped.load(.monotonic);
+                if (dispatched > 0 or failures > 0) {
+                    std.log.info("STATS: outputs={d}, tcp_failures={d}, dropped={d}", .{
+                        dispatched, failures, dropped,
+                    });
+                }
+                last_stats_time = now;
+            }
         }
         std.log.info("Threaded server event loop exited", .{});
     }
@@ -479,6 +497,25 @@ pub const ThreadedServer = struct {
         // Flush all batches at end of drain cycle
         // IMPORTANT: Always flush after processing to ensure no messages stuck in batches
         self.flushAllBatches();
+        
+        // Force flush TCP send buffers to socket
+        // This ensures data is actually sent, not just queued
+        if (total_outputs > 0) {
+            self.flushAllTcpClients();
+        }
+    }
+    
+    /// Attempt to flush all TCP client send buffers.
+    /// This is called after draining outputs to push data to sockets.
+    fn flushAllTcpClients(self: *Self) void {
+        var iter = self.tcp.clients.getActive();
+        while (iter.next()) |client| {
+            if (client.hasPendingSend()) {
+                client.flushSend() catch |err| {
+                    std.log.debug("Client {} flush error: {}", .{ client.client_id, err });
+                };
+            }
+        }
     }
     /// Process a single output message, batching UDP sends.
     fn processOutput(self: *Self, out_msg: *const msg.OutputMsg) void {
