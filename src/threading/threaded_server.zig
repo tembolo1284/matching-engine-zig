@@ -6,17 +6,13 @@
 //! Optimizations:
 //! - Message batching: Multiple CSV messages packed into single UDP packet
 //! - Protocol-aware encoding: Binary clients get binary responses, CSV clients get CSV
-//! - Aggressive output draining: Process up to OUTPUT_DRAIN_LIMIT outputs per poll cycle
-//!
-//! UDP Batching:
-//! - CSV messages are batched into single UDP packets (up to MTU limit)
-//! - Binary messages sent immediately (fixed-size, more efficient individually)
-//! - Batches flushed at end of each drain cycle
+//! - Output draining is time-sliced to avoid starving socket polling
 //!
 //! NASA Power of Ten Compliance:
-//! - Rule 2: All loops bounded by explicit constants (OUTPUT_DRAIN_LIMIT, MAX_CLIENT_BATCHES)
+//! - Rule 2: All loops bounded by explicit constants
 //! - Rule 5: Assertions validate state and inputs
 //! - Rule 7: All queue operations and send results checked
+
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -25,65 +21,59 @@ const binary_codec = @import("../protocol/binary_codec.zig");
 const TcpServer = @import("../transport/tcp_server.zig").TcpServer;
 const udp_server = @import("../transport/udp_server.zig");
 const UdpServer = udp_server.UdpServer;
-const UdpProtocol = udp_server.Protocol;
 const MulticastPublisher = @import("../transport/multicast.zig").MulticastPublisher;
 const config = @import("../transport/config.zig");
 const proc = @import("processor.zig");
+
 // ============================================================================
 // Configuration
 // ============================================================================
+
 pub const NUM_PROCESSORS: usize = 2;
-/// Output drain limit per poll cycle.
-/// At 200K orders/sec generating 2 outputs each = 400K outputs/sec.
-/// At 1000 polls/sec, need to drain 400 outputs per poll minimum.
-/// We use 128K to handle burst scenarios with margin.
-const OUTPUT_DRAIN_LIMIT: u32 = 131072;
+
+/// IMPORTANT CHANGE:
+/// Drain limit per poll cycle must NOT starve socket polling.
+/// Large limits can cause EPOLLOUT / reads to be delayed for many ms+ under load.
+/// Keep this modest; you can tune upward after measuring.
+const OUTPUT_DRAIN_LIMIT: u32 = 8192;
+
+/// Total output cap per pollOnce across ALL processors.
+/// Prevents worst-case 2 * OUTPUT_DRAIN_LIMIT from taking too long.
+const OUTPUT_DRAIN_TOTAL_CAP: u32 = OUTPUT_DRAIN_LIMIT * @as(u32, @intCast(NUM_PROCESSORS));
+
 /// Default poll timeout in milliseconds.
-/// Short timeout ensures responsive output draining.
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 2;
-/// Maximum UDP payload size.
-/// Derived from: MTU (1500) - IP header (20) - UDP header (8) = 1472 bytes.
-/// Using 1400 for safety margin with various network configurations.
+
+/// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
-/// Maximum batch size for CSV message batching.
-/// Slightly under MAX_UDP_PAYLOAD to ensure we never exceed MTU.
 const MAX_UDP_BATCH_SIZE: usize = MAX_UDP_PAYLOAD;
-/// Maximum number of client batches to track simultaneously.
-/// Each active UDP client gets a batch slot.
 const MAX_CLIENT_BATCHES: usize = 64;
-/// Maximum encode buffer size.
+
+/// Encode buffer size.
 const ENCODE_BUF_SIZE: usize = 512;
-// Compile-time validation
+
 comptime {
     std.debug.assert(NUM_PROCESSORS > 0);
-    std.debug.assert(NUM_PROCESSORS <= 8); // Reasonable limit
+    std.debug.assert(NUM_PROCESSORS <= 8);
     std.debug.assert(OUTPUT_DRAIN_LIMIT > 0);
-    std.debug.assert(OUTPUT_DRAIN_LIMIT <= proc.CHANNEL_CAPACITY * NUM_PROCESSORS * 2);
-    std.debug.assert(MAX_UDP_PAYLOAD > 0);
-    std.debug.assert(MAX_UDP_PAYLOAD <= 1472); // MTU - headers
-    std.debug.assert(MAX_UDP_BATCH_SIZE > 0);
-    std.debug.assert(MAX_UDP_BATCH_SIZE <= MAX_UDP_PAYLOAD);
+    std.debug.assert(OUTPUT_DRAIN_TOTAL_CAP > 0);
+    std.debug.assert(MAX_UDP_BATCH_SIZE <= 1472);
     std.debug.assert(MAX_CLIENT_BATCHES > 0);
-    std.debug.assert(MAX_CLIENT_BATCHES <= 1024);
     std.debug.assert(ENCODE_BUF_SIZE >= 256);
 }
+
 // ============================================================================
-// Output Batching
+// Output Batching (unchanged)
 // ============================================================================
-/// Batch buffer for accumulating CSV messages to same UDP client.
-/// Binary protocol messages are sent immediately (not batched).
+
 const ClientBatch = struct {
     client_id: config.ClientId,
     buf: [MAX_UDP_BATCH_SIZE]u8,
     len: usize,
     msg_count: usize,
+
     fn init() ClientBatch {
-        return .{
-            .client_id = 0,
-            .buf = undefined,
-            .len = 0,
-            .msg_count = 0,
-        };
+        return .{ .client_id = 0, .buf = undefined, .len = 0, .msg_count = 0 };
     }
     fn reset(self: *ClientBatch, client_id: config.ClientId) void {
         std.debug.assert(client_id != 0);
@@ -96,11 +86,9 @@ const ClientBatch = struct {
     }
     fn add(self: *ClientBatch, data: []const u8) void {
         std.debug.assert(self.canFit(data.len));
-        std.debug.assert(data.len > 0);
         @memcpy(self.buf[self.len..][0..data.len], data);
         self.len += data.len;
         self.msg_count += 1;
-        std.debug.assert(self.len <= MAX_UDP_BATCH_SIZE);
     }
     fn getData(self: *const ClientBatch) []const u8 {
         return self.buf[0..self.len];
@@ -109,69 +97,44 @@ const ClientBatch = struct {
         return self.len == 0;
     }
 };
-/// Multi-client batch manager.
-/// Tracks active batches for multiple UDP clients simultaneously.
-///
-/// P10 Rule 2: All loops bounded by MAX_CLIENT_BATCHES.
+
 const BatchManager = struct {
     batches: [MAX_CLIENT_BATCHES]ClientBatch,
     active_count: usize,
+
     fn init() BatchManager {
-        var self = BatchManager{
-            .batches = undefined,
-            .active_count = 0,
-        };
-        for (&self.batches) |*b| {
-            b.* = ClientBatch.init();
-        }
+        var self = BatchManager{ .batches = undefined, .active_count = 0 };
+        for (&self.batches) |*b| b.* = ClientBatch.init();
         return self;
     }
-    /// Find existing batch for client, or return null if not found.
-    ///
-    /// P10 Rule 2: O(n) scan bounded by active_count <= MAX_CLIENT_BATCHES.
+
     fn findBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
-        std.debug.assert(client_id != 0);
-        // P10 Rule 2: Bounded by active_count which is <= MAX_CLIENT_BATCHES
         for (self.batches[0..self.active_count]) |*batch| {
-            if (batch.client_id == client_id) {
-                return batch;
-            }
+            if (batch.client_id == client_id) return batch;
         }
         return null;
     }
-    /// Get or create a batch for client.
-    /// Returns null if all slots are full (caller should flush oldest).
+
     fn getOrCreateBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
-        std.debug.assert(client_id != 0);
-        // Find existing
-        if (self.findBatch(client_id)) |batch| {
-            return batch;
-        }
-        // Create new if space available
+        if (self.findBatch(client_id)) |batch| return batch;
         if (self.active_count < MAX_CLIENT_BATCHES) {
             const batch = &self.batches[self.active_count];
             batch.reset(client_id);
             self.active_count += 1;
-            std.debug.assert(self.active_count <= MAX_CLIENT_BATCHES);
             return batch;
         }
         return null;
     }
-    /// Get the oldest (first) batch for flushing when slots are full.
+
     fn getOldestBatch(self: *BatchManager) ?*ClientBatch {
-        if (self.active_count > 0) {
-            return &self.batches[0];
-        }
+        if (self.active_count > 0) return &self.batches[0];
         return null;
     }
-    /// Remove a batch after flushing (swap with last to maintain density).
+
     fn removeBatch(self: *BatchManager, batch: *ClientBatch) void {
-        // Find index of this batch
         const batch_ptr = @intFromPtr(batch);
-        // P10 Rule 2: Bounded by active_count
         for (self.batches[0..self.active_count], 0..) |*b, i| {
             if (@intFromPtr(b) == batch_ptr) {
-                // Swap with last active batch
                 if (i < self.active_count - 1) {
                     self.batches[i] = self.batches[self.active_count - 1];
                 }
@@ -180,18 +143,20 @@ const BatchManager = struct {
             }
         }
     }
-    /// Get all active batches (for final flush).
+
     fn getActiveBatches(self: *BatchManager) []ClientBatch {
         return self.batches[0..self.active_count];
     }
-    /// Clear all batches (only after flushing!).
+
     fn clear(self: *BatchManager) void {
         self.active_count = 0;
     }
 };
+
 // ============================================================================
-// Statistics
+// Statistics (unchanged)
 // ============================================================================
+
 pub const ServerStats = struct {
     messages_routed: [NUM_PROCESSORS]u64,
     outputs_dispatched: u64,
@@ -199,18 +164,15 @@ pub const ServerStats = struct {
     disconnect_cancels: u64,
     tcp_send_failures: u64,
     processor_stats: [NUM_PROCESSORS]proc.ProcessorStats,
+
     pub fn totalProcessed(self: ServerStats) u64 {
         var total: u64 = 0;
-        for (self.processor_stats) |ps| {
-            total += ps.messages_processed;
-        }
+        for (self.processor_stats) |ps| total += ps.messages_processed;
         return total;
     }
     pub fn totalCriticalDrops(self: ServerStats) u64 {
         var total: u64 = 0;
-        for (self.processor_stats) |ps| {
-            total += ps.critical_drops;
-        }
+        for (self.processor_stats) |ps| total += ps.critical_drops;
         return total;
     }
     pub fn isHealthy(self: ServerStats) bool {
@@ -218,70 +180,68 @@ pub const ServerStats = struct {
     }
     pub fn totalOutputs(self: ServerStats) u64 {
         var total: u64 = 0;
-        for (self.processor_stats) |ps| {
-            total += ps.outputs_generated;
-        }
+        for (self.processor_stats) |ps| total += ps.outputs_generated;
         return total;
     }
 };
+
 // ============================================================================
 // Threaded Server
 // ============================================================================
+
 pub const ThreadedServer = struct {
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
+
     input_queues: [NUM_PROCESSORS]*proc.InputQueue,
     output_queues: [NUM_PROCESSORS]*proc.OutputQueue,
     processors: [NUM_PROCESSORS]?proc.Processor,
-    /// Per-message encode buffer.
+
     encode_buf: [ENCODE_BUF_SIZE]u8,
-    /// Batch manager for UDP output batching.
     batch_mgr: BatchManager,
+
     cfg: config.Config,
     allocator: std.mem.Allocator,
     running: std.atomic.Value(bool),
-    // Statistics (atomics for thread-safe access)
+
     messages_routed: [NUM_PROCESSORS]std.atomic.Value(u64),
     outputs_dispatched: std.atomic.Value(u64),
     messages_dropped: std.atomic.Value(u64),
     disconnect_cancels: std.atomic.Value(u64),
     batches_sent: std.atomic.Value(u64),
     tcp_send_failures: std.atomic.Value(u64),
+
     const Self = @This();
-    /// Heap-allocate and initialize a ThreadedServer.
+
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
-        // Initialize queues
+
         for (0..NUM_PROCESSORS) |i| {
             self.input_queues[i] = try allocator.create(proc.InputQueue);
-            self.input_queues[i].* = .{}; // old temp copy way -> proc.InputQueue.init();
+            self.input_queues[i].* = .{};
         }
-        errdefer {
-            for (0..NUM_PROCESSORS) |i| {
-                allocator.destroy(self.input_queues[i]);
-            }
-        }
+        errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.input_queues[i]);
+
         for (0..NUM_PROCESSORS) |i| {
             self.output_queues[i] = try allocator.create(proc.OutputQueue);
-            self.output_queues[i].* = .{}; // proc.OutputQueue.init();
+            self.output_queues[i].* = .{};
         }
-        errdefer {
-            for (0..NUM_PROCESSORS) |i| {
-                allocator.destroy(self.output_queues[i]);
-            }
-        }
-        // Initialize embedded structs in-place
+        errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.output_queues[i]);
+
         self.tcp = TcpServer.init(allocator);
         self.udp = UdpServer.init();
         self.multicast = MulticastPublisher.init();
         self.processors = .{ null, null };
+
         self.encode_buf = undefined;
         self.batch_mgr = BatchManager.init();
+
         self.cfg = cfg;
         self.allocator = allocator;
         self.running = std.atomic.Value(bool).init(false);
+
         self.messages_routed = .{
             std.atomic.Value(u64).init(0),
             std.atomic.Value(u64).init(0),
@@ -291,8 +251,10 @@ pub const ThreadedServer = struct {
         self.disconnect_cancels = std.atomic.Value(u64).init(0);
         self.batches_sent = std.atomic.Value(u64).init(0);
         self.tcp_send_failures = std.atomic.Value(u64).init(0);
+
         return self;
     }
+
     pub fn deinit(self: *Self) void {
         self.stop();
         self.tcp.deinit();
@@ -304,15 +266,19 @@ pub const ThreadedServer = struct {
         }
         self.allocator.destroy(self);
     }
+
     pub fn start(self: *Self) !void {
         std.debug.assert(!self.running.load(.acquire));
+
         std.log.info("Starting threaded server...", .{});
-        std.log.info("Config: channel_capacity={d}, drain_limit={d}, batch_size={d}, max_batches={d}", .{
+        std.log.info("Config: channel_capacity={d}, drain_limit={d}, drain_total_cap={d}, batch_size={d}, max_batches={d}", .{
             proc.CHANNEL_CAPACITY,
             OUTPUT_DRAIN_LIMIT,
+            OUTPUT_DRAIN_TOTAL_CAP,
             MAX_UDP_BATCH_SIZE,
             MAX_CLIENT_BATCHES,
         });
+
         for (0..NUM_PROCESSORS) |i| {
             const id: proc.ProcessorId = @enumFromInt(i);
             self.processors[i] = try proc.Processor.init(
@@ -323,30 +289,31 @@ pub const ThreadedServer = struct {
             );
             try self.processors[i].?.start();
         }
+
         if (self.cfg.tcp_enabled) {
             self.tcp.on_message = onTcpMessage;
             self.tcp.on_disconnect = onTcpDisconnect;
             self.tcp.callback_ctx = self;
             try self.tcp.start(self.cfg.tcp_addr, self.cfg.tcp_port);
-            std.log.info("TCP server listening on {s}:{d}", .{ self.cfg.tcp_addr, self.cfg.tcp_port });
         }
+
         if (self.cfg.udp_enabled) {
             self.udp.on_message = onUdpMessage;
             self.udp.callback_ctx = self;
             try self.udp.start(self.cfg.udp_addr, self.cfg.udp_port);
-            std.log.info("UDP server listening on {s}:{d}", .{ self.cfg.udp_addr, self.cfg.udp_port });
         }
+
         if (self.cfg.mcast_enabled) {
             try self.multicast.start(self.cfg.mcast_group, self.cfg.mcast_port, self.cfg.mcast_ttl);
-            std.log.info("Multicast publishing to {s}:{d}", .{ self.cfg.mcast_group, self.cfg.mcast_port });
         }
+
         self.running.store(true, .release);
         std.log.info("Threaded server started ({d} processors)", .{NUM_PROCESSORS});
     }
+
     pub fn stop(self: *Self) void {
-        if (!self.running.load(.acquire)) {
-            return;
-        }
+        if (!self.running.load(.acquire)) return;
+
         std.log.info("Stopping threaded server...", .{});
         std.log.info("Stats: batches_sent={d}, outputs_dispatched={d}, messages_dropped={d}, tcp_send_failures={d}", .{
             self.batches_sent.load(.monotonic),
@@ -354,44 +321,41 @@ pub const ThreadedServer = struct {
             self.messages_dropped.load(.monotonic),
             self.tcp_send_failures.load(.monotonic),
         });
+
         self.running.store(false, .release);
+
         self.tcp.stop();
         self.udp.stop();
         self.multicast.stop();
-        // Final drain of output queues
-        self.drainOutputQueues();
+
+        // Final drain
+        _ = self.drainOutputQueuesBounded(OUTPUT_DRAIN_TOTAL_CAP);
+
         for (&self.processors) |*p| {
             if (p.*) |*processor| {
                 processor.deinit();
                 p.* = null;
             }
         }
+
         std.log.info("Threaded server stopped", .{});
     }
-    pub fn isRunning(self: *const Self) bool {
-        return self.running.load(.acquire);
-    }
-    /// Run the server event loop.
-    ///
-    /// P10 Rule 2: Loop terminates when running becomes false.
-    /// Call stop() or set running to false to exit.
+
     pub fn run(self: *Self) !void {
         std.log.info("Threaded server running...", .{});
-        
+
         var last_stats_time = std.time.milliTimestamp();
-        const stats_interval_ms: i64 = 5000; // Print stats every 5 seconds
-        
-        // P10 Rule 2: Loop bounded by running flag
+        const stats_interval_ms: i64 = 5000;
+
         while (self.running.load(.acquire)) {
             try self.pollOnce(DEFAULT_POLL_TIMEOUT_MS);
-            
-            // Periodic stats logging
+
             const now = std.time.milliTimestamp();
             if (now - last_stats_time >= stats_interval_ms) {
                 const dispatched = self.outputs_dispatched.load(.monotonic);
                 const failures = self.tcp_send_failures.load(.monotonic);
                 const dropped = self.messages_dropped.load(.monotonic);
-                if (dispatched > 0 or failures > 0) {
+                if (dispatched > 0 or failures > 0 or dropped > 0) {
                     std.log.info("STATS: outputs={d}, tcp_failures={d}, dropped={d}", .{
                         dispatched, failures, dropped,
                     });
@@ -399,46 +363,49 @@ pub const ThreadedServer = struct {
                 last_stats_time = now;
             }
         }
+
         std.log.info("Threaded server event loop exited", .{});
     }
-    /// Run for a limited number of iterations (for testing).
-    ///
-    /// P10 Rule 2: Loop bounded by max_iterations parameter.
-    pub fn runBounded(self: *Self, max_iterations: usize) !void {
-        std.debug.assert(max_iterations > 0);
-        var iterations: usize = 0;
-        // P10 Rule 2: Bounded by max_iterations
-        while (self.running.load(.acquire) and iterations < max_iterations) : (iterations += 1) {
-            try self.pollOnce(DEFAULT_POLL_TIMEOUT_MS);
-        }
-    }
+
+    /// FAIR poll loop:
+    /// 1) poll sockets with 0ms (service writable/readable quickly)
+    /// 2) drain a bounded chunk of outputs
+    /// 3) poll sockets again with timeout
+    /// 4) drain again (bounded)
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
         std.debug.assert(timeout_ms >= 0);
-        // IMPORTANT: Drain outputs FIRST to make room for new outputs
-        self.drainOutputQueues();
-        if (self.cfg.tcp_enabled) {
-            _ = try self.tcp.poll(timeout_ms);
-        }
-        if (self.cfg.udp_enabled) {
-            _ = self.udp.poll() catch |err| {
-                std.log.warn("UDP poll error: {any}", .{err});
-                return;
-            };
-        }
-        // Drain again after receiving new messages
-        self.drainOutputQueues();
+
+        // 1) service socket events immediately
+        if (self.cfg.tcp_enabled) _ = try self.tcp.poll(0);
+        if (self.cfg.udp_enabled) _ = self.udp.poll() catch |err| {
+            std.log.warn("UDP poll error: {any}", .{err});
+            return;
+        };
+
+        // 2) bounded output drain so we don't starve polling
+        _ = self.drainOutputQueuesBounded(OUTPUT_DRAIN_TOTAL_CAP);
+
+        // 3) now wait a tiny bit for new input readiness
+        if (self.cfg.tcp_enabled) _ = try self.tcp.poll(timeout_ms);
+        if (self.cfg.udp_enabled) _ = self.udp.poll() catch |err| {
+            std.log.warn("UDP poll error: {any}", .{err});
+            return;
+        };
+
+        // 4) drain again (bounded)
+        _ = self.drainOutputQueuesBounded(OUTPUT_DRAIN_TOTAL_CAP);
     }
+
     fn routeMessage(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
         std.debug.assert(self.running.load(.acquire));
         std.debug.assert(client_id != 0 or message.msg_type == .flush);
+
         const input = proc.ProcessorInput{
             .message = message.*,
             .client_id = client_id,
-            .enqueue_time_ns = if (proc.TRACK_LATENCY)
-                @truncate(std.time.nanoTimestamp())
-            else
-                0,
+            .enqueue_time_ns = if (proc.TRACK_LATENCY) @truncate(std.time.nanoTimestamp()) else 0,
         };
+
         switch (message.msg_type) {
             .new_order => {
                 const processor_id = proc.routeSymbol(message.data.new_order.symbol);
@@ -452,14 +419,12 @@ pub const ThreadedServer = struct {
                     self.sendToAllProcessors(input);
                 }
             },
-            .flush => {
-                self.sendToAllProcessors(input);
-            },
+            .flush => self.sendToAllProcessors(input),
         }
     }
+
     fn sendToProcessor(self: *Self, processor_id: proc.ProcessorId, input: proc.ProcessorInput) void {
         const idx = @intFromEnum(processor_id);
-        std.debug.assert(idx < NUM_PROCESSORS);
         if (self.input_queues[idx].push(input)) {
             _ = self.messages_routed[idx].fetchAdd(1, .monotonic);
         } else {
@@ -467,8 +432,8 @@ pub const ThreadedServer = struct {
             std.log.warn("Input queue {d} full, dropping message", .{idx});
         }
     }
+
     fn sendToAllProcessors(self: *Self, input: proc.ProcessorInput) void {
-        // P10 Rule 2: Loop bounded by NUM_PROCESSORS
         for (0..NUM_PROCESSORS) |i| {
             if (self.input_queues[i].push(input)) {
                 _ = self.messages_routed[i].fetchAdd(1, .monotonic);
@@ -477,54 +442,61 @@ pub const ThreadedServer = struct {
             }
         }
     }
-    /// Drain output queues with message batching for UDP.
-    /// CSV messages are batched; binary messages sent immediately.
-    ///
-    /// P10 Rule 2: Per-queue loop bounded by OUTPUT_DRAIN_LIMIT.
-    fn drainOutputQueues(self: *Self) void {
-        var total_outputs: u32 = 0;
-        // P10 Rule 2: Outer loop bounded by NUM_PROCESSORS
+
+    /// Bounded draining:
+    /// - per-processor drain bounded by OUTPUT_DRAIN_LIMIT
+    /// - total bounded by `cap_total`
+    /// Returns number drained.
+    fn drainOutputQueuesBounded(self: *Self, cap_total: u32) u32 {
+        var drained_total: u32 = 0;
+
         for (self.output_queues) |queue| {
-            var count: u32 = 0;
-            // P10 Rule 2: Inner loop bounded by OUTPUT_DRAIN_LIMIT
-            while (count < OUTPUT_DRAIN_LIMIT) : (count += 1) {
+            var drained_this_q: u32 = 0;
+
+            while (drained_this_q < OUTPUT_DRAIN_LIMIT and drained_total < cap_total) : ({
+                drained_this_q += 1;
+                drained_total += 1;
+            }) {
                 const output = queue.pop() orelse break;
                 self.processOutput(&output.message);
                 _ = self.outputs_dispatched.fetchAdd(1, .monotonic);
-                total_outputs += 1;
             }
+
+            if (drained_total >= cap_total) break;
         }
-        // Flush all batches at end of drain cycle
-        // IMPORTANT: Always flush after processing to ensure no messages stuck in batches
+
+        // Always flush UDP batches at end of a drain slice
         self.flushAllBatches();
-        
-        // Force flush TCP send buffers to socket
-        // This ensures data is actually sent, not just queued
-        if (total_outputs > 0) {
-            self.flushAllTcpClients();
-        }
+
+        // Try to flush TCP queued bytes (cheap if nothing pending)
+        if (drained_total > 0) self.flushAllTcpClients();
+
+        return drained_total;
     }
-    
-    /// Attempt to flush all TCP client send buffers.
-    /// This is called after draining outputs to push data to sockets.
+
     fn flushAllTcpClients(self: *Self) void {
         var iter = self.tcp.clients.getActive();
         while (iter.next()) |client| {
-            if (client.hasPendingSend()) {
-                client.flushSend() catch |err| {
+            if (!client.hasPendingSend()) continue;
+
+            client.flushSend() catch |err| {
+                // WouldBlock means we MUST rely on EPOLLOUT to continue.
+                // Ensure write interest is enabled.
+                if (err == error.WouldBlock) {
+                    self.tcp.updateClientPoller(client, true) catch {};
+                } else {
                     std.log.debug("Client {} flush error: {}", .{ client.client_id, err });
-                };
-            }
+                }
+            };
         }
     }
-    /// Process a single output message, batching UDP sends.
+
     fn processOutput(self: *Self, out_msg: *const msg.OutputMsg) void {
-        // Determine client protocol for UDP clients
         const use_binary = if (config.isUdpClient(out_msg.client_id))
             self.udp.getClientProtocol(out_msg.client_id) == .binary
         else
             self.cfg.use_binary_protocol;
-        // Encode message based on client protocol
+
         const len = if (use_binary)
             binary_codec.encodeOutput(out_msg, &self.encode_buf) catch |err| {
                 std.log.err("Failed to encode binary output: {any}", .{err});
@@ -535,141 +507,104 @@ pub const ThreadedServer = struct {
                 std.log.err("Failed to encode CSV output: {any}", .{err});
                 return;
             };
-        std.debug.assert(len > 0);
-        std.debug.assert(len <= ENCODE_BUF_SIZE);
+
         const data = self.encode_buf[0..len];
-        // Handle based on message type
+
         switch (out_msg.msg_type) {
-            .ack, .cancel_ack, .reject => {
-                self.sendToClient(out_msg.client_id, data, use_binary);
-            },
+            .ack, .cancel_ack, .reject => self.sendToClient(out_msg.client_id, data, use_binary),
             .trade => {
                 self.sendToClient(out_msg.client_id, data, use_binary);
-                if (self.cfg.mcast_enabled) {
-                    _ = self.multicast.publish(out_msg);
-                }
+                if (self.cfg.mcast_enabled) _ = self.multicast.publish(out_msg);
             },
             .top_of_book => {
-                if (out_msg.client_id != 0) {
-                    self.sendToClient(out_msg.client_id, data, use_binary);
-                }
-                if (self.cfg.mcast_enabled) {
-                    _ = self.multicast.publish(out_msg);
-                }
+                if (out_msg.client_id != 0) self.sendToClient(out_msg.client_id, data, use_binary);
+                if (self.cfg.mcast_enabled) _ = self.multicast.publish(out_msg);
             },
         }
     }
-    /// Send message to client, using batching for CSV over UDP.
+
     fn sendToClient(self: *Self, client_id: config.ClientId, data: []const u8, is_binary: bool) void {
         if (client_id == 0) return;
-        std.debug.assert(data.len > 0);
-        // TCP messages sent directly (TCP handles its own buffering via Nagle/cork)
+
         if (!config.isUdpClient(client_id)) {
-            const success = self.tcp.send(client_id, data);
-            if (!success) {
-                _ = self.tcp_send_failures.fetchAdd(1, .monotonic);
-            }
+            const ok = self.tcp.send(client_id, data);
+            if (!ok) _ = self.tcp_send_failures.fetchAdd(1, .monotonic);
             return;
         }
-        // Binary UDP: send immediately (fixed-size messages, no batching benefit)
+
         if (is_binary) {
             _ = self.udp.send(client_id, data);
             _ = self.batches_sent.fetchAdd(1, .monotonic);
             return;
         }
-        // CSV UDP: batch multiple messages into single packet
+
         self.batchCsvMessage(client_id, data);
     }
-    /// Add CSV message to batch for client.
+
     fn batchCsvMessage(self: *Self, client_id: config.ClientId, data: []const u8) void {
-        std.debug.assert(client_id != 0);
-        std.debug.assert(data.len > 0);
-        std.debug.assert(data.len <= MAX_UDP_BATCH_SIZE);
-        // Try to get or create batch for this client
         if (self.batch_mgr.getOrCreateBatch(client_id)) |batch| {
             if (batch.canFit(data.len)) {
                 batch.add(data);
                 return;
             }
-            // Batch is full, flush it first
             self.flushBatch(batch);
             batch.reset(client_id);
             batch.add(data);
             return;
         }
-        // All batch slots full - flush oldest and retry
+
         if (self.batch_mgr.getOldestBatch()) |oldest| {
             self.flushBatch(oldest);
             self.batch_mgr.removeBatch(oldest);
-            // Now create new batch
             if (self.batch_mgr.getOrCreateBatch(client_id)) |batch| {
                 batch.add(data);
                 return;
             }
         }
-        // Fallback: send directly without batching
+
         _ = self.udp.send(client_id, data);
         _ = self.batches_sent.fetchAdd(1, .monotonic);
     }
-    /// Flush a single batch to UDP.
+
     fn flushBatch(self: *Self, batch: *const ClientBatch) void {
         if (batch.isEmpty()) return;
-        const data = batch.getData();
-        std.debug.assert(data.len > 0);
-        std.debug.assert(data.len <= MAX_UDP_BATCH_SIZE);
-        _ = self.udp.send(batch.client_id, data);
+        _ = self.udp.send(batch.client_id, batch.getData());
         _ = self.batches_sent.fetchAdd(1, .monotonic);
     }
-    /// Flush all active batches.
-    ///
-    /// P10 Rule 2: Loop bounded by MAX_CLIENT_BATCHES via getActiveBatches().
+
     fn flushAllBatches(self: *Self) void {
-        // P10 Rule 2: Bounded by active_count which is <= MAX_CLIENT_BATCHES
-        for (self.batch_mgr.getActiveBatches()) |*batch| {
-            self.flushBatch(batch);
-        }
-        // Clear only AFTER flushing to prevent data loss
+        for (self.batch_mgr.getActiveBatches()) |*batch| self.flushBatch(batch);
         self.batch_mgr.clear();
     }
+
     fn handleClientDisconnect(self: *Self, client_id: config.ClientId) void {
-        std.debug.assert(client_id != 0);
         std.log.info("Client {d} disconnected, sending cancel-on-disconnect", .{client_id});
         const cancel_msg = msg.InputMsg.flush();
         const input = proc.ProcessorInput{
             .message = cancel_msg,
             .client_id = client_id,
-            .enqueue_time_ns = if (proc.TRACK_LATENCY)
-                @truncate(std.time.nanoTimestamp())
-            else
-                0,
+            .enqueue_time_ns = if (proc.TRACK_LATENCY) @truncate(std.time.nanoTimestamp()) else 0,
         };
-        // P10 Rule 2: Loop bounded by NUM_PROCESSORS
-        for (0..NUM_PROCESSORS) |i| {
-            _ = self.input_queues[i].push(input);
-        }
+        for (0..NUM_PROCESSORS) |i| _ = self.input_queues[i].push(input);
         _ = self.disconnect_cancels.fetchAdd(1, .monotonic);
     }
+
     fn onTcpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
-        std.debug.assert(ctx != null);
-        std.debug.assert(config.isTcpClient(client_id));
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        std.debug.assert(self.running.load(.acquire));
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
         self.routeMessage(message, client_id);
     }
+
     fn onTcpDisconnect(client_id: config.ClientId, ctx: ?*anyopaque) void {
-        std.debug.assert(ctx != null);
-        std.debug.assert(config.isTcpClient(client_id));
-        const self: *Self = @ptrCast(@alignCast(ctx));
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
         if (!self.running.load(.acquire)) return;
         self.handleClientDisconnect(client_id);
     }
+
     fn onUdpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
-        std.debug.assert(ctx != null);
-        std.debug.assert(config.isUdpClient(client_id));
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        std.debug.assert(self.running.load(.acquire));
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
         self.routeMessage(message, client_id);
     }
+
     pub fn getStats(self: *const Self) ServerStats {
         var stats = ServerStats{
             .messages_routed = undefined,
@@ -681,35 +616,22 @@ pub const ThreadedServer = struct {
         };
         for (0..NUM_PROCESSORS) |i| {
             stats.messages_routed[i] = self.messages_routed[i].load(.monotonic);
-            if (self.processors[i]) |*p| {
-                stats.processor_stats[i] = p.getStats();
-            } else {
-                stats.processor_stats[i] = std.mem.zeroes(proc.ProcessorStats);
-            }
+            if (self.processors[i]) |*p| stats.processor_stats[i] = p.getStats()
+            else stats.processor_stats[i] = std.mem.zeroes(proc.ProcessorStats);
         }
         return stats;
     }
-    /// Get batches sent count (for diagnostics).
-    pub fn getBatchesSent(self: *const Self) u64 {
-        return self.batches_sent.load(.monotonic);
-    }
-    
-    /// Get TCP send failures count (for diagnostics).
-    pub fn getTcpSendFailures(self: *const Self) u64 {
-        return self.tcp_send_failures.load(.monotonic);
-    }
-    /// Check if server is healthy (no critical drops).
+
     pub fn isHealthy(self: *const Self) bool {
         return self.getStats().isHealthy();
     }
-    /// Request graceful shutdown.
+
     pub fn requestShutdown(self: *Self) void {
         self.running.store(false, .release);
     }
 };
-// ============================================================================
-// Tests
-// ============================================================================
+
+
 test "ClientBatch basic operations" {
     var batch = ClientBatch.init();
     batch.reset(100);

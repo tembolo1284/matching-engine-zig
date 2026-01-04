@@ -19,6 +19,10 @@
 //! - Send: Queue outbound data, flush when socket writable
 //! - Buffers are heap-allocated to avoid stack overflow
 //!
+//! Receive optimization:
+//! - Uses read/write indices to avoid O(n) memmove per message
+//! - Compacts only when needed (space pressure) or periodically
+//!
 //! Thread Safety:
 //! - NOT thread-safe. Each client owned by single I/O thread.
 //!
@@ -66,6 +70,10 @@ pub const MAX_MESSAGE_SIZE: u32 = 4 * 16384;
 /// Prevents infinite loops on malformed data streams.
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
+/// Compact threshold: if read index grows past this, compact opportunistically.
+/// Keeps receive buffer with plenty of contiguous free space.
+const RECV_COMPACT_THRESHOLD: u32 = RECV_BUFFER_SIZE / 2;
+
 // Compile-time validation
 comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
@@ -74,6 +82,7 @@ comptime {
     std.debug.assert(MAX_MESSAGE_SIZE <= (4 * 65535)); // Reasonable limit
     std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
     std.debug.assert(FRAME_HEADER_SIZE == 4);
+    std.debug.assert(RECV_COMPACT_THRESHOLD > 0);
 }
 
 // ============================================================================
@@ -170,8 +179,12 @@ pub const TcpClient = struct {
     /// Allocator used for buffers (null when disconnected).
     allocator: ?std.mem.Allocator = null,
 
-    /// Bytes currently in receive buffer.
-    recv_len: u32 = 0,
+    // === Receive Buffer Indices ===
+    /// Read index into receive buffer (start of unread data).
+    recv_read: u32 = 0,
+
+    /// Write index into receive buffer (end of unread data).
+    recv_write: u32 = 0,
 
     // === Send Buffer ===
     /// Total bytes queued for sending.
@@ -226,7 +239,8 @@ pub const TcpClient = struct {
             .recv_buf = recv_buf,
             .send_buf = send_buf,
             .allocator = allocator,
-            .recv_len = 0,
+            .recv_read = 0,
+            .recv_write = 0,
             .send_len = 0,
             .send_pos = 0,
             .protocol = .unknown,
@@ -297,6 +311,54 @@ pub const TcpClient = struct {
     // Receive Operations
     // ========================================================================
 
+    /// Number of unread bytes currently in receive buffer.
+    pub fn recvDataLen(self: *const Self) u32 {
+        std.debug.assert(self.recv_write >= self.recv_read);
+        return self.recv_write - self.recv_read;
+    }
+
+    /// Compact receive buffer by moving unread data to front.
+    /// This is O(n) but called rarely (space pressure or threshold).
+    fn compactRecv(self: *Self) void {
+        const recv_buf = self.recv_buf orelse return;
+        const unread = self.recvDataLen();
+
+        if (unread == 0) {
+            self.recv_read = 0;
+            self.recv_write = 0;
+            return;
+        }
+
+        if (self.recv_read == 0) return;
+
+        std.mem.copyForwards(
+            u8,
+            recv_buf[0..unread],
+            recv_buf[self.recv_read..self.recv_write],
+        );
+        self.recv_read = 0;
+        self.recv_write = unread;
+
+        std.debug.assert(self.recv_write <= RECV_BUFFER_SIZE);
+    }
+
+    /// Ensure there is contiguous space for receiving at the end of the buffer.
+    /// Compacts if we have space at front.
+    fn ensureRecvSpace(self: *Self) bool {
+        std.debug.assert(self.recv_write <= RECV_BUFFER_SIZE);
+
+        const avail = RECV_BUFFER_SIZE - self.recv_write;
+        if (avail > 0) return true;
+
+        // No space at end. If we have consumed some data at front, compact once.
+        if (self.recv_read > 0) {
+            self.compactRecv();
+            return (RECV_BUFFER_SIZE - self.recv_write) > 0;
+        }
+
+        return false;
+    }
+
     /// Receive data from socket into buffer.
     /// Returns bytes received, or error.
     ///
@@ -304,19 +366,19 @@ pub const TcpClient = struct {
     pub fn receive(self: *Self) !usize {
         std.debug.assert(self.state == .connected);
         std.debug.assert(self.fd >= 0);
-        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
+        std.debug.assert(self.recv_write <= RECV_BUFFER_SIZE);
+        std.debug.assert(self.recv_read <= self.recv_write);
 
         const recv_buf = self.recv_buf orelse return error.BufferNotAllocated;
 
-        const available = RECV_BUFFER_SIZE - self.recv_len;
-        if (available == 0) {
+        if (!self.ensureRecvSpace()) {
             self.stats.buffer_overflows += 1;
             return error.BufferFull;
         }
 
         const n = posix.recv(
             self.fd,
-            recv_buf[self.recv_len..],
+            recv_buf[self.recv_write..],
             0,
         ) catch |err| {
             if (net_utils.isWouldBlock(err)) return error.WouldBlock;
@@ -325,30 +387,61 @@ pub const TcpClient = struct {
 
         if (n == 0) return error.ConnectionClosed;
 
-        self.recv_len += @intCast(n);
+        self.recv_write += @intCast(n);
         self.stats.bytes_received += n;
         self.touch();
 
-        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
+        std.debug.assert(self.recv_write <= RECV_BUFFER_SIZE);
+        std.debug.assert(self.recv_read <= self.recv_write);
+
+        // Opportunistic compaction (rare)
+        if (self.recv_read >= RECV_COMPACT_THRESHOLD) {
+            self.compactRecv();
+        }
 
         return n;
     }
 
     /// Get available data in receive buffer (for raw protocol).
+    /// Always returns a contiguous slice of unread bytes.
     pub fn getReceivedData(self: *const Self) []const u8 {
-        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
         const recv_buf = self.recv_buf orelse return &[_]u8{};
-        return recv_buf[0..self.recv_len];
+        std.debug.assert(self.recv_read <= self.recv_write);
+        return recv_buf[self.recv_read..self.recv_write];
+    }
+
+    /// Consume bytes from the front of unread receive data (raw mode).
+    pub fn consumeBytes(self: *Self, bytes: u32) void {
+        std.debug.assert(bytes <= self.recvDataLen());
+        self.recv_read += bytes;
+
+        if (self.recv_read == self.recv_write) {
+            self.recv_read = 0;
+            self.recv_write = 0;
+            return;
+        }
+
+        if (self.recv_read >= RECV_COMPACT_THRESHOLD) {
+            self.compactRecv();
+        }
+    }
+
+    /// Compatibility shim for server-side code that wants a `usize` parameter.
+    /// This consumes raw bytes from the front of the receive buffer.
+    pub fn compactRecvBuffer(self: *Self, processed: usize) void {
+        std.debug.assert(processed <= self.recvDataLen());
+        self.consumeBytes(@intCast(processed));
     }
 
     /// Check if receive buffer has any data.
     pub fn hasReceivedData(self: *const Self) bool {
-        return self.recv_len > 0;
+        return self.recv_write > self.recv_read;
     }
 
-    /// Get receive buffer fill percentage.
+    /// Get receive buffer fill percentage (unread portion).
     pub fn getRecvBufferUsage(self: *const Self) u32 {
-        return (self.recv_len * 100) / RECV_BUFFER_SIZE;
+        const unread = self.recvDataLen();
+        return (unread * 100) / RECV_BUFFER_SIZE;
     }
 
     // ========================================================================
@@ -362,25 +455,24 @@ pub const TcpClient = struct {
     /// Returns:
     /// - .frame: Complete frame payload (without header)
     /// - .incomplete: Need more data
-    /// - .oversized: Frame too large, was skipped
+    /// - .oversized: Frame too large, skipped
     /// - .empty: No data in buffer
     pub fn extractFrame(self: *Self) FrameResult {
-        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
-
         const recv_buf = self.recv_buf orelse return .empty;
 
-        if (self.recv_len == 0) {
-            return .empty;
-        }
+        const unread = self.recvDataLen();
+        if (unread == 0) return .empty;
 
-        if (self.recv_len < FRAME_HEADER_SIZE) {
-            return .incomplete;
-        }
+        if (unread < FRAME_HEADER_SIZE) return .incomplete;
 
-        // Read length header
-        const msg_len = std.mem.readInt(u32, recv_buf[0..4], .big);
+        const hdr_start = self.recv_read;
+        const hdr_end = hdr_start + FRAME_HEADER_SIZE;
 
-        // Validate length
+        std.debug.assert(hdr_end <= self.recv_write);
+
+        const hdr: *const [4]u8 = @ptrCast(recv_buf[hdr_start..hdr_end].ptr);
+        const msg_len = std.mem.readInt(u32, hdr, .big);
+
         if (msg_len > MAX_MESSAGE_SIZE) {
             std.log.warn("Client {}: oversized frame {} bytes (max {})", .{
                 self.client_id,
@@ -388,24 +480,29 @@ pub const TcpClient = struct {
                 MAX_MESSAGE_SIZE,
             });
 
-            // Skip the invalid header
-            self.compactRecvBuffer(FRAME_HEADER_SIZE);
+            // Skip just the invalid header and keep going (do not memmove here).
+            self.recv_read += FRAME_HEADER_SIZE;
             self.stats.frames_dropped += 1;
+
+            if (self.recv_read == self.recv_write) {
+                self.recv_read = 0;
+                self.recv_write = 0;
+            } else if (self.recv_read >= RECV_COMPACT_THRESHOLD) {
+                self.compactRecv();
+            }
 
             return .{ .oversized = msg_len };
         }
 
-        const total_len = FRAME_HEADER_SIZE + msg_len;
+        const total_len: u32 = FRAME_HEADER_SIZE + msg_len;
+        if (unread < total_len) return .incomplete;
 
-        if (self.recv_len < total_len) {
-            return .incomplete;
-        }
+        const payload_start = hdr_end;
+        const payload_end = payload_start + msg_len;
 
-        std.debug.assert(total_len <= self.recv_len);
-        std.debug.assert(total_len <= RECV_BUFFER_SIZE);
+        std.debug.assert(payload_end <= self.recv_write);
 
-        // Return payload slice (caller must call consumeFrame after processing)
-        return .{ .frame = recv_buf[FRAME_HEADER_SIZE..total_len] };
+        return .{ .frame = recv_buf[payload_start..payload_end] };
     }
 
     /// Consume a frame after successful processing.
@@ -413,35 +510,22 @@ pub const TcpClient = struct {
     pub fn consumeFrame(self: *Self, payload_len: usize) void {
         std.debug.assert(payload_len <= MAX_MESSAGE_SIZE);
 
-        const total_len = FRAME_HEADER_SIZE + @as(u32, @intCast(payload_len));
-        std.debug.assert(total_len <= self.recv_len);
+        const total_len: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(payload_len));
+        std.debug.assert(total_len <= self.recvDataLen());
 
-        self.compactRecvBuffer(total_len);
+        self.recv_read += total_len;
         self.stats.messages_received += 1;
-        self.resetErrors(); // Successful frame resets error counter
-    }
+        self.resetErrors();
 
-    /// Compact receive buffer by removing bytes from front.
-    pub fn compactRecvBuffer(self: *Self, bytes: u32) void {
-        std.debug.assert(bytes <= self.recv_len);
-        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
-
-        const recv_buf = self.recv_buf orelse return;
-
-        if (bytes >= self.recv_len) {
-            self.recv_len = 0;
+        if (self.recv_read == self.recv_write) {
+            self.recv_read = 0;
+            self.recv_write = 0;
             return;
         }
 
-        const remaining = self.recv_len - bytes;
-        std.mem.copyForwards(
-            u8,
-            recv_buf[0..remaining],
-            recv_buf[bytes..self.recv_len],
-        );
-        self.recv_len = remaining;
-
-        std.debug.assert(self.recv_len <= RECV_BUFFER_SIZE);
+        if (self.recv_read >= RECV_COMPACT_THRESHOLD) {
+            self.compactRecv();
+        }
     }
 
     // ========================================================================
@@ -571,10 +655,10 @@ pub const TcpClient = struct {
     /// Should be called once when first data arrives.
     pub fn detectProtocol(self: *Self) void {
         if (self.protocol != .unknown) return;
-        if (self.recv_len == 0) return;
+        if (!self.hasReceivedData()) return;
 
-        const recv_buf = self.recv_buf orelse return;
-        self.protocol = codec.detectProtocol(recv_buf[0..self.recv_len]);
+        const data = self.getReceivedData();
+        self.protocol = codec.detectProtocol(data);
     }
 
     /// Get detected protocol.
@@ -742,14 +826,17 @@ test "TcpClient frame extraction - complete frame" {
     // Write a complete frame: length=5, payload="hello"
     std.mem.writeInt(u32, recv_buf[0..4], 5, .big);
     @memcpy(recv_buf[4..9], "hello");
-    client.recv_len = 9;
+    client.recv_read = 0;
+    client.recv_write = 9;
 
     const result = client.extractFrame();
     switch (result) {
         .frame => |payload| {
             try std.testing.expectEqualStrings("hello", payload);
             client.consumeFrame(payload.len);
-            try std.testing.expectEqual(@as(u32, 0), client.recv_len);
+            try std.testing.expectEqual(@as(u32, 0), client.recvDataLen());
+            try std.testing.expectEqual(@as(u32, 0), client.recv_read);
+            try std.testing.expectEqual(@as(u32, 0), client.recv_write);
         },
         else => return error.ExpectedFrame,
     }
@@ -766,7 +853,8 @@ test "TcpClient frame extraction - incomplete" {
     // Write partial frame: length=10, but only 5 bytes of payload
     std.mem.writeInt(u32, recv_buf[0..4], 10, .big);
     @memcpy(recv_buf[4..9], "hello");
-    client.recv_len = 9;
+    client.recv_read = 0;
+    client.recv_write = 9;
 
     const result = client.extractFrame();
     try std.testing.expect(result == .incomplete);
@@ -782,7 +870,8 @@ test "TcpClient frame extraction - oversized" {
 
     // Write oversized frame length
     std.mem.writeInt(u32, recv_buf[0..4], MAX_MESSAGE_SIZE + 1, .big);
-    client.recv_len = 4;
+    client.recv_read = 0;
+    client.recv_write = 4;
 
     const result = client.extractFrame();
     switch (result) {
@@ -807,7 +896,8 @@ test "TcpClient frame extraction - multiple frames" {
     @memcpy(recv_buf[4..6], "AB");
     std.mem.writeInt(u32, recv_buf[6..10], 3, .big);
     @memcpy(recv_buf[10..13], "XYZ");
-    client.recv_len = 13;
+    client.recv_read = 0;
+    client.recv_write = 13;
 
     // Extract first frame
     const result1 = client.extractFrame();
@@ -830,7 +920,7 @@ test "TcpClient frame extraction - multiple frames" {
     }
 
     // Buffer should be empty
-    try std.testing.expectEqual(@as(u32, 0), client.recv_len);
+    try std.testing.expectEqual(@as(u32, 0), client.recvDataLen());
 }
 
 test "TcpClient queue framed send" {
@@ -962,7 +1052,7 @@ test "TcpClient init validation" {
     try std.testing.expectEqual(@as(posix.fd_t, 5), client.fd);
     try std.testing.expectEqual(@as(config.ClientId, 100), client.client_id);
     try std.testing.expectEqual(ClientState.connected, client.state);
-    try std.testing.expectEqual(@as(u32, 0), client.recv_len);
+    try std.testing.expectEqual(@as(u32, 0), client.recvDataLen());
     try std.testing.expectEqual(@as(u32, 0), client.send_len);
     try std.testing.expect(client.recv_buf != null);
     try std.testing.expect(client.send_buf != null);
@@ -984,3 +1074,4 @@ test "ClientPool size is reasonable" {
     // 64 clients * ~150 bytes = ~10KB, plus some overhead
     try std.testing.expect(pool_size < 20 * 1024); // Should be well under 20KB
 }
+
