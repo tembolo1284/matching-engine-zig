@@ -49,11 +49,11 @@ const SEND_FLAGS: u32 = if (is_linux) posix.MSG.NOSIGNAL else 0;
 
 /// Receive buffer size per client.
 /// Must accommodate largest expected message plus some headroom.
-pub const RECV_BUFFER_SIZE: u32 = 4 * 65536;
+pub const RECV_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Send buffer size per client.
 /// Should handle burst of outbound messages.
-pub const SEND_BUFFER_SIZE: u32 = 4 * 65536;
+pub const SEND_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Frame header size (4-byte length prefix).
 pub const FRAME_HEADER_SIZE: u32 = 4;
