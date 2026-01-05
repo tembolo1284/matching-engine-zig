@@ -61,16 +61,27 @@ const MAX_EVENTS: u32 = 64;
 const LISTEN_BACKLOG: u31 = 128;
 const IDLE_CHECK_INTERVAL: u32 = 100;
 const MAX_ACCEPTS_PER_POLL: u32 = 16;
-const MAX_FRAMES_PER_CLIENT: u32 = 100;
-const MAX_RAW_BYTES_PER_CLIENT: u32 = 16384;
+
+/// Per “processing chunk” bound — used for fairness.
+/// IMPORTANT: With EPOLLET you MUST keep looping until .incomplete/.empty,
+/// otherwise you can strand frames in the user buffer forever.
+const MAX_FRAMES_PER_CHUNK: u32 = 256;
+
+/// Total upper bound per readable event to avoid starvation.
+/// With a single client in your benchmarks this will fully drain.
+const MAX_FRAMES_PER_READ_EVENT: u32 = 65536;
+
+const MAX_RAW_BYTES_PER_CHUNK: u32 = 16384;
+const MAX_RAW_BYTES_PER_READ_EVENT: u32 = 1024 * 1024;
+
 const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
 
 comptime {
     std.debug.assert(MAX_CLIENTS > 0);
     std.debug.assert(MAX_EVENTS > 0);
     std.debug.assert(MAX_ACCEPTS_PER_POLL > 0);
-    std.debug.assert(MAX_FRAMES_PER_CLIENT > 0);
-    std.debug.assert(MAX_RAW_BYTES_PER_CLIENT > 0);
+    std.debug.assert(MAX_FRAMES_PER_CHUNK > 0);
+    std.debug.assert(MAX_FRAMES_PER_READ_EVENT >= MAX_FRAMES_PER_CHUNK);
     std.debug.assert(SOCKET_BUFFER_SIZE >= 64 * 1024);
 }
 
@@ -418,6 +429,7 @@ pub const TcpServer = struct {
     }
 
     fn handleClientRead(self: *Self, client: *TcpClient) !void {
+        // Drain socket (ET requirement)
         while (true) {
             _ = client.receive() catch |err| {
                 if (err == error.WouldBlock) break;
@@ -426,13 +438,29 @@ pub const TcpServer = struct {
             };
         }
 
-        if (self.use_framing) self.processFramedMessages(client)
-        else self.processRawMessages(client);
+        // Drain USER BUFFER too (ET requirement).
+        // If we stop with complete frames still buffered, epoll may never fire again.
+        if (self.use_framing) {
+            var total: u32 = 0;
+            while (total < MAX_FRAMES_PER_READ_EVENT) {
+                const n = self.processFramedMessagesChunk(client, MAX_FRAMES_PER_CHUNK);
+                if (n == 0) break;
+                total += n;
+            }
+        } else {
+            var total_bytes: u32 = 0;
+            while (total_bytes < MAX_RAW_BYTES_PER_READ_EVENT) {
+                const n = self.processRawMessagesChunk(client, MAX_RAW_BYTES_PER_CHUNK);
+                if (n == 0) break;
+                total_bytes += n;
+            }
+        }
     }
 
-    fn processFramedMessages(self: *Self, client: *TcpClient) void {
+    fn processFramedMessagesChunk(self: *Self, client: *TcpClient, max_frames: u32) u32 {
         var frames_processed: u32 = 0;
-        while (frames_processed < MAX_FRAMES_PER_CLIENT) : (frames_processed += 1) {
+
+        while (frames_processed < max_frames) : (frames_processed += 1) {
             const frame_result = client.extractFrame();
             switch (frame_result) {
                 .frame => |payload| {
@@ -440,25 +468,32 @@ pub const TcpServer = struct {
                     self.decodeAndDispatch(client, payload);
                     client.consumeFrame(payload.len);
                 },
-                .incomplete, .empty => break,
+                .incomplete, .empty => return frames_processed,
                 .oversized => {
                     if (client.recordDecodeError()) {
                         self.error_disconnects += 1;
                         self.disconnectClient(client);
-                        return;
+                        return frames_processed;
                     }
                     continue;
                 },
             }
         }
+
+        return frames_processed;
     }
 
-    fn processRawMessages(self: *Self, client: *TcpClient) void {
+    fn processRawMessagesChunk(self: *Self, client: *TcpClient, max_bytes: u32) u32 {
         var processed: u32 = 0;
+
         const data = client.getReceivedData();
-        const max_process = @min(@as(u32, @intCast(data.len)), MAX_RAW_BYTES_PER_CLIENT);
+        if (data.len == 0) return 0;
+
+        const max_process = @min(@as(u32, @intCast(data.len)), max_bytes);
+
         while (processed < max_process) {
             const remaining = data[processed..];
+
             if (client.protocol == .unknown) {
                 client.protocol = codec.detectProtocol(remaining);
                 if (client.protocol == .unknown and remaining.len < 8) break;
@@ -470,7 +505,7 @@ pub const TcpServer = struct {
                 if (client.recordDecodeError()) {
                     self.error_disconnects += 1;
                     self.disconnectClient(client);
-                    return;
+                    return processed;
                 }
                 processed += 1;
                 continue;
@@ -482,7 +517,8 @@ pub const TcpServer = struct {
             processed += @intCast(result.bytes_consumed);
         }
 
-        if (processed > 0) client.compactRecvBuffer(processed);
+        if (processed > 0) client.consumeBytes(processed);
+        return processed;
     }
 
     fn decodeAndDispatch(self: *Self, client: *TcpClient, payload: []const u8) void {
@@ -499,8 +535,6 @@ pub const TcpServer = struct {
     // Send Operations
     // ========================================================================
 
-    /// Queue + mark write-interest if needed.
-    /// DO NOT flush per message (syscall heavy). Writable events + periodic flush handle it.
     pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
         const client = self.clients.findById(client_id) orelse return false;
 
@@ -604,7 +638,6 @@ pub const TcpServer = struct {
     }
 };
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -653,8 +686,6 @@ test "Constants are valid" {
     try std.testing.expect(MAX_CLIENTS > 0);
     try std.testing.expect(MAX_EVENTS > 0);
     try std.testing.expect(MAX_ACCEPTS_PER_POLL > 0);
-    try std.testing.expect(MAX_FRAMES_PER_CLIENT > 0);
-    try std.testing.expect(MAX_RAW_BYTES_PER_CLIENT > 0);
     try std.testing.expect(SOCKET_BUFFER_SIZE >= 64 * 1024);
 }
 
