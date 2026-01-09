@@ -41,7 +41,7 @@ const SpscQueue = @import("../collections/spsc_queue.zig").SpscQueue;
 /// Channel capacity - must be power of 2
 /// Increased from 8192 to handle high throughput scenarios
 /// At 200K orders/sec with ~2 outputs per order, need substantial buffer
-pub const CHANNEL_CAPACITY: usize = 65536;
+pub const CHANNEL_CAPACITY: usize = 4 * 65536;
 
 /// Max messages to process per poll iteration
 /// Prevents starvation but allows good throughput
