@@ -308,8 +308,7 @@ pub const OrderBook = struct {
 
     /// Process a new order.
     ///
-    /// Generates: Ack (always), Trade(s) (if matched), TopOfBook (if changed),
-    /// or Reject (on error).
+    /// Generates: Ack (always), Trade(s) (if matched), or Reject (on error).
     pub fn addOrder(
         self: *Self,
         order_msg: *const msg.NewOrderMsg,
@@ -381,7 +380,6 @@ pub const OrderBook = struct {
             self.insertOrderOrReject(order, client_id, output);
         } else {
             // Fully filled - release back to pool
-            self.checkTopOfBookChange(output, client_id);
             self.pools.order_pool.release(order);
         }
 
@@ -409,7 +407,6 @@ pub const OrderBook = struct {
             self.pools.order_pool.release(order);
             return;
         }
-        self.checkTopOfBookChange(output, client_id);
     }
 
     // ========================================================================
@@ -495,7 +492,6 @@ pub const OrderBook = struct {
         ));
 
         self.maybeCleanupLevels();
-        self.checkTopOfBookChange(output, client_id);
     }
 
     /// Cancel all orders for a specific client (e.g., on disconnect).
@@ -510,7 +506,6 @@ pub const OrderBook = struct {
 
         if (cancelled > 0) {
             self.maybeCleanupLevels();
-            self.checkTopOfBookChange(output, client_id);
         }
 
         std.debug.assert(self.isValid());
