@@ -7,12 +7,12 @@
 //! - Message batching: Multiple CSV messages packed into single UDP packet
 //! - Protocol-aware encoding: Binary clients get binary responses, CSV clients get CSV
 //! - Output draining is time-sliced to avoid starving socket polling
+//! - Periodic TCP flush to prevent send buffer overflow
 //!
 //! NASA Power of Ten Compliance:
 //! - Rule 2: All loops bounded by explicit constants
 //! - Rule 5: Assertions validate state and inputs
 //! - Rule 7: All queue operations and send results checked
-
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -35,14 +35,18 @@ pub const NUM_PROCESSORS: usize = 2;
 /// Drain limit per poll cycle must NOT starve socket polling.
 /// Large limits can cause EPOLLOUT / reads to be delayed for many ms+ under load.
 /// Keep this modest; you can tune upward after measuring.
-const OUTPUT_DRAIN_LIMIT: u32 = 4 * 8192;
+const OUTPUT_DRAIN_LIMIT: u32 = 32768;
 
 /// Total output cap per pollOnce across ALL processors.
 /// Prevents worst-case 2 * OUTPUT_DRAIN_LIMIT from taking too long.
-const OUTPUT_DRAIN_TOTAL_CAP: u32 = OUTPUT_DRAIN_LIMIT * @as(u32, @intCast(NUM_PROCESSORS));
+const OUTPUT_DRAIN_TOTAL_CAP: u32 = 65536;
 
 /// Default poll timeout in milliseconds.
+/// 0 = busy loop for maximum throughput
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
+
+/// Flush TCP send buffers every N messages to prevent overflow
+const FLUSH_INTERVAL: u32 = 100;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
@@ -60,6 +64,7 @@ comptime {
     std.debug.assert(MAX_UDP_BATCH_SIZE <= 1472);
     std.debug.assert(MAX_CLIENT_BATCHES > 0);
     std.debug.assert(ENCODE_BUF_SIZE >= 256);
+    std.debug.assert(FLUSH_INTERVAL > 0);
 }
 
 // ============================================================================
@@ -75,24 +80,29 @@ const ClientBatch = struct {
     fn init() ClientBatch {
         return .{ .client_id = 0, .buf = undefined, .len = 0, .msg_count = 0 };
     }
+
     fn reset(self: *ClientBatch, client_id: config.ClientId) void {
         std.debug.assert(client_id != 0);
         self.client_id = client_id;
         self.len = 0;
         self.msg_count = 0;
     }
+
     fn canFit(self: *const ClientBatch, data_len: usize) bool {
         return self.len + data_len <= MAX_UDP_BATCH_SIZE;
     }
+
     fn add(self: *ClientBatch, data: []const u8) void {
         std.debug.assert(self.canFit(data.len));
         @memcpy(self.buf[self.len..][0..data.len], data);
         self.len += data.len;
         self.msg_count += 1;
     }
+
     fn getData(self: *const ClientBatch) []const u8 {
         return self.buf[0..self.len];
     }
+
     fn isEmpty(self: *const ClientBatch) bool {
         return self.len == 0;
     }
@@ -170,14 +180,17 @@ pub const ServerStats = struct {
         for (self.processor_stats) |ps| total += ps.messages_processed;
         return total;
     }
+
     pub fn totalCriticalDrops(self: ServerStats) u64 {
         var total: u64 = 0;
         for (self.processor_stats) |ps| total += ps.critical_drops;
         return total;
     }
+
     pub fn isHealthy(self: ServerStats) bool {
         return self.totalCriticalDrops() == 0 and self.tcp_send_failures == 0;
     }
+
     pub fn totalOutputs(self: ServerStats) u64 {
         var total: u64 = 0;
         for (self.processor_stats) |ps| total += ps.outputs_generated;
@@ -193,18 +206,14 @@ pub const ThreadedServer = struct {
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
-
     input_queues: [NUM_PROCESSORS]*proc.InputQueue,
     output_queues: [NUM_PROCESSORS]*proc.OutputQueue,
     processors: [NUM_PROCESSORS]?proc.Processor,
-
     encode_buf: [ENCODE_BUF_SIZE]u8,
     batch_mgr: BatchManager,
-
     cfg: config.Config,
     allocator: std.mem.Allocator,
     running: std.atomic.Value(bool),
-
     messages_routed: [NUM_PROCESSORS]std.atomic.Value(u64),
     outputs_dispatched: std.atomic.Value(u64),
     messages_dropped: std.atomic.Value(u64),
@@ -234,14 +243,11 @@ pub const ThreadedServer = struct {
         self.udp = UdpServer.init();
         self.multicast = MulticastPublisher.init();
         self.processors = .{ null, null };
-
         self.encode_buf = undefined;
         self.batch_mgr = BatchManager.init();
-
         self.cfg = cfg;
         self.allocator = allocator;
         self.running = std.atomic.Value(bool).init(false);
-
         self.messages_routed = .{
             std.atomic.Value(u64).init(0),
             std.atomic.Value(u64).init(0),
@@ -269,14 +275,14 @@ pub const ThreadedServer = struct {
 
     pub fn start(self: *Self) !void {
         std.debug.assert(!self.running.load(.acquire));
-
         std.log.info("Starting threaded server...", .{});
-        std.log.info("Config: channel_capacity={d}, drain_limit={d}, drain_total_cap={d}, batch_size={d}, max_batches={d}", .{
+        std.log.info("Config: channel_capacity={d}, drain_limit={d}, drain_total_cap={d}, batch_size={d}, max_batches={d}, flush_interval={d}", .{
             proc.CHANNEL_CAPACITY,
             OUTPUT_DRAIN_LIMIT,
             OUTPUT_DRAIN_TOTAL_CAP,
             MAX_UDP_BATCH_SIZE,
             MAX_CLIENT_BATCHES,
+            FLUSH_INTERVAL,
         });
 
         for (0..NUM_PROCESSORS) |i| {
@@ -313,7 +319,6 @@ pub const ThreadedServer = struct {
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
-
         std.log.info("Stopping threaded server...", .{});
         std.log.info("Stats: batches_sent={d}, outputs_dispatched={d}, messages_dropped={d}, tcp_send_failures={d}", .{
             self.batches_sent.load(.monotonic),
@@ -321,9 +326,7 @@ pub const ThreadedServer = struct {
             self.messages_dropped.load(.monotonic),
             self.tcp_send_failures.load(.monotonic),
         });
-
         self.running.store(false, .release);
-
         self.tcp.stop();
         self.udp.stop();
         self.multicast.stop();
@@ -337,13 +340,11 @@ pub const ThreadedServer = struct {
                 p.* = null;
             }
         }
-
         std.log.info("Threaded server stopped", .{});
     }
 
     pub fn run(self: *Self) !void {
         std.log.info("Threaded server running...", .{});
-
         var last_stats_time = std.time.milliTimestamp();
         const stats_interval_ms: i64 = 5000;
 
@@ -363,7 +364,6 @@ pub const ThreadedServer = struct {
                 last_stats_time = now;
             }
         }
-
         std.log.info("Threaded server event loop exited", .{});
     }
 
@@ -443,32 +443,39 @@ pub const ThreadedServer = struct {
         }
     }
 
-    /// Bounded draining:
+    /// Bounded draining with periodic TCP flush:
     /// - per-processor drain bounded by OUTPUT_DRAIN_LIMIT
     /// - total bounded by `cap_total`
+    /// - flushes TCP every FLUSH_INTERVAL messages to prevent buffer overflow
     /// Returns number drained.
     fn drainOutputQueuesBounded(self: *Self, cap_total: u32) u32 {
         var drained_total: u32 = 0;
+        var since_last_flush: u32 = 0;
 
         for (self.output_queues) |queue| {
             var drained_this_q: u32 = 0;
-
             while (drained_this_q < OUTPUT_DRAIN_LIMIT and drained_total < cap_total) : ({
                 drained_this_q += 1;
                 drained_total += 1;
+                since_last_flush += 1;
             }) {
                 const output = queue.pop() orelse break;
                 self.processOutput(&output.message);
                 _ = self.outputs_dispatched.fetchAdd(1, .monotonic);
-            }
 
+                // Periodic flush to prevent send buffer overflow
+                if (since_last_flush >= FLUSH_INTERVAL) {
+                    self.flushAllTcpClients();
+                    since_last_flush = 0;
+                }
+            }
             if (drained_total >= cap_total) break;
         }
 
         // Always flush UDP batches at end of a drain slice
         self.flushAllBatches();
 
-        // Try to flush TCP queued bytes (cheap if nothing pending)
+        // Final TCP flush
         if (drained_total > 0) self.flushAllTcpClients();
 
         return drained_total;
@@ -478,7 +485,6 @@ pub const ThreadedServer = struct {
         var iter = self.tcp.clients.getActive();
         while (iter.next()) |client| {
             if (!client.hasPendingSend()) continue;
-
             client.flushSend() catch |err| {
                 // WouldBlock means we MUST rely on EPOLLOUT to continue.
                 // Ensure write interest is enabled.
@@ -631,51 +637,67 @@ pub const ThreadedServer = struct {
     }
 };
 
+// ============================================================================
+// Tests
+// ============================================================================
 
 test "ClientBatch basic operations" {
     var batch = ClientBatch.init();
     batch.reset(100);
+
     try std.testing.expect(batch.isEmpty());
     try std.testing.expect(batch.canFit(100));
+
     batch.add("A, AAPL, 1, 1\n");
     try std.testing.expect(!batch.isEmpty());
     try std.testing.expectEqual(@as(usize, 15), batch.len);
     try std.testing.expectEqual(@as(usize, 1), batch.msg_count);
 }
+
 test "ClientBatch overflow detection" {
     var batch = ClientBatch.init();
     batch.reset(100);
+
     // Fill most of the buffer
     const big_msg = "X" ** 1300;
     batch.add(big_msg);
+
     // Should not fit another 200 bytes (1300 + 200 > 1400)
     try std.testing.expect(!batch.canFit(200));
     // Should fit 100 bytes (1300 + 100 = 1400)
     try std.testing.expect(batch.canFit(100));
 }
+
 test "BatchManager multi-client" {
     var mgr = BatchManager.init();
+
     // Add batches for different clients
     const batch1 = mgr.getOrCreateBatch(100);
     try std.testing.expect(batch1 != null);
     batch1.?.add("msg1\n");
+
     const batch2 = mgr.getOrCreateBatch(200);
     try std.testing.expect(batch2 != null);
     batch2.?.add("msg2\n");
+
     // Same client should return same batch
     const batch1_again = mgr.getOrCreateBatch(100);
     try std.testing.expect(batch1_again == batch1);
+
     try std.testing.expectEqual(@as(usize, 2), mgr.active_count);
 }
+
 test "BatchManager flush and clear" {
     var mgr = BatchManager.init();
     _ = mgr.getOrCreateBatch(100);
     _ = mgr.getOrCreateBatch(200);
     try std.testing.expectEqual(@as(usize, 2), mgr.active_count);
+
     // Clear should reset count
     mgr.clear();
     try std.testing.expectEqual(@as(usize, 0), mgr.active_count);
 }
+
 test "ServerStats total processed" {
     var stats = ServerStats{
         .messages_routed = .{ 100, 200 },
@@ -716,11 +738,13 @@ test "ServerStats total processed" {
             },
         },
     };
+
     try std.testing.expectEqual(@as(u64, 300), stats.totalProcessed());
     try std.testing.expectEqual(@as(u64, 150), stats.totalOutputs());
     try std.testing.expectEqual(@as(u64, 0), stats.totalCriticalDrops());
     try std.testing.expect(stats.isHealthy());
 }
+
 test "ServerStats unhealthy with critical drops" {
     var stats = ServerStats{
         .messages_routed = .{ 100, 200 },
@@ -761,9 +785,11 @@ test "ServerStats unhealthy with critical drops" {
             },
         },
     };
+
     try std.testing.expectEqual(@as(u64, 5), stats.totalCriticalDrops());
     try std.testing.expect(!stats.isHealthy());
 }
+
 test "ServerStats unhealthy with tcp send failures" {
     var stats = ServerStats{
         .messages_routed = .{ 100, 200 },
@@ -804,17 +830,21 @@ test "ServerStats unhealthy with tcp send failures" {
             },
         },
     };
+
     try std.testing.expect(!stats.isHealthy());
 }
+
 test "MAX_UDP_BATCH_SIZE within MTU" {
     // Verify our batch size is safe for UDP
     try std.testing.expect(MAX_UDP_BATCH_SIZE <= 1472); // MTU - headers
     try std.testing.expect(MAX_UDP_BATCH_SIZE <= MAX_UDP_PAYLOAD);
 }
+
 test "Configuration constants are valid" {
     try std.testing.expect(NUM_PROCESSORS > 0);
     try std.testing.expect(OUTPUT_DRAIN_LIMIT > 0);
     try std.testing.expect(MAX_UDP_PAYLOAD > 0);
     try std.testing.expect(MAX_CLIENT_BATCHES > 0);
     try std.testing.expect(ENCODE_BUF_SIZE >= 256);
+    try std.testing.expect(FLUSH_INTERVAL > 0);
 }
