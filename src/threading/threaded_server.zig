@@ -35,14 +35,14 @@ pub const NUM_PROCESSORS: usize = 2;
 /// Drain limit per poll cycle must NOT starve socket polling.
 /// Large limits can cause EPOLLOUT / reads to be delayed for many ms+ under load.
 /// Keep this modest; you can tune upward after measuring.
-const OUTPUT_DRAIN_LIMIT: u32 = 8192;
+const OUTPUT_DRAIN_LIMIT: u32 = 4 * 8192;
 
 /// Total output cap per pollOnce across ALL processors.
 /// Prevents worst-case 2 * OUTPUT_DRAIN_LIMIT from taking too long.
 const OUTPUT_DRAIN_TOTAL_CAP: u32 = OUTPUT_DRAIN_LIMIT * @as(u32, @intCast(NUM_PROCESSORS));
 
 /// Default poll timeout in milliseconds.
-const DEFAULT_POLL_TIMEOUT_MS: i32 = 2;
+const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;

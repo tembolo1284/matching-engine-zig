@@ -59,7 +59,7 @@ const OUTPUT_YIELD_COUNT: u32 = 50;
 
 /// Enable latency tracking (adds ~100-200ns per message from syscalls)
 /// Set to false for maximum performance in production
-pub const TRACK_LATENCY: bool = true;
+pub const TRACK_LATENCY: bool = false;
 
 /// In debug/safe builds, panic if critical messages are dropped
 /// Critical = trades, rejects (clients MUST receive these)
