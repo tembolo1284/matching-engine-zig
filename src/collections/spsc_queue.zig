@@ -43,7 +43,6 @@
 //! - Rule 2: All loops bounded by capacity
 //! - Rule 5: Assertions validate invariants
 //! - Rule 9: Unsafe pointer access clearly marked
-
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -61,6 +60,8 @@ pub const TRACK_STATS: bool = builtin.mode != .ReleaseFast;
 
 /// Warning threshold for item size relative to cache line.
 /// Items larger than this may cause cache thrashing.
+/// Note: This is advisory only - larger items are allowed but may have
+/// suboptimal cache performance.
 const LARGE_ITEM_THRESHOLD: usize = CACHE_LINE_SIZE * 2;
 
 // ============================================================================
@@ -100,7 +101,7 @@ pub const QueueStats = struct {
 /// Lock-free Single Producer Single Consumer queue.
 ///
 /// Parameters:
-/// - `T`: Element type (should be small, ideally ≤ cache line)
+/// - `T`: Element type (ideally ≤ 2 cache lines for optimal performance)
 /// - `capacity`: Queue size, must be power of 2
 ///
 /// Example:
@@ -129,10 +130,10 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
         if (capacity > 1 << 30) {
             @compileError("SpscQueue capacity too large (max 2^30)");
         }
-        // Warn about large items (compile-time note via assert message)
-        if (@sizeOf(T) > LARGE_ITEM_THRESHOLD) {
-            @compileLog("SpscQueue: Item size exceeds 2 cache lines, consider using pointers");
-        }
+        // Note: Items larger than 2 cache lines (128 bytes) are allowed but
+        // may have suboptimal cache performance. Consider using pointers
+        // for very large items.
+        // (Removed @compileLog to allow release builds with larger items)
     }
 
     return struct {
@@ -592,7 +593,6 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
             // P10 Rule 2: CAS loop bounded by practical limit
             var attempts: usize = 0;
             const max_attempts: usize = 10;
-
             while (current > high and attempts < max_attempts) : (attempts += 1) {
                 const result = self.stats.high_water_mark.cmpxchgWeak(
                     high,
@@ -646,7 +646,6 @@ test "SpscQueue - basic push/pop" {
     try std.testing.expect(queue.push(1));
     try std.testing.expect(queue.push(2));
     try std.testing.expect(queue.push(3));
-
     try std.testing.expectEqual(@as(usize, 3), queue.size());
 
     // Pop items (FIFO order)
@@ -654,7 +653,6 @@ test "SpscQueue - basic push/pop" {
     try std.testing.expectEqual(@as(?u32, 2), queue.pop());
     try std.testing.expectEqual(@as(?u32, 3), queue.pop());
     try std.testing.expectEqual(@as(?u32, null), queue.pop());
-
     try std.testing.expectEqual(@as(usize, 0), queue.size());
 }
 
@@ -727,7 +725,6 @@ test "SpscQueue - peek (safe copy)" {
     try std.testing.expect(queue.peek() == null);
 
     _ = queue.push(42);
-
     const peeked = queue.peek();
     try std.testing.expect(peeked != null);
     try std.testing.expectEqual(@as(u32, 42), peeked.?);
@@ -745,7 +742,6 @@ test "SpscQueue - peekPtr (unsafe pointer)" {
     try std.testing.expect(queue.peekPtr() == null);
 
     _ = queue.push(42);
-
     const peeked = queue.peekPtr();
     try std.testing.expect(peeked != null);
     try std.testing.expectEqual(@as(u32, 42), peeked.?.*);

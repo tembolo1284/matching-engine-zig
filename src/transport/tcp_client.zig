@@ -37,10 +37,13 @@ pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 const RECV_COMPACT_THRESHOLD: u32 = RECV_BUFFER_SIZE / 2;
 
 /// Per-client output queue capacity
-const OUTPUT_QUEUE_CAPACITY: usize = 32768;
+const OUTPUT_QUEUE_CAPACITY: usize = 65536;
 
 /// Max encoded message size (with framing)
-const MAX_ENCODED_SIZE: usize = 256;
+/// Binary trade is 34 bytes + 4 byte header = 38 bytes
+/// CSV trade is ~90 bytes max
+/// Use 124 bytes so struct (124 + 2 for len + padding) stays under 128 bytes (2 cache lines)
+const MAX_ENCODED_SIZE: usize = 124;
 
 /// Max messages to drain per EPOLLOUT event
 const MAX_DRAIN_PER_EVENT: u32 = 1024;
