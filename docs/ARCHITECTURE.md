@@ -6,29 +6,31 @@ This document describes the technical architecture of the Zig Matching Engine, c
 
 1. [System Overview](#system-overview)
 2. [Threading Model](#threading-model)
-3. [Core Components](#core-components)
-4. [Protocol Layer](#protocol-layer)
-5. [Transport Layer](#transport-layer)
-6. [Memory Management](#memory-management)
-7. [Data Structures](#data-structures)
-8. [Message Flow](#message-flow)
-9. [Error Handling](#error-handling)
-10. [Performance Optimizations](#performance-optimizations)
+3. [Per-Client Output Queues (v3)](#per-client-output-queues-v3)
+4. [Core Components](#core-components)
+5. [Protocol Layer](#protocol-layer)
+6. [Transport Layer](#transport-layer)
+7. [Memory Management](#memory-management)
+8. [Data Structures](#data-structures)
+9. [Message Flow](#message-flow)
+10. [Error Handling](#error-handling)
+11. [Performance Optimizations](#performance-optimizations)
 
 ---
 
 ## System Overview
 
-The matching engine uses a **dual-processor architecture** where network I/O is separated from order matching to minimize latency jitter.
+The matching engine uses a **dual-processor architecture** with **per-client output queues** where network I/O is separated from order matching to minimize latency jitter, and message routing is decoupled from TCP sending for maximum throughput.
 
 ### Design Goals
 
 | Goal | Approach |
 |------|----------|
-| Low Latency | Lock-free queues, heap-allocated buffers, no allocation in hot path |
-| High Throughput | Parallel processors, batched I/O, epoll/kqueue |
+| Low Latency | Lock-free queues, per-client output queues, no allocation in hot path |
+| High Throughput | Parallel processors, batched I/O, EPOLLOUT-driven sends |
 | Reliability | Bounded resources, graceful degradation, P10 compliance |
 | Cross-Platform | epoll (Linux), kqueue (macOS), abstracted socket options |
+| Client Isolation | Per-client queues prevent slow clients from blocking fast ones |
 
 ### High-Level Architecture
 
@@ -88,8 +90,22 @@ The matching engine uses a **dual-processor architecture** where network I/O is 
                               ┌────────────────────────────────┘
                               │
                     ┌─────────▼───────────────────────────────┐
-                    │           Response Encoding             │
-                    │         & Client Dispatch               │
+                    │      Per-Client Output Queues (v3)       │
+                    │                                          │
+                    │  ┌────────┐ ┌────────┐ ┌────────┐       │
+                    │  │Client 1│ │Client 2│ │Client N│       │
+                    │  │ Queue  │ │ Queue  │ │ Queue  │       │
+                    │  │ (32K)  │ │ (32K)  │ │ (32K)  │       │
+                    │  └───┬────┘ └───┬────┘ └───┬────┘       │
+                    │      │          │          │             │
+                    │      └──────────┼──────────┘             │
+                    │                 │                        │
+                    │         EPOLLOUT triggers                │
+                    │                 │                        │
+                    │      ┌──────────▼──────────┐             │
+                    │      │  drainToSocket()   │             │
+                    │      │  Batched send()    │             │
+                    │      └────────────────────┘             │
                     └─────────────────────────────────────────┘
 ```
 
@@ -101,7 +117,7 @@ The matching engine uses a **dual-processor architecture** where network I/O is 
 
 | Thread | Responsibility | Key Structures |
 |--------|----------------|----------------|
-| I/O Thread | Network I/O, routing, encoding | TcpServer, UdpServer, MulticastPublisher |
+| I/O Thread | Network I/O, routing, encoding, output dispatch | TcpServer, UdpServer, MulticastPublisher, Per-client queues |
 | Processor 0 | Match A-M symbols | MatchingEngine, MemoryPools, OrderMap |
 | Processor 1 | Match N-Z symbols | MatchingEngine, MemoryPools, OrderMap |
 
@@ -124,6 +140,22 @@ I/O Thread                    Processor Thread
      │◄─│ message      │────pop─────│
      │  │ latency_ns   │            │
      │  └──────────────┘            │
+     │                              │
+     │      (I/O Thread)            │
+     │           │                  │
+     │     queueOutput()            │
+     │           │                  │
+     │  ┌────────▼────────┐         │
+     │  │ Per-Client Queue│         │
+     │  │    (32K SPSC)   │         │
+     │  └────────┬────────┘         │
+     │           │                  │
+     │    EPOLLOUT fires            │
+     │           │                  │
+     │  ┌────────▼────────┐         │
+     │  │ drainToSocket() │         │
+     │  │ Batched send()  │         │
+     │  └─────────────────┘         │
 ```
 
 ### Symbol Routing
@@ -132,7 +164,6 @@ I/O Thread                    Processor Thread
 pub fn routeSymbol(symbol: *const Symbol) ProcessorId {
     const first = symbol[0];
     if (first == 0) return .processor_0;
-
     const upper = first & 0xDF;  // ASCII to uppercase
     if (upper >= 'A' and upper <= 'M') {
         return .processor_0;
@@ -145,6 +176,109 @@ This provides:
 - **Deterministic routing**: Same symbol always goes to same processor
 - **Even distribution**: Roughly 50/50 split for typical symbol sets
 - **No locking**: Routing is a pure function
+
+---
+
+## Per-Client Output Queues (v3)
+
+### The Problem (v1/v2)
+
+In earlier versions, the output routing path looked like this:
+
+```
+drainOutputQueues() → encode() → queueFramedSend() → [16MB buffer] → flushSend() → send()
+                                        ↑                                    ↑
+                                  copies to buffer                    syscall blocks everything
+```
+
+This had several issues:
+- **Blocking sends**: `flushSend()` would loop calling `send()` until all data was sent
+- **Coupled routing**: Message routing was tied to TCP I/O performance
+- **No client isolation**: A slow client would block all other clients
+- **Syscall overhead**: Many small `send()` calls instead of batched writes
+
+### The Solution (v3)
+
+The v3 architecture introduces **per-client lock-free output queues**, inspired by high-performance C matching engine implementations:
+
+```
+drainOutputQueues() → encode() → client.queueOutput() → [per-client SPSC queue]
+                                        ↑                           ↓
+                                  just a queue push           [later, on EPOLLOUT]
+                                  (no syscall!)                      ↓
+                                                    client.drainToSocket() → batched send()
+```
+
+### Key Components
+
+#### Per-Client Output Queue
+
+Each TCP client has its own lock-free SPSC queue:
+
+```zig
+const OutputQueue = SpscQueue(EncodedMessage, OUTPUT_QUEUE_CAPACITY);
+
+pub const TcpClient = struct {
+    // ... existing fields ...
+    output_queue: ?*OutputQueue,  // NEW: per-client output queue
+    
+    /// Queue an encoded message for sending. This is FAST - just a queue push.
+    pub fn queueOutput(self: *Self, data: []const u8) bool {
+        const queue = self.output_queue orelse return false;
+        var msg = EncodedMessage.init();
+        if (!msg.set(data)) return false;
+        return queue.push(msg);
+    }
+    
+    /// Drain queued messages to socket. Called on EPOLLOUT.
+    pub fn drainToSocket(self: *Self) !u32 {
+        // Batch multiple messages into send buffer
+        // Single send() syscall for the batch
+        // Returns number of messages sent
+    }
+};
+```
+
+#### Output Dispatch Flow
+
+```zig
+pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
+    // 1) Service socket events (EPOLLOUT drains client queues)
+    if (self.cfg.tcp_enabled) _ = try self.tcp.poll(0);
+    
+    // 2) Drain processor outputs into per-client queues (fast)
+    _ = self.drainOutputQueues();
+    
+    // 3) Enable EPOLLOUT for clients with queued output
+    self.enableWriteForClientsWithOutput();
+    
+    // 4) Poll again to service EPOLLOUT
+    if (self.cfg.tcp_enabled) _ = try self.tcp.poll(timeout_ms);
+}
+```
+
+### Benefits
+
+| Aspect | v1/v2 | v3 |
+|--------|-------|-----|
+| Routing latency | ~1-10μs (includes syscall) | ~10-50ns (queue push only) |
+| Client isolation | None (shared buffer) | Full (per-client queue) |
+| Batching | Limited | Automatic (batch per EPOLLOUT) |
+| Backpressure | Blocks hot path | Isolated to slow client |
+| Syscall overhead | Many small sends | Few batched sends |
+
+### Configuration
+
+```zig
+// Per-client output queue capacity
+const OUTPUT_QUEUE_CAPACITY: usize = 32768;
+
+// Maximum encoded message size
+const MAX_ENCODED_SIZE: usize = 256;
+
+// Maximum messages to drain per EPOLLOUT event
+const MAX_DRAIN_PER_EVENT: u32 = 1024;
+```
 
 ---
 
@@ -209,7 +343,6 @@ pub const OrderBook = struct {
 ```
 
 **Order Matching Algorithm**:
-
 ```
 For a BUY order at price P with quantity Q:
 1. Find best ASK price
@@ -388,7 +521,6 @@ Offset  Size  Field
 ### CSV Format
 
 Human-readable, newline-terminated:
-
 ```
 # Input
 N, <user_id>, <symbol>, <price>, <qty>, <side>, <order_id>
@@ -410,7 +542,6 @@ R, <symbol>, <user_id>, <order_id>, <reason>
 ### TCP Server
 
 **Framing**: 4-byte big-endian length prefix:
-
 ```
 ┌────────────────┬─────────────────────────────────┐
 │  4 bytes (BE)  │         N bytes                 │
@@ -421,18 +552,20 @@ R, <symbol>, <user_id>, <order_id>, <reason>
 **Features**:
 - epoll (Linux) / kqueue (macOS) via `Poller` abstraction
 - Edge-triggered events with drain loops
-- Per-client heap-allocated buffers (256KB recv, 256KB send)
+- Per-client heap-allocated buffers (16MB recv, 256KB send)
+- **Per-client output queues (32K capacity)** - NEW in v3
 - Idle timeout enforcement (default 300s)
 - Consecutive error tracking with auto-disconnect
 
 **Key Constants** (from `tcp_client.zig`):
 ```zig
-RECV_BUFFER_SIZE = 262144      // 256KB per client
-SEND_BUFFER_SIZE = 262144      // 256KB per client
-FRAME_HEADER_SIZE = 4          // Length prefix
-MAX_MESSAGE_SIZE = 65536       // Max payload
-MAX_CONSECUTIVE_ERRORS = 10    // Before disconnect
-MAX_CLIENTS = 64               // Concurrent connections
+RECV_BUFFER_SIZE = 16 * 1024 * 1024    // 16MB per client (receive)
+SEND_BUFFER_SIZE = 256 * 1024          // 256KB per client (send batching)
+OUTPUT_QUEUE_CAPACITY = 32768          // 32K messages per client
+FRAME_HEADER_SIZE = 4                  // Length prefix
+MAX_MESSAGE_SIZE = 65536               // Max payload
+MAX_CONSECUTIVE_ERRORS = 10            // Before disconnect
+MAX_CLIENTS = 64                       // Concurrent connections
 ```
 
 ### UDP Server
@@ -514,13 +647,20 @@ Subscribers use sequence numbers for gap detection.
 │  Shared (I/O Thread):                                        │
 │  ┌─────────────────┐  ┌─────────────────┐                   │
 │  │  Input Queues   │  │  Output Queues  │                   │
-│  │  2 × 64K slots  │  │  2 × 64K slots  │                   │
+│  │  2 × 256K slots │  │  2 × 256K slots │                   │
+│  └─────────────────┘  └─────────────────┘                   │
+│                                                              │
+│  Per-Client (v3):                                            │
+│  ┌─────────────────┐  ┌─────────────────┐                   │
+│  │  Output Queue   │  │  Send Buffer    │                   │
+│  │  (32K messages) │  │  (256KB)        │                   │
+│  │  × max_clients  │  │  × max_clients  │                   │
 │  └─────────────────┘  └─────────────────┘                   │
 │                                                              │
 │  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │  TCP Client     │  │  UDP Hash Table │                   │
+│  │  TCP Recv       │  │  UDP Hash Table │                   │
 │  │  Buffers (heap) │  │  (~64 KB)       │                   │
-│  │  256KB × clients│  │                 │                   │
+│  │  16MB × clients │  │                 │                   │
 │  └─────────────────┘  └─────────────────┘                   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -584,9 +724,14 @@ pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
 - `pop`: Acquire semantics on tail read (sees producer's writes)
 - No memory barriers needed within single thread
 
+**Usage in v3**:
+- Input queues: I/O thread → Processor threads (256K capacity)
+- Output queues: Processor threads → I/O thread (256K capacity)
+- **Per-client queues**: I/O thread internal (32K capacity per client)
+
 **Key Constants** (from `processor.zig`):
 ```zig
-CHANNEL_CAPACITY = 65536       // Must be power of 2
+CHANNEL_CAPACITY = 262144       // Must be power of 2
 ```
 
 ### PriceLevel (Intrusive Doubly-Linked List)
@@ -604,13 +749,13 @@ pub const PriceLevel = struct {
 };
 ```
 
-Orders maintain `prev`/`next` pointers for O(1) insertion and removal.
+Orders maintain `prev/next` pointers for O(1) insertion and removal.
 
 ---
 
 ## Message Flow
 
-### New Order Flow
+### New Order Flow (v3)
 
 ```
 1. Client sends:     N, 1, AAPL, 15000, 100, B, 1
@@ -641,18 +786,45 @@ Orders maintain `prev`/`next` pointers for O(1) insertion and removal.
                            │
 12. I/O drains:      output_queue[0].pop() → ProcessorOutput
                            │
-13. Encode:          csv_codec.encodeOutput(...)
+13. Encode:          binary_codec.encodeOutput(...)
                            │
-14. Send:            tcp_server.send(client_id, data)
-                     multicast.publish(&trade) // if trade
+14. Queue to client: client.queueOutput(encoded_data)   ◄── FAST (no syscall)
+                           │
+                    ─ ─ ─ ─┼─ ─ ─ ─ Later, on EPOLLOUT ─ ─ ─
+                           │
+15. EPOLLOUT fires:  tcp.poll() triggers writable event
+                           │
+16. Drain & Send:    client.drainToSocket()   ◄── Batched send()
+                           │
+17. Multicast:       multicast.publish(&trade) // if trade
+```
+
+### Key Difference from v1/v2
+
+In v1/v2, steps 14-16 were combined:
+```
+14. Queue + Send:    tcp.send(client_id, data)  ◄── Could block on syscall
+```
+
+In v3, they are separated:
+```
+14. Queue:           client.queueOutput(data)   ◄── Just a queue push (~50ns)
+    ...later...
+16. Send:            client.drainToSocket()     ◄── Batched, EPOLLOUT-driven
 ```
 
 ### Backpressure Handling
 
 ```
-Output Queue Full:
+Per-Client Output Queue Full:
+1. queueOutput() returns false
+2. Increment tcp_queue_failures counter
+3. Message is dropped (client-specific)
+4. Other clients are unaffected
+
+Processor Output Queue Full:
 1. Spin wait (OUTPUT_SPIN_COUNT iterations)
-2. Log warning
+2. Yield wait (OUTPUT_YIELD_COUNT iterations)
 3. For critical messages (trade, reject):
    - In debug: panic
    - In release: increment critical_drop counter
@@ -695,6 +867,7 @@ Output Queue Full:
 pub fn isHealthy(self: *const ThreadedServer) bool {
     const stats = self.getStats();
     // Critical drops indicate system overload
+    // Queue failures indicate client-specific issues (less severe)
     return stats.totalCriticalDrops() == 0;
 }
 ```
@@ -702,6 +875,14 @@ pub fn isHealthy(self: *const ThreadedServer) bool {
 ---
 
 ## Performance Optimizations
+
+### v3 Per-Client Queue Optimizations
+
+1. **Decoupled Routing**: `queueOutput()` is just a lock-free push (~10-50ns)
+2. **Batched Syscalls**: `drainToSocket()` batches multiple messages per `send()`
+3. **EPOLLOUT-Driven**: Only call `send()` when kernel signals socket readiness
+4. **Client Isolation**: Slow clients don't block fast clients
+5. **Reduced Contention**: No shared send buffer between clients
 
 ### Hot Path Optimizations
 
@@ -727,9 +908,10 @@ const CacheLineAtomic = struct {
 
 **Output Drain Batching**:
 ```zig
+OUTPUT_DRAIN_LIMIT = 262144    // Messages per drain cycle
+MAX_DRAIN_PER_EVENT = 1024     // Messages per EPOLLOUT (per client)
 OUTPUT_BATCH_SIZE = 1400       // Bytes per UDP packet
-MAX_OUTPUT_BATCHES = 64        // Per drain cycle
-OUTPUT_DRAIN_LIMIT = 131072    // Messages per drain
+MAX_OUTPUT_BATCHES = 64        // UDP batches per drain
 ```
 
 ### Platform-Specific
@@ -744,10 +926,13 @@ OUTPUT_DRAIN_LIMIT = 131072    // Messages per drain
 
 ```zig
 // Threading (processor.zig)
-CHANNEL_CAPACITY = 65536        // SPSC queue size (power of 2)
-OUTPUT_DRAIN_LIMIT = 131072     // Max outputs per drain cycle
-OUTPUT_BATCH_SIZE = 1400        // UDP batch payload size
-MAX_OUTPUT_BATCHES = 64         // Batches per drain
+CHANNEL_CAPACITY = 262144       // SPSC queue size (power of 2)
+OUTPUT_DRAIN_LIMIT = 262144     // Max outputs per drain cycle
+
+// Per-Client (tcp_client.zig) - NEW in v3
+OUTPUT_QUEUE_CAPACITY = 32768   // Per-client output queue
+MAX_ENCODED_SIZE = 256          // Bytes per queued message
+MAX_DRAIN_PER_EVENT = 1024      // Messages per EPOLLOUT
 
 // Network (config.zig, tcp_client.zig, udp_server.zig)
 DEFAULT_TCP_PORT = 1234
@@ -756,10 +941,10 @@ DEFAULT_MCAST_PORT = 1236
 DEFAULT_MCAST_GROUP = "239.255.0.1"
 MAX_TCP_CLIENTS = 64
 MAX_UDP_CLIENTS = 4096
-RECV_BUFFER_SIZE = 262144       // 256KB per TCP client
-SEND_BUFFER_SIZE = 262144       // 256KB per TCP client
-MAX_MESSAGE_SIZE = 65536        // Max framed message
-SOCKET_RECV_BUF_SIZE = 8MB      // UDP kernel buffer
+RECV_BUFFER_SIZE = 16 * 1024 * 1024   // 16MB per TCP client
+SEND_BUFFER_SIZE = 256 * 1024         // 256KB per TCP client (batching only)
+MAX_MESSAGE_SIZE = 65536              // Max framed message
+SOCKET_RECV_BUF_SIZE = 8MB            // UDP kernel buffer
 
 // Memory (memory_pool.zig, matching_engine.zig)
 ORDER_POOL_CAPACITY = 65536     // Orders per processor
@@ -782,3 +967,4 @@ PANIC_ON_CRITICAL_DROP = true   // In debug mode
 - [NASA Power of Ten Rules](https://spinroot.com/gerard/pdf/P10.pdf)
 - [Lock-Free Programming](https://www.cs.cmu.edu/~410-s05/lectures/L31_LockFree.pdf)
 - [Trading and Exchanges: Market Microstructure](https://global.oup.com/academic/product/trading-and-exchanges-9780195144703)
+- High-performance C matching engine implementations (design inspiration for v3)

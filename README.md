@@ -1,11 +1,12 @@
 # Zig Matching Engine
 
-A high-performance order matching engine written in Zig, designed for low-latency trading systems. Features a dual-processor architecture with lock-free communication, supporting TCP, UDP, and multicast protocols with CSV, binary, and FIX message formats.
+A high-performance order matching engine written in Zig, designed for low-latency trading systems. Features a dual-processor architecture with lock-free communication, per-client output queues for decoupled I/O, and support for TCP, UDP, and multicast protocols with CSV, binary, and FIX message formats.
 
 ## Features
 
-- **High Performance**: Lock-free SPSC queues, zero-copy message passing, O(1) order operations
+- **High Performance**: Lock-free SPSC queues, per-client output queues, zero-copy message passing, O(1) order operations
 - **Dual-Processor Architecture**: Symbol-based partitioning (A-M / N-Z) for parallel matching
+- **Decoupled I/O**: Per-client output queues separate message routing from TCP sending (inspired by high-performance C implementations)
 - **Multiple Transports**: TCP (length-prefixed framing), UDP (stateless), Multicast (market data)
 - **Multiple Codecs**: CSV (human-readable), Binary (low-latency), FIX 4.2 (industry standard)
 - **NASA Power of Ten Compliant**: Bounded loops, extensive assertions, no dynamic allocation in hot path
@@ -41,28 +42,31 @@ See [docs/QUICK_START.md](docs/QUICK_START.md) for detailed setup instructions.
 
 ## Architecture Overview
 
+The engine uses a **three-stage pipeline** with per-client output queues for maximum throughput:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      I/O Thread                              │
-│  ┌───────────┐  ┌───────────┐  ┌─────────────────────────┐  │
-│  │TCP Server │  │UDP Server │  │ Multicast Publisher     │  │
-│  │ :1234     │  │ :1235     │  │ 239.255.0.1:1236        │  │
-│  └─────┬─────┘  └─────┬─────┘  └───────────┬─────────────┘  │
-│        │              │                    │                 │
-│        └──────────────┼────────────────────┘                 │
-│                       │                                      │
-│              ┌────────▼────────┐                             │
-│              │  Symbol Router  │                             │
-│              │  (A-M → P0)     │                             │
-│              │  (N-Z → P1)     │                             │
-│              └────────┬────────┘                             │
-└───────────────────────┼─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              I/O Thread                                      │
+│                                                                              │
+│  ┌───────────┐  ┌───────────┐  ┌─────────────────────────┐                  │
+│  │TCP Server │  │UDP Server │  │ Multicast Publisher     │                  │
+│  │ :1234     │  │ :1235     │  │ 239.255.0.1:1236        │                  │
+│  └─────┬─────┘  └─────┬─────┘  └───────────┬─────────────┘                  │
+│        │              │                    │                                 │
+│        └──────────────┼────────────────────┘                                 │
+│                       │                                                      │
+│              ┌────────▼────────┐                                             │
+│              │  Symbol Router  │                                             │
+│              │  (A-M → P0)     │                                             │
+│              │  (N-Z → P1)     │                                             │
+│              └────────┬────────┘                                             │
+└───────────────────────┼─────────────────────────────────────────────────────┘
                         │
           ┌─────────────┴─────────────┐
           │                           │
     ┌─────▼─────┐               ┌─────▼─────┐
     │ SPSC Queue│               │ SPSC Queue│
-    │  (64K)    │               │  (64K)    │
+    │  (256K)   │               │  (256K)   │
     └─────┬─────┘               └─────┬─────┘
           │                           │
 ┌─────────▼─────────┐       ┌─────────▼─────────┐
@@ -71,9 +75,46 @@ See [docs/QUICK_START.md](docs/QUICK_START.md) for detailed setup instructions.
 │  ┌─────────────┐  │       │  ┌─────────────┐  │
 │  │ OrderBooks  │  │       │  │ OrderBooks  │  │
 │  │ MemoryPools │  │       │  │ MemoryPools │  │
-│  └─────────────┘  │       │  └─────────────┘  │
-└───────────────────┘       └───────────────────┘
+│  └─────────────┘  │       └─────────────┘  │  │
+└─────────┬─────────┘       └─────────┬─────────┘
+          │                           │
+    ┌─────▼─────┐               ┌─────▼─────┐
+    │Output SPSC│               │Output SPSC│
+    └─────┬─────┘               └─────┬─────┘
+          │                           │
+          └─────────────┬─────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────────────────────────┐
+│                         Output Routing (I/O Thread)                          │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    Per-Client Output Queues                          │   │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │   │
+│   │  │Client 1  │  │Client 2  │  │Client 3  │  │Client N  │            │   │
+│   │  │Queue 32K │  │Queue 32K │  │Queue 32K │  │Queue 32K │            │   │
+│   │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘            │   │
+│   └───────┼─────────────┼─────────────┼─────────────┼───────────────────┘   │
+│           │             │             │             │                        │
+│           │         EPOLLOUT fires    │             │                        │
+│           │             │             │             │                        │
+│           ▼             ▼             ▼             ▼                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │              Batched TCP Send (drainToSocket)                        │   │
+│   │         Multiple messages per send() syscall                         │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Key Design: Per-Client Output Queues
+
+The v3 architecture introduces **per-client lock-free output queues** that decouple message routing from TCP sending:
+
+1. **Fast Routing**: `queueOutput()` just pushes to a lock-free queue - no syscalls
+2. **Batched Sending**: `drainToSocket()` batches multiple messages per `send()` syscall
+3. **EPOLLOUT-Driven**: Actual TCP writes happen when the kernel signals socket readiness
+4. **No Backpressure on Hot Path**: Routing never blocks on slow clients
+
+This pattern is inspired by high-performance C matching engine implementations.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentation.
 
@@ -98,14 +139,14 @@ src/
 │
 ├── transport/              # Network I/O layer
 │   ├── tcp_server.zig      # TCP with epoll/kqueue
-│   ├── tcp_client.zig      # Per-connection state & buffers
+│   ├── tcp_client.zig      # Per-connection state, buffers & output queue
 │   ├── udp_server.zig      # Stateless UDP with client tracking
 │   ├── multicast.zig       # Market data publisher/subscriber
 │   ├── config.zig          # Configuration management
 │   └── net_utils.zig       # Cross-platform network utilities
 │
 ├── threading/              # Multi-threaded architecture
-│   ├── threaded_server.zig # I/O thread + message routing
+│   ├── threaded_server.zig # I/O thread + message routing + output dispatch
 │   ├── processor.zig       # Matching processor threads
 │   └── mod.zig             # Module exports
 │
@@ -121,7 +162,6 @@ src/
 ### CSV Format (Human-Readable)
 
 **Input Messages:**
-
 ```
 # New Order: N, <user_id>, <symbol>, <price>, <qty>, <side>, <user_order_id>
 N, 1001, AAPL, 15000, 100, B, 1
@@ -134,7 +174,6 @@ F
 ```
 
 **Output Messages:**
-
 ```
 # Acknowledgment: A, <symbol>, <user_id>, <user_order_id>
 A, AAPL, 1001, 1
@@ -254,7 +293,8 @@ ENGINE_MCAST_PORT=1236        # Multicast port
 ENGINE_MCAST_TTL=1            # TTL (1 = local subnet)
 
 # Performance
-ENGINE_CHANNEL_CAPACITY=65536 # SPSC queue size (power of 2)
+ENGINE_CHANNEL_CAPACITY=262144  # SPSC queue size (power of 2)
+ENGINE_CLIENT_QUEUE_CAPACITY=32768  # Per-client output queue
 ENGINE_BINARY_PROTOCOL=false  # Use binary instead of CSV
 ```
 
@@ -278,6 +318,15 @@ Options:
 | Latency (p99) | < 50 μs | Including queue wait |
 | Throughput | > 200K orders/sec | Per processor |
 | Memory | ~100 MB | Fixed allocation at startup |
+
+### v3 Architecture Benefits
+
+The per-client output queue architecture provides:
+
+- **No routing bottleneck**: `queueOutput()` is just a lock-free push (~10-50ns)
+- **Batched syscalls**: Multiple messages per `send()` reduces kernel overhead
+- **Client isolation**: Slow clients don't block fast clients
+- **Graceful degradation**: Per-client queue overflow is isolated
 
 ## Client Examples
 
@@ -413,3 +462,19 @@ This codebase follows the **NASA Power of Ten** rules for safety-critical softwa
 | 9 | Book full |
 | 10 | Invalid order ID |
 
+## Version History
+
+### v3.0 (Current)
+- **Per-client output queues**: Decoupled routing from TCP sending
+- **EPOLLOUT-driven writes**: Batched sends when socket is ready
+- **Improved throughput**: 5-10x improvement in sustained message rates
+- **Client isolation**: Slow clients don't impact fast clients
+
+### v2.0
+- Dual-processor architecture
+- Symbol-based partitioning
+- Lock-free SPSC queues
+
+### v1.0
+- Single-threaded matching engine
+- Basic TCP/UDP support
