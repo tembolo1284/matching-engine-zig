@@ -574,8 +574,8 @@ pub const TcpClient = struct {
         return self.send_len - self.send_pos;
     }
 
-    pub fn recordMessageSent(self: *Self) void {
-        // Now tracked in drainToSocket
+    pub fn recordMessageSent(_: *Self) void {
+        // Now tracked in drainToSocket - this is a no-op for API compatibility
     }
 
     // ========================================================================
