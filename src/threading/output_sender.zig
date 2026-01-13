@@ -51,23 +51,26 @@ const proc = @import("processor.zig");
 pub const MAX_OUTPUT_CLIENTS: usize = 128;
 
 /// Drain limit per poll iteration (prevents starvation)
-const DRAIN_LIMIT_PER_QUEUE: u32 = 16384;
+const DRAIN_LIMIT_PER_QUEUE: u32 = 4096;
 
 /// Total drain cap across all queues per iteration
-const DRAIN_TOTAL_CAP: u32 = 32768;
+const DRAIN_TOTAL_CAP: u32 = 8192;
 
 /// Send buffer size per client for batching
-/// Larger buffer = fewer syscalls = higher throughput
-const SEND_BUFFER_SIZE: usize = 256 * 1024; // 256KB per client
+/// Smaller buffer = more frequent sends = better latency and flow control
+const SEND_BUFFER_SIZE: usize = 64 * 1024; // 64KB per client
 
 /// Maximum sends per client per iteration (prevents starvation)
-const MAX_SENDS_PER_CLIENT: u32 = 1024;
+const MAX_SENDS_PER_CLIENT: u32 = 512;
 
 /// Encode buffer size
 const ENCODE_BUF_SIZE: usize = 512;
 
 /// Poll sleep when idle (microseconds) - keep very short to minimize latency
 const IDLE_SLEEP_US: u64 = 10;
+
+/// Flush threshold - flush when buffer reaches this level (leave room for one more message)
+const FLUSH_THRESHOLD: usize = SEND_BUFFER_SIZE - 1024;
 
 // Compile-time validation
 comptime {
@@ -76,6 +79,7 @@ comptime {
     std.debug.assert(DRAIN_TOTAL_CAP >= DRAIN_LIMIT_PER_QUEUE);
     std.debug.assert(SEND_BUFFER_SIZE >= 1024);
     std.debug.assert(ENCODE_BUF_SIZE >= 256);
+    std.debug.assert(FLUSH_THRESHOLD < SEND_BUFFER_SIZE);
 }
 
 // ============================================================================
@@ -582,10 +586,8 @@ pub const OutputSender = struct {
             if (total_drained >= DRAIN_TOTAL_CAP) break;
         }
 
-        // Flush client buffers periodically
-        if (total_drained > 0) {
-            self.flushAllClients();
-        }
+        // Always flush after draining - don't let messages sit in buffers
+        self.flushAllClients();
 
         return total_drained;
     }
@@ -675,7 +677,7 @@ pub const OutputSender = struct {
             client.send_len += data.len;
 
             // Flush if buffer is getting full
-            if (client.send_len >= SEND_BUFFER_SIZE - ENCODE_BUF_SIZE - 4) {
+            if (client.send_len >= FLUSH_THRESHOLD) {
                 self.flushClient(client);
             }
         } else {
