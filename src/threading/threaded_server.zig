@@ -29,17 +29,16 @@ const proc = @import("processor.zig");
 // ============================================================================
 pub const NUM_PROCESSORS: usize = 2;
 
-/// Drain limits - high to maximize throughput
-const OUTPUT_DRAIN_LIMIT: u32 = 262144;
-const OUTPUT_DRAIN_TOTAL_CAP: u32 = 262144;
+/// Drain limits - smaller for faster poll cycling
+const OUTPUT_DRAIN_LIMIT: u32 = 4096;
+const OUTPUT_DRAIN_TOTAL_CAP: u32 = 8192;
 
 /// Poll timeout - 0 for maximum throughput
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
 
 /// How many send() calls to make per client per drain cycle
-/// This batches multiple small sends into fewer syscalls
-/// At ~64KB per send, 256 calls = ~16MB per flush round
-const MAX_FLUSHES_PER_CLIENT: u32 = 256;
+/// Smaller = faster poll cycling, let EPOLLOUT help
+const MAX_FLUSHES_PER_CLIENT: u32 = 32;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
@@ -315,36 +314,24 @@ pub const ThreadedServer = struct {
         std.log.info("Threaded server event loop exited", .{});
     }
 
-    /// v5 poll loop:
-    /// 1) Poll sockets (handles reads AND EPOLLOUT for sends)
-    /// 2) Drain output queues into send buffers
-    /// 3) Flush UDP batches
-    /// 4) Aggressively flush TCP clients until no progress
-    /// 5) Poll again for EPOLLOUT events
+    /// v5 poll loop - fast cycling, balanced read/write
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
         std.debug.assert(timeout_ms >= 0);
 
-        // 1) Service socket events (reads + EPOLLOUT sends)
+        // 1) Service socket events
         if (self.cfg.tcp_enabled) _ = try self.tcp.poll(0);
         if (self.cfg.udp_enabled) _ = self.udp.poll() catch {};
 
-        // 2) Drain processor outputs into TCP send buffers
-        const drained = self.drainOutputQueues();
+        // 2) Drain a chunk of processor outputs
+        _ = self.drainOutputQueues();
 
         // 3) Flush UDP batches
         self.flushAllBatches();
 
-        // 4) Aggressively flush TCP - keep going while making progress
-        if (drained > 0 or self.hasPendingTcpData()) {
-            var rounds: u32 = 0;
-            const max_rounds: u32 = 16; // Prevent infinite loop
-            while (rounds < max_rounds) : (rounds += 1) {
-                const made_progress = self.flushPendingClients();
-                if (!made_progress) break;
-            }
-        }
+        // 4) Flush TCP once (no rounds - just one pass)
+        _ = self.flushPendingClients();
 
-        // 5) Poll again to handle any EPOLLOUT events for remaining data
+        // 5) Poll with timeout
         if (self.cfg.tcp_enabled) _ = try self.tcp.poll(timeout_ms);
         if (self.cfg.udp_enabled) _ = self.udp.poll() catch {};
     }
