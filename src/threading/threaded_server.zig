@@ -38,7 +38,8 @@ const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
 
 /// How many send() calls to make per client per drain cycle
 /// This batches multiple small sends into fewer syscalls
-const MAX_FLUSHES_PER_CLIENT: u32 = 64;
+/// At ~64KB per send, 256 calls = ~16MB per flush round
+const MAX_FLUSHES_PER_CLIENT: u32 = 256;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
@@ -318,9 +319,8 @@ pub const ThreadedServer = struct {
     /// 1) Poll sockets (handles reads AND EPOLLOUT for sends)
     /// 2) Drain output queues into send buffers
     /// 3) Flush UDP batches
-    /// 4) Proactively flush TCP clients (bounded attempts per client)
-    /// 5) Enable EPOLLOUT for any clients with remaining data
-    /// 6) Poll again for EPOLLOUT events
+    /// 4) Aggressively flush TCP clients until no progress
+    /// 5) Poll again for EPOLLOUT events
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
         std.debug.assert(timeout_ms >= 0);
 
@@ -334,24 +334,42 @@ pub const ThreadedServer = struct {
         // 3) Flush UDP batches
         self.flushAllBatches();
 
-        // 4) Proactively flush TCP clients with bounded send attempts
-        if (drained > 0) {
-            self.flushPendingClients();
+        // 4) Aggressively flush TCP - keep going while making progress
+        if (drained > 0 or self.hasPendingTcpData()) {
+            var rounds: u32 = 0;
+            const max_rounds: u32 = 16; // Prevent infinite loop
+            while (rounds < max_rounds) : (rounds += 1) {
+                const made_progress = self.flushPendingClients();
+                if (!made_progress) break;
+            }
         }
 
         // 5) Poll again to handle any EPOLLOUT events for remaining data
         if (self.cfg.tcp_enabled) _ = try self.tcp.poll(timeout_ms);
         if (self.cfg.udp_enabled) _ = self.udp.poll() catch {};
     }
+    
+    /// Check if any TCP client has pending send data
+    fn hasPendingTcpData(self: *Self) bool {
+        var iter = self.tcp.clients.getActive();
+        while (iter.next()) |client| {
+            if (client.hasPendingSend()) return true;
+        }
+        return false;
+    }
 
     /// Flush pending TCP clients with bounded send attempts per client.
     /// This does the actual sending - we don't just rely on EPOLLOUT because
     /// edge-triggered epoll only fires on transitions.
-    fn flushPendingClients(self: *Self) void {
+    /// Returns true if any data was sent.
+    fn flushPendingClients(self: *Self) bool {
+        var any_sent = false;
         var iter = self.tcp.clients.getActive();
         while (iter.next()) |client| {
             if (!client.hasPendingSend()) continue;
 
+            const before = client.getPendingSendBytes();
+            
             // Do up to MAX_FLUSHES_PER_CLIENT send attempts
             var flushes: u32 = 0;
             while (flushes < MAX_FLUSHES_PER_CLIENT) : (flushes += 1) {
@@ -368,11 +386,15 @@ pub const ThreadedServer = struct {
                 };
             }
 
+            const after = client.getPendingSendBytes();
+            if (after < before) any_sent = true;
+
             // If still have data after our attempts, enable EPOLLOUT
             if (client.hasPendingSend()) {
                 self.tcp.updateClientPoller(client, true) catch {};
             }
         }
+        return any_sent;
     }
 
     /// Force flush all clients (for shutdown only)
