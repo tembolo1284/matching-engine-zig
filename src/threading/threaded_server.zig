@@ -355,6 +355,7 @@ pub const ThreadedServerV6 = struct {
         if (self.cfg.tcp_enabled) {
             self.tcp.on_message = onTcpMessage;
             self.tcp.on_disconnect = onTcpDisconnect;
+            self.tcp.on_connect = onTcpConnect;  // NEW: register connect callback
             self.tcp.callback_ctx = self;
             try self.tcp.start(self.cfg.tcp_addr, self.cfg.tcp_port);
         }
@@ -492,19 +493,31 @@ pub const ThreadedServerV6 = struct {
 
     fn registerClientWithOutputSender(self: *Self, client_id: config.ClientId, fd: std.posix.fd_t) void {
         if (self.output_sender) |os| {
-            _ = os.registerClient(client_id, fd, null);
+            const registered = os.registerClient(client_id, fd, null);
+            if (registered) {
+                std.log.debug("Registered client {} with OutputSender (fd={})", .{ client_id, fd });
+            } else {
+                std.log.warn("Failed to register client {} with OutputSender", .{client_id});
+            }
         }
     }
 
     fn unregisterClientFromOutputSender(self: *Self, client_id: config.ClientId) void {
         if (self.output_sender) |os| {
             os.unregisterClient(client_id);
+            std.log.debug("Unregistered client {} from OutputSender", .{client_id});
         }
     }
 
     // ========================================================================
     // Callbacks
     // ========================================================================
+
+    /// NEW: Called when a TCP client connects
+    fn onTcpConnect(client_id: config.ClientId, fd: std.posix.fd_t, ctx: ?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
+        self.registerClientWithOutputSender(client_id, fd);
+    }
 
     fn onTcpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));

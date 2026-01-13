@@ -154,12 +154,6 @@ pub const ClientOutputState = struct {
     }
 };
 
-/// Protocol type
-pub const Protocol = enum {
-    binary,
-    csv,
-};
-
 /// Send callback type - called to actually send data to client
 /// This abstracts the transport layer (TCP socket, etc.)
 pub const SendCallback = *const fn (
@@ -184,43 +178,47 @@ pub const MulticastCallback = *const fn (
 ) void;
 
 // ============================================================================
-// Statistics
-// ============================================================================
-
-pub const OutputSenderStats = struct {
-    /// Total messages drained from processor queues
-    messages_drained: u64,
-    /// Total messages sent to clients
-    messages_sent: u64,
-    /// Messages dropped (queue full, errors)
-    messages_dropped: u64,
-    /// Critical messages dropped (trades, rejects)
-    critical_drops: u64,
-    /// Total bytes sent
-    bytes_sent: u64,
-    /// Send errors
-    send_errors: u64,
-    /// Multicast publishes
-    multicast_publishes: u64,
-    /// Idle cycles (no work)
-    idle_cycles: u64,
-    /// Active clients
-    active_clients: u32,
-
-    pub fn init() OutputSenderStats {
-        return std.mem.zeroes(OutputSenderStats);
-    }
-
-    pub fn isHealthy(self: OutputSenderStats) bool {
-        return self.critical_drops == 0;
-    }
-};
-
-// ============================================================================
 // Output Sender
 // ============================================================================
 
 pub const OutputSender = struct {
+    // ========================================================================
+    // Nested Types
+    // ========================================================================
+
+    pub const OutputSenderStats = struct {
+        /// Total messages drained from processor queues
+        messages_drained: u64,
+        /// Total messages sent to clients
+        messages_sent: u64,
+        /// Messages dropped (queue full, errors)
+        messages_dropped: u64,
+        /// Critical messages dropped (trades, rejects)
+        critical_drops: u64,
+        /// Total bytes sent
+        bytes_sent: u64,
+        /// Send errors
+        send_errors: u64,
+        /// Multicast publishes
+        multicast_publishes: u64,
+        /// Idle cycles (no work)
+        idle_cycles: u64,
+        /// Active clients
+        active_clients: u32,
+
+        pub fn init() OutputSenderStats {
+            return std.mem.zeroes(OutputSenderStats);
+        }
+
+        pub fn isHealthy(self: OutputSenderStats) bool {
+            return self.critical_drops == 0;
+        }
+    };
+
+    // ========================================================================
+    // Fields
+    // ========================================================================
+
     /// Processor output queues to drain
     processor_queues: []const *proc.OutputQueue,
 
@@ -540,7 +538,7 @@ pub const OutputSender = struct {
             if (drained == 0) {
                 self.stats.idle_cycles += 1;
                 // Brief sleep when idle to avoid spinning
-                std.time.sleep(IDLE_SLEEP_US * std.time.ns_per_us);
+                std.Thread.sleep(IDLE_SLEEP_US * std.time.ns_per_us);
             }
         }
 
@@ -703,7 +701,7 @@ pub const OutputSender = struct {
                 },
                 .would_block => {
                     // Brief pause then retry (blocking behavior)
-                    std.time.sleep(10 * std.time.ns_per_us);
+                    std.Thread.sleep(10 * std.time.ns_per_us);
                 },
                 .error_disconnected => {
                     client.send_errors += 1;
@@ -760,44 +758,44 @@ pub const OutputSender = struct {
     pub fn isHealthy(self: *const Self) bool {
         return self.stats.critical_drops == 0;
     }
+
+    // ========================================================================
+    // Direct Send Helper (for integration with TcpServer)
+    // ========================================================================
+
+    /// Creates a send callback that uses POSIX send() directly
+    /// For use when you want the OutputSender to bypass TcpClient buffering
+    pub fn makeDirectSendCallback() SendCallback {
+        return struct {
+            fn send(
+                _: config.ClientId,
+                fd: std.posix.fd_t,
+                data: []const u8,
+                _: ?*anyopaque,
+            ) SendResult {
+                if (fd < 0) return .error_disconnected;
+
+                const flags: u32 = if (@import("builtin").os.tag == .linux)
+                    std.posix.MSG.NOSIGNAL
+                else
+                    0;
+
+                _ = std.posix.send(fd, data, flags) catch |err| {
+                    if (err == error.WouldBlock) return .would_block;
+                    if (err == error.BrokenPipe or
+                        err == error.ConnectionResetByPeer or
+                        err == error.NotConnected)
+                    {
+                        return .error_disconnected;
+                    }
+                    return .error_other;
+                };
+
+                return .success;
+            }
+        }.send;
+    }
 };
-
-// ============================================================================
-// Direct Send Helper (for integration with TcpServer)
-// ============================================================================
-
-/// Creates a send callback that uses POSIX send() directly
-/// For use when you want the OutputSender to bypass TcpClient buffering
-pub fn makeDirectSendCallback() SendCallback {
-    return struct {
-        fn send(
-            _: config.ClientId,
-            fd: std.posix.fd_t,
-            data: []const u8,
-            _: ?*anyopaque,
-        ) SendResult {
-            if (fd < 0) return .error_disconnected;
-
-            const flags: u32 = if (@import("builtin").os.tag == .linux)
-                std.posix.MSG.NOSIGNAL
-            else
-                0;
-
-            _ = std.posix.send(fd, data, flags) catch |err| {
-                if (err == error.WouldBlock) return .would_block;
-                if (err == error.BrokenPipe or
-                    err == error.ConnectionResetByPeer or
-                    err == error.NotConnected)
-                {
-                    return .error_disconnected;
-                }
-                return .error_other;
-            };
-
-            return .success;
-        }
-    }.send;
-}
 
 // ============================================================================
 // Tests
