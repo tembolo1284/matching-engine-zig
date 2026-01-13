@@ -271,8 +271,8 @@ pub const ThreadedServerV6 = struct {
         errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.output_queues[i]);
 
         // Create output sender (drains processor output queues)
-        const output_queues_slice: []const *proc.OutputQueue = &self.output_queues;
-        self.output_sender = try OutputSender.init(allocator, output_queues_slice);
+        // Note: The slice points to self.output_queues which lives as long as self
+        self.output_sender = try OutputSender.init(allocator, &self.output_queues);
         errdefer if (self.output_sender) |os| os.deinit();
 
         self.tcp = TcpServer.init(allocator);
