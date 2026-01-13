@@ -1,21 +1,20 @@
 //! TCP client connection state and buffer management.
 //!
-//! OPTIMIZED VERSION v3 - Per-client output queue
+//! OPTIMIZED VERSION v4 - Improved batching without architectural changes
 //!
-//! Key changes from v2:
-//! 1. Added per-client output queue (ClientOutputQueue)
-//! 2. queueOutput() enqueues to lock-free queue (no syscall, always fast)
-//! 3. drainToSocket() dequeues and sends in batches (called on EPOLLOUT)
-//! 4. Send buffer is now just for batching syscalls, not for queuing
+//! Key changes from original:
+//! 1. Larger send buffer (16MB to handle bursts)
+//! 2. Single-shot flushSend() - one send() per call, no loop
+//! 3. Let EPOLLOUT drive subsequent flushes
+//! 4. Track send stats for debugging
 //!
-//! This decouples message routing from TCP sending, matching the C server pattern.
+//! This is a simpler optimization that doesn't require tcp_server changes.
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const config = @import("config.zig");
 const codec = @import("../protocol/codec.zig");
 const net_utils = @import("net_utils.zig");
-const SpscQueue = @import("../collections/spsc_queue.zig").SpscQueue;
 
 // ============================================================================
 // Platform Detection
@@ -26,27 +25,12 @@ const SEND_FLAGS: u32 = if (is_linux) posix.MSG.NOSIGNAL else 0;
 // ============================================================================
 // Configuration
 // ============================================================================
-pub const RECV_BUFFER_SIZE: u32 = 16 * 1024 * 1024;
-
-/// Send buffer - smaller now, just for batching syscalls
-pub const SEND_BUFFER_SIZE: u32 = 256 * 1024;  // 256KB is plenty for batching
-
+pub const RECV_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB receive buffer
+pub const SEND_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB send buffer for burst handling
 pub const FRAME_HEADER_SIZE: u32 = 4;
 pub const MAX_MESSAGE_SIZE: u32 = 4 * 16384;
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 const RECV_COMPACT_THRESHOLD: u32 = RECV_BUFFER_SIZE / 2;
-
-/// Per-client output queue capacity
-const OUTPUT_QUEUE_CAPACITY: usize = 65536;
-
-/// Max encoded message size (with framing)
-/// Binary trade is 34 bytes + 4 byte header = 38 bytes
-/// CSV trade is ~90 bytes max
-/// Use 124 bytes so struct (124 + 2 for len + padding) stays under 128 bytes (2 cache lines)
-const MAX_ENCODED_SIZE: usize = 124;
-
-/// Max messages to drain per EPOLLOUT event
-const MAX_DRAIN_PER_EVENT: u32 = 1024;
 
 comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
@@ -54,34 +38,7 @@ comptime {
     std.debug.assert(MAX_MESSAGE_SIZE > 0);
     std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
     std.debug.assert(FRAME_HEADER_SIZE == 4);
-    std.debug.assert(OUTPUT_QUEUE_CAPACITY > 0);
-    std.debug.assert((OUTPUT_QUEUE_CAPACITY & (OUTPUT_QUEUE_CAPACITY - 1)) == 0); // Power of 2
 }
-
-// ============================================================================
-// Encoded Message for Queue
-// ============================================================================
-const EncodedMessage = struct {
-    data: [MAX_ENCODED_SIZE]u8,
-    len: u16,
-    
-    fn init() EncodedMessage {
-        return .{ .data = undefined, .len = 0 };
-    }
-    
-    fn set(self: *EncodedMessage, bytes: []const u8) bool {
-        if (bytes.len > MAX_ENCODED_SIZE) return false;
-        @memcpy(self.data[0..bytes.len], bytes);
-        self.len = @intCast(bytes.len);
-        return true;
-    }
-    
-    fn slice(self: *const EncodedMessage) []const u8 {
-        return self.data[0..self.len];
-    }
-};
-
-const OutputQueue = SpscQueue(EncodedMessage, OUTPUT_QUEUE_CAPACITY);
 
 // ============================================================================
 // Client State
@@ -109,9 +66,7 @@ pub const ClientStats = struct {
     decode_errors: u64,
     send_calls: u64,
     send_would_block: u64,
-    output_queue_full: u64,
-    output_enqueued: u64,
-    output_dequeued: u64,
+    send_full_flushes: u64,
 
     pub fn init() ClientStats {
         return .{
@@ -124,9 +79,7 @@ pub const ClientStats = struct {
             .decode_errors = 0,
             .send_calls = 0,
             .send_would_block = 0,
-            .output_queue_full = 0,
-            .output_enqueued = 0,
-            .output_dequeued = 0,
+            .send_full_flushes = 0,
         };
     }
 };
@@ -142,7 +95,7 @@ pub const FrameResult = union(enum) {
 };
 
 // ============================================================================
-// TCP Client - OPTIMIZED v3
+// TCP Client
 // ============================================================================
 pub const TcpClient = struct {
     // === Connection ===
@@ -153,14 +106,13 @@ pub const TcpClient = struct {
     // === Heap-Allocated Buffers ===
     recv_buf: ?[]u8 = null,
     send_buf: ?[]u8 = null,
-    output_queue: ?*OutputQueue = null,
     allocator: ?std.mem.Allocator = null,
 
     // === Receive Buffer Indices ===
     recv_read: u32 = 0,
     recv_write: u32 = 0,
 
-    // === Send Buffer (for batching only) ===
+    // === Send Buffer Indices ===
     send_len: u32 = 0,
     send_pos: u32 = 0,
 
@@ -193,10 +145,6 @@ pub const TcpClient = struct {
         const send_buf = try allocator.alloc(u8, SEND_BUFFER_SIZE);
         errdefer allocator.free(send_buf);
 
-        const output_queue = try allocator.create(OutputQueue);
-        errdefer allocator.destroy(output_queue);
-        output_queue.* = OutputQueue.init();
-
         const now = std.time.timestamp();
 
         return .{
@@ -205,7 +153,6 @@ pub const TcpClient = struct {
             .state = .connected,
             .recv_buf = recv_buf,
             .send_buf = send_buf,
-            .output_queue = output_queue,
             .allocator = allocator,
             .recv_read = 0,
             .recv_write = 0,
@@ -226,7 +173,6 @@ pub const TcpClient = struct {
         if (self.allocator) |alloc| {
             if (self.recv_buf) |buf| alloc.free(buf);
             if (self.send_buf) |buf| alloc.free(buf);
-            if (self.output_queue) |q| alloc.destroy(q);
         }
         self.* = .{};
     }
@@ -261,7 +207,7 @@ pub const TcpClient = struct {
     }
 
     // ========================================================================
-    // Receive Operations (unchanged from original)
+    // Receive Operations
     // ========================================================================
     pub fn recvDataLen(self: *const Self) u32 {
         std.debug.assert(self.recv_write >= self.recv_read);
@@ -350,7 +296,7 @@ pub const TcpClient = struct {
     }
 
     // ========================================================================
-    // Frame Extraction (unchanged)
+    // Frame Extraction
     // ========================================================================
     pub fn extractFrame(self: *Self) FrameResult {
         const recv_buf = self.recv_buf orelse return .empty;
@@ -391,164 +337,35 @@ pub const TcpClient = struct {
     }
 
     // ========================================================================
-    // OUTPUT QUEUE OPERATIONS (NEW - the key optimization)
+    // Send Operations - OPTIMIZED
     // ========================================================================
     
-    /// Queue an encoded message for sending. This is FAST - just a queue push.
-    /// The actual TCP send happens later when drainToSocket() is called.
-    /// 
-    /// This is the key optimization: routing thread never touches the socket.
-    pub fn queueOutput(self: *Self, data: []const u8) bool {
-        const queue = self.output_queue orelse return false;
-        
-        var msg = EncodedMessage.init();
-        if (!msg.set(data)) {
-            self.stats.output_queue_full += 1;
+    /// Queue a framed message for sending.
+    /// Returns false if buffer is full.
+    pub fn queueFramedSend(self: *Self, data: []const u8) bool {
+        const send_buf = self.send_buf orelse return false;
+        const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(data.len));
+        const available = SEND_BUFFER_SIZE - self.send_len;
+
+        if (frame_size > available) {
+            self.stats.buffer_overflows += 1;
             return false;
         }
-        
-        if (queue.push(msg)) {
-            self.stats.output_enqueued += 1;
-            return true;
-        }
-        
-        self.stats.output_queue_full += 1;
-        return false;
-    }
-    
-    /// Check if there are messages waiting to be sent
-    pub fn hasQueuedOutput(self: *const Self) bool {
-        const queue = self.output_queue orelse return false;
-        return !queue.isEmpty();
-    }
-    
-    /// Get output queue depth
-    pub fn getOutputQueueDepth(self: *const Self) usize {
-        const queue = self.output_queue orelse return 0;
-        return queue.size();
-    }
-    
-    /// Drain queued messages to the socket. Call this on EPOLLOUT.
-    /// Batches multiple messages into send buffer, then does single send().
-    /// Returns number of messages sent.
-    pub fn drainToSocket(self: *Self) !u32 {
-        const queue = self.output_queue orelse return 0;
-        const send_buf = self.send_buf orelse return 0;
-        
-        var messages_sent: u32 = 0;
-        var iterations: u32 = 0;
-        
-        while (iterations < MAX_DRAIN_PER_EVENT) : (iterations += 1) {
-            // First, try to flush any pending data in send buffer
-            if (self.send_pos < self.send_len) {
-                const sent = posix.send(
-                    self.fd,
-                    send_buf[self.send_pos..self.send_len],
-                    SEND_FLAGS,
-                ) catch |err| {
-                    if (net_utils.isWouldBlock(err)) {
-                        self.stats.send_would_block += 1;
-                        return error.WouldBlock;
-                    }
-                    return err;
-                };
-                
-                self.stats.send_calls += 1;
-                self.send_pos += @intCast(sent);
-                self.stats.bytes_sent += sent;
-                
-                if (self.send_pos < self.send_len) {
-                    // Didn't send everything, socket would block
-                    return error.WouldBlock;
-                }
-                
-                // Buffer fully sent, reset
-                self.send_pos = 0;
-                self.send_len = 0;
-            }
-            
-            // Now batch messages from queue into send buffer
-            var batched: u32 = 0;
-            const max_batch = 64; // Messages per batch
-            
-            while (batched < max_batch) : (batched += 1) {
-                const msg = queue.pop() orelse break;
-                self.stats.output_dequeued += 1;
-                
-                const data = msg.slice();
-                const frame_size = FRAME_HEADER_SIZE + data.len;
-                
-                // Check if it fits in send buffer
-                if (self.send_len + frame_size > SEND_BUFFER_SIZE) {
-                    // Buffer full, need to send first
-                    // Re-queue this message (push back - but we can't with SPSC)
-                    // Instead, just break and send what we have
-                    // TODO: This loses a message! Need to handle better
-                    break;
-                }
-                
-                // Write length header
-                const hdr = send_buf[self.send_len..][0..4];
-                std.mem.writeInt(u32, hdr, @intCast(data.len), .big);
-                self.send_len += FRAME_HEADER_SIZE;
-                
-                // Write payload
-                @memcpy(send_buf[self.send_len..][0..data.len], data);
-                self.send_len += @intCast(data.len);
-                
-                messages_sent += 1;
-            }
-            
-            if (batched == 0 and self.send_len == 0) {
-                // Nothing more to send
-                break;
-            }
-            
-            // Send the batch
-            if (self.send_len > 0) {
-                const sent = posix.send(
-                    self.fd,
-                    send_buf[self.send_pos..self.send_len],
-                    SEND_FLAGS,
-                ) catch |err| {
-                    if (net_utils.isWouldBlock(err)) {
-                        self.stats.send_would_block += 1;
-                        return error.WouldBlock;
-                    }
-                    return err;
-                };
-                
-                self.stats.send_calls += 1;
-                self.send_pos += @intCast(sent);
-                self.stats.bytes_sent += sent;
-                
-                if (self.send_pos == self.send_len) {
-                    self.send_pos = 0;
-                    self.send_len = 0;
-                }
-            }
-            
-            // If queue is now empty and buffer is flushed, we're done
-            if (queue.isEmpty() and self.send_len == 0) {
-                break;
-            }
-        }
-        
-        self.touch();
-        self.stats.messages_sent += messages_sent;
-        return messages_sent;
+
+        // Write length header
+        const hdr = send_buf[self.send_len..][0..4];
+        std.mem.writeInt(u32, hdr, @intCast(data.len), .big);
+        self.send_len += FRAME_HEADER_SIZE;
+
+        // Write payload
+        @memcpy(send_buf[self.send_len..][0..data.len], data);
+        self.send_len += @intCast(data.len);
+
+        return true;
     }
 
-    // ========================================================================
-    // Legacy Send Operations (for compatibility, prefer queueOutput)
-    // ========================================================================
-    pub fn queueFramedSend(self: *Self, data: []const u8) bool {
-        // Redirect to new queue-based approach
-        return self.queueOutput(data);
-    }
-
+    /// Queue raw data without framing.
     pub fn queueRawSend(self: *Self, data: []const u8) bool {
-        // For raw sends, we still need the old behavior
         const send_buf = self.send_buf orelse return false;
         const available = SEND_BUFFER_SIZE - self.send_len;
         if (data.len > available) {
@@ -560,13 +377,75 @@ pub const TcpClient = struct {
         return true;
     }
 
+    /// Flush send buffer - SINGLE send() call, non-blocking.
+    /// Returns WouldBlock if socket isn't ready (caller should enable EPOLLOUT).
+    /// Returns normally when some data was sent (may still have pending data).
     pub fn flushSend(self: *Self) !void {
-        // Now this drains the output queue
-        _ = try self.drainToSocket();
+        if (self.send_pos >= self.send_len) return; // Nothing to send
+
+        const send_buf = self.send_buf orelse return;
+
+        const sent = posix.send(
+            self.fd,
+            send_buf[self.send_pos..self.send_len],
+            SEND_FLAGS,
+        ) catch |err| {
+            if (net_utils.isWouldBlock(err)) {
+                self.stats.send_would_block += 1;
+                return error.WouldBlock;
+            }
+            return err;
+        };
+
+        self.stats.send_calls += 1;
+        self.send_pos += @intCast(sent);
+        self.stats.bytes_sent += sent;
+        self.touch();
+
+        // Check if we sent everything
+        if (self.send_pos == self.send_len) {
+            // Buffer fully sent, reset
+            self.send_pos = 0;
+            self.send_len = 0;
+            self.stats.send_full_flushes += 1;
+        }
+        // If not fully sent, caller should enable EPOLLOUT and call again later
+    }
+
+    /// Flush send buffer completely (blocking-style, for shutdown).
+    /// Loops until all data sent or error.
+    pub fn flushSendFully(self: *Self) !void {
+        const send_buf = self.send_buf orelse return;
+        var attempts: u32 = 0;
+        const max_attempts: u32 = 10000;
+
+        while (self.send_pos < self.send_len and attempts < max_attempts) : (attempts += 1) {
+            const sent = posix.send(
+                self.fd,
+                send_buf[self.send_pos..self.send_len],
+                SEND_FLAGS,
+            ) catch |err| {
+                if (net_utils.isWouldBlock(err)) {
+                    self.stats.send_would_block += 1;
+                    std.Thread.sleep(100_000); // 100us
+                    continue;
+                }
+                return err;
+            };
+
+            self.stats.send_calls += 1;
+            self.send_pos += @intCast(sent);
+            self.stats.bytes_sent += sent;
+        }
+
+        if (self.send_pos == self.send_len) {
+            self.send_pos = 0;
+            self.send_len = 0;
+        }
     }
 
     pub fn hasPendingSend(self: *const Self) bool {
-        return self.hasQueuedOutput() or self.send_pos < self.send_len;
+        return self.send_pos < self.send_len;
     }
 
     pub fn getSendBufferUsage(self: *const Self) u32 {
@@ -577,8 +456,8 @@ pub const TcpClient = struct {
         return self.send_len - self.send_pos;
     }
 
-    pub fn recordMessageSent(_: *Self) void {
-        // Now tracked in drainToSocket - this is a no-op for API compatibility
+    pub fn recordMessageSent(self: *Self) void {
+        self.stats.messages_sent += 1;
     }
 
     // ========================================================================
@@ -613,7 +492,7 @@ pub const TcpClient = struct {
 };
 
 // ============================================================================
-// Client Pool (updated for new stats)
+// Client Pool
 // ============================================================================
 pub fn ClientPool(comptime capacity: u32) type {
     comptime {
@@ -678,9 +557,7 @@ pub fn ClientPool(comptime capacity: u32) type {
                 stats.total_decode_errors += client.stats.decode_errors;
                 stats.total_send_calls += client.stats.send_calls;
                 stats.total_would_block += client.stats.send_would_block;
-                stats.total_queue_full += client.stats.output_queue_full;
-                stats.total_enqueued += client.stats.output_enqueued;
-                stats.total_dequeued += client.stats.output_dequeued;
+                stats.total_full_flushes += client.stats.send_full_flushes;
             }
             return stats;
         }
@@ -694,9 +571,7 @@ pub fn ClientPool(comptime capacity: u32) type {
             total_decode_errors: u64 = 0,
             total_send_calls: u64 = 0,
             total_would_block: u64 = 0,
-            total_queue_full: u64 = 0,
-            total_enqueued: u64 = 0,
-            total_dequeued: u64 = 0,
+            total_full_flushes: u64 = 0,
         };
     };
 }

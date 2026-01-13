@@ -1,18 +1,16 @@
 //! Threaded server with I/O thread and dual processor threads.
 //!
-//! OPTIMIZED VERSION v3 - Per-client output queues (matches C server pattern)
+//! OPTIMIZED VERSION v4 - Remove excessive flushing, rely on EPOLLOUT
 //!
-//! Key architectural change:
-//! - Output routing just enqueues to per-client lock-free queue (FAST)
-//! - TCP sending happens separately on EPOLLOUT (batched)
-//! - This decouples message routing from TCP I/O
+//! Key changes from original:
+//! 1. Removed periodic flushAllTcpClients() during drain - MAJOR BOTTLENECK
+//! 2. Only enable EPOLLOUT when buffer has data, let kernel drive sends
+//! 3. Increased drain limits to maximize throughput
+//! 4. tcp_client v4 does single-shot flushSend() instead of looping
 //!
-//! Flow:
-//!   Processor → Output Queue → drainOutputs() → client.queueOutput() [no syscall]
-//!                                                       ↓
-//!                                              [per-client queue]
-//!                                                       ↓
-//!                              EPOLLOUT → client.drainToSocket() [batched send]
+//! The original code called flushAllTcpClients() every 100 messages AND at end
+//! of each drain cycle, causing thousands of send() syscalls per second.
+//! Now we just queue to buffer and let EPOLLOUT trigger efficient batched sends.
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -31,11 +29,12 @@ const proc = @import("processor.zig");
 // ============================================================================
 pub const NUM_PROCESSORS: usize = 2;
 
-/// Drain ALL available outputs per cycle - we're just enqueueing, it's fast
+/// Drain as much as possible per poll - no artificial limits
+/// The 16MB send buffer can hold ~100K+ messages
 const OUTPUT_DRAIN_LIMIT: u32 = 262144;
 const OUTPUT_DRAIN_TOTAL_CAP: u32 = 262144;
 
-/// Poll timeout - 0 for maximum throughput
+/// Poll timeout - 0 for maximum throughput in busy loop
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
 
 /// UDP sizing
@@ -57,7 +56,7 @@ comptime {
 }
 
 // ============================================================================
-// Output Batching (for UDP)
+// Output Batching (unchanged)
 // ============================================================================
 const ClientBatch = struct {
     client_id: config.ClientId,
@@ -70,6 +69,7 @@ const ClientBatch = struct {
     }
 
     fn reset(self: *ClientBatch, client_id: config.ClientId) void {
+        std.debug.assert(client_id != 0);
         self.client_id = client_id;
         self.len = 0;
         self.msg_count = 0;
@@ -80,6 +80,7 @@ const ClientBatch = struct {
     }
 
     fn add(self: *ClientBatch, data: []const u8) void {
+        std.debug.assert(self.canFit(data.len));
         @memcpy(self.buf[self.len..][0..data.len], data);
         self.len += data.len;
         self.msg_count += 1;
@@ -104,10 +105,15 @@ const BatchManager = struct {
         return self;
     }
 
-    fn getOrCreateBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
+    fn findBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
         for (self.batches[0..self.active_count]) |*batch| {
             if (batch.client_id == client_id) return batch;
         }
+        return null;
+    }
+
+    fn getOrCreateBatch(self: *BatchManager, client_id: config.ClientId) ?*ClientBatch {
+        if (self.findBatch(client_id)) |batch| return batch;
         if (self.active_count < MAX_CLIENT_BATCHES) {
             const batch = &self.batches[self.active_count];
             batch.reset(client_id);
@@ -115,6 +121,24 @@ const BatchManager = struct {
             return batch;
         }
         return null;
+    }
+
+    fn getOldestBatch(self: *BatchManager) ?*ClientBatch {
+        if (self.active_count > 0) return &self.batches[0];
+        return null;
+    }
+
+    fn removeBatch(self: *BatchManager, batch: *ClientBatch) void {
+        const batch_ptr = @intFromPtr(batch);
+        for (self.batches[0..self.active_count], 0..) |*b, i| {
+            if (@intFromPtr(b) == batch_ptr) {
+                if (i < self.active_count - 1) {
+                    self.batches[i] = self.batches[self.active_count - 1];
+                }
+                self.active_count -= 1;
+                return;
+            }
+        }
     }
 
     fn getActiveBatches(self: *BatchManager) []ClientBatch {
@@ -134,7 +158,7 @@ pub const ServerStats = struct {
     outputs_dispatched: u64,
     messages_dropped: u64,
     disconnect_cancels: u64,
-    tcp_queue_failures: u64,
+    tcp_send_failures: u64,
     processor_stats: [NUM_PROCESSORS]proc.ProcessorStats,
 
     pub fn totalProcessed(self: ServerStats) u64 {
@@ -150,7 +174,7 @@ pub const ServerStats = struct {
     }
 
     pub fn isHealthy(self: ServerStats) bool {
-        return self.totalCriticalDrops() == 0 and self.tcp_queue_failures == 0;
+        return self.totalCriticalDrops() == 0 and self.tcp_send_failures == 0;
     }
 
     pub fn totalOutputs(self: ServerStats) u64 {
@@ -161,7 +185,7 @@ pub const ServerStats = struct {
 };
 
 // ============================================================================
-// Threaded Server - v3 with per-client queues
+// Threaded Server - v4 (EPOLLOUT-driven, no proactive flushing)
 // ============================================================================
 pub const ThreadedServer = struct {
     tcp: TcpServer,
@@ -181,7 +205,7 @@ pub const ThreadedServer = struct {
     messages_dropped: std.atomic.Value(u64),
     disconnect_cancels: std.atomic.Value(u64),
     batches_sent: std.atomic.Value(u64),
-    tcp_queue_failures: std.atomic.Value(u64),
+    tcp_send_failures: std.atomic.Value(u64),
 
     const Self = @This();
 
@@ -193,11 +217,13 @@ pub const ThreadedServer = struct {
             self.input_queues[i] = try allocator.create(proc.InputQueue);
             self.input_queues[i].* = .{};
         }
+        errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.input_queues[i]);
 
         for (0..NUM_PROCESSORS) |i| {
             self.output_queues[i] = try allocator.create(proc.OutputQueue);
             self.output_queues[i].* = .{};
         }
+        errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.output_queues[i]);
 
         self.tcp = TcpServer.init(allocator);
         self.udp = UdpServer.init();
@@ -216,7 +242,7 @@ pub const ThreadedServer = struct {
         self.messages_dropped = std.atomic.Value(u64).init(0);
         self.disconnect_cancels = std.atomic.Value(u64).init(0);
         self.batches_sent = std.atomic.Value(u64).init(0);
-        self.tcp_queue_failures = std.atomic.Value(u64).init(0);
+        self.tcp_send_failures = std.atomic.Value(u64).init(0);
 
         return self;
     }
@@ -234,7 +260,9 @@ pub const ThreadedServer = struct {
     }
 
     pub fn start(self: *Self) !void {
-        std.log.info("Starting threaded server (v3 - per-client queues)...", .{});
+        std.debug.assert(!self.running.load(.acquire));
+
+        std.log.info("Starting threaded server (v4 - EPOLLOUT-driven)...", .{});
         std.log.info("Config: channel_capacity={d}, drain_limit={d}", .{
             proc.CHANNEL_CAPACITY,
             OUTPUT_DRAIN_LIMIT,
@@ -274,19 +302,20 @@ pub const ThreadedServer = struct {
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
+
         std.log.info("Stopping threaded server...", .{});
-        std.log.info("Stats: outputs_dispatched={d}, messages_dropped={d}, tcp_queue_failures={d}", .{
+        std.log.info("Stats: outputs_dispatched={d}, messages_dropped={d}, tcp_send_failures={d}", .{
             self.outputs_dispatched.load(.monotonic),
             self.messages_dropped.load(.monotonic),
-            self.tcp_queue_failures.load(.monotonic),
+            self.tcp_send_failures.load(.monotonic),
         });
 
         self.running.store(false, .release);
-        
-        // Final drain before stopping
+
+        // Final drain
         _ = self.drainOutputQueues();
-        
-        // Force flush all clients
+
+        // Force flush all clients on shutdown
         self.forceFlushAllClients();
 
         self.tcp.stop();
@@ -304,39 +333,43 @@ pub const ThreadedServer = struct {
     }
 
     pub fn run(self: *Self) !void {
-        std.log.info("Threaded server running (v3)...", .{});
+        std.log.info("Threaded server running (v4)...", .{});
         while (self.running.load(.acquire)) {
             try self.pollOnce(DEFAULT_POLL_TIMEOUT_MS);
         }
         std.log.info("Threaded server event loop exited", .{});
     }
 
-    /// v3 poll loop:
-    /// 1) Poll sockets - handles reads AND EPOLLOUT (which drains per-client queues)
-    /// 2) Drain processor output queues into per-client queues (FAST, no syscalls)
-    /// 3) Enable EPOLLOUT for clients with queued output
-    /// 4) Poll again to service EPOLLOUT
+    /// v4 poll loop - NO proactive flushing during drain!
+    /// 1) Poll sockets (handles reads AND EPOLLOUT for sends)
+    /// 2) Drain output queues into send buffers
+    /// 3) Enable EPOLLOUT for clients with pending data
+    /// 4) Poll again with timeout
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
-        // 1) Service socket events (EPOLLOUT will drain client queues)
+        std.debug.assert(timeout_ms >= 0);
+
+        // 1) Service socket events (EPOLLOUT will send buffered data)
         if (self.cfg.tcp_enabled) _ = try self.tcp.poll(0);
         if (self.cfg.udp_enabled) _ = self.udp.poll() catch {};
 
-        // 2) Drain processor outputs into per-client queues (fast)
-        _ = self.drainOutputQueues();
+        // 2) Drain processor outputs into TCP send buffers (no syscalls!)
+        const drained = self.drainOutputQueues();
 
         // 3) Flush UDP batches
         self.flushAllBatches();
 
-        // 4) Enable EPOLLOUT for clients with queued output
-        self.enableWriteForClientsWithOutput();
+        // 4) Enable EPOLLOUT for clients with pending TCP data
+        if (drained > 0) {
+            self.enableWriteForPendingClients();
+        }
 
         // 5) Poll again with timeout to service EPOLLOUT
         if (self.cfg.tcp_enabled) _ = try self.tcp.poll(timeout_ms);
         if (self.cfg.udp_enabled) _ = self.udp.poll() catch {};
     }
-    
-    /// Enable EPOLLOUT for all clients that have queued output
-    fn enableWriteForClientsWithOutput(self: *Self) void {
+
+    /// Enable EPOLLOUT for all clients with pending send data
+    fn enableWriteForPendingClients(self: *Self) void {
         var iter = self.tcp.clients.getActive();
         while (iter.next()) |client| {
             if (client.hasPendingSend()) {
@@ -344,24 +377,23 @@ pub const ThreadedServer = struct {
             }
         }
     }
-    
-    /// Force flush all clients (for shutdown)
+
+    /// Force flush all clients (for shutdown only)
     fn forceFlushAllClients(self: *Self) void {
         var iter = self.tcp.clients.getActive();
         while (iter.next()) |client| {
-            // Try to drain everything
-            var attempts: u32 = 0;
-            while (client.hasPendingSend() and attempts < 100) : (attempts += 1) {
-                _ = client.drainToSocket() catch break;
-            }
+            client.flushSendFully() catch {};
         }
     }
 
     fn routeMessage(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
+        std.debug.assert(self.running.load(.acquire));
+        std.debug.assert(client_id != 0 or message.msg_type == .flush);
+
         const input = proc.ProcessorInput{
             .message = message.*,
             .client_id = client_id,
-            .enqueue_time_ns = 0,
+            .enqueue_time_ns = if (proc.TRACK_LATENCY) @truncate(std.time.nanoTimestamp()) else 0,
         };
 
         switch (message.msg_type) {
@@ -387,6 +419,7 @@ pub const ThreadedServer = struct {
             _ = self.messages_routed[idx].fetchAdd(1, .monotonic);
         } else {
             _ = self.messages_dropped.fetchAdd(1, .monotonic);
+            std.log.warn("Input queue {d} full, dropping message", .{idx});
         }
     }
 
@@ -400,19 +433,21 @@ pub const ThreadedServer = struct {
         }
     }
 
-    /// Drain processor outputs into per-client queues.
-    /// This is FAST because queueOutput() just pushes to a lock-free queue.
+    /// Drain outputs - NO TCP flushing here! Just queue to buffers.
     fn drainOutputQueues(self: *Self) u32 {
         var drained_total: u32 = 0;
 
         for (self.output_queues) |queue| {
-            var drained: u32 = 0;
-            while (drained < OUTPUT_DRAIN_LIMIT) : (drained += 1) {
+            var drained_this_q: u32 = 0;
+            while (drained_this_q < OUTPUT_DRAIN_LIMIT and drained_total < OUTPUT_DRAIN_TOTAL_CAP) : ({
+                drained_this_q += 1;
+                drained_total += 1;
+            }) {
                 const output = queue.pop() orelse break;
                 self.processOutput(&output.message);
                 _ = self.outputs_dispatched.fetchAdd(1, .monotonic);
-                drained_total += 1;
             }
+            if (drained_total >= OUTPUT_DRAIN_TOTAL_CAP) break;
         }
 
         return drained_total;
@@ -425,9 +460,15 @@ pub const ThreadedServer = struct {
             self.cfg.use_binary_protocol;
 
         const len = if (use_binary)
-            binary_codec.encodeOutput(out_msg, &self.encode_buf) catch return
+            binary_codec.encodeOutput(out_msg, &self.encode_buf) catch |err| {
+                std.log.err("Failed to encode binary output: {any}", .{err});
+                return;
+            }
         else
-            csv_codec.encodeOutput(out_msg, &self.encode_buf) catch return;
+            csv_codec.encodeOutput(out_msg, &self.encode_buf) catch |err| {
+                std.log.err("Failed to encode CSV output: {any}", .{err});
+                return;
+            };
 
         const data = self.encode_buf[0..len];
 
@@ -446,18 +487,15 @@ pub const ThreadedServer = struct {
 
     fn sendToClient(self: *Self, client_id: config.ClientId, data: []const u8, is_binary: bool) void {
         if (client_id == 0) return;
-        
+
         if (!config.isUdpClient(client_id)) {
-            // TCP: Queue to per-client output queue (FAST, no syscall)
-            if (self.tcp.clients.findById(client_id)) |client| {
-                if (!client.queueOutput(data)) {
-                    _ = self.tcp_queue_failures.fetchAdd(1, .monotonic);
-                }
-            }
+            // TCP - just queue to buffer, EPOLLOUT will send
+            const ok = self.tcp.send(client_id, data);
+            if (!ok) _ = self.tcp_send_failures.fetchAdd(1, .monotonic);
             return;
         }
 
-        // UDP handling
+        // UDP handling (unchanged)
         if (is_binary) {
             _ = self.udp.send(client_id, data);
             _ = self.batches_sent.fetchAdd(1, .monotonic);
@@ -475,7 +513,18 @@ pub const ThreadedServer = struct {
             self.flushBatch(batch);
             batch.reset(client_id);
             batch.add(data);
+            return;
         }
+        if (self.batch_mgr.getOldestBatch()) |oldest| {
+            self.flushBatch(oldest);
+            self.batch_mgr.removeBatch(oldest);
+            if (self.batch_mgr.getOrCreateBatch(client_id)) |batch| {
+                batch.add(data);
+                return;
+            }
+        }
+        _ = self.udp.send(client_id, data);
+        _ = self.batches_sent.fetchAdd(1, .monotonic);
     }
 
     fn flushBatch(self: *Self, batch: *const ClientBatch) void {
@@ -495,7 +544,7 @@ pub const ThreadedServer = struct {
         const input = proc.ProcessorInput{
             .message = cancel_msg,
             .client_id = client_id,
-            .enqueue_time_ns = 0,
+            .enqueue_time_ns = if (proc.TRACK_LATENCY) @truncate(std.time.nanoTimestamp()) else 0,
         };
         for (0..NUM_PROCESSORS) |i| _ = self.input_queues[i].push(input);
         _ = self.disconnect_cancels.fetchAdd(1, .monotonic);
@@ -523,7 +572,7 @@ pub const ThreadedServer = struct {
             .outputs_dispatched = self.outputs_dispatched.load(.monotonic),
             .messages_dropped = self.messages_dropped.load(.monotonic),
             .disconnect_cancels = self.disconnect_cancels.load(.monotonic),
-            .tcp_queue_failures = self.tcp_queue_failures.load(.monotonic),
+            .tcp_send_failures = self.tcp_send_failures.load(.monotonic),
             .processor_stats = undefined,
         };
         for (0..NUM_PROCESSORS) |i| {
