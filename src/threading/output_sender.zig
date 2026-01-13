@@ -51,22 +51,23 @@ const proc = @import("processor.zig");
 pub const MAX_OUTPUT_CLIENTS: usize = 128;
 
 /// Drain limit per poll iteration (prevents starvation)
-const DRAIN_LIMIT_PER_QUEUE: u32 = 2048;
+const DRAIN_LIMIT_PER_QUEUE: u32 = 16384;
 
 /// Total drain cap across all queues per iteration
-const DRAIN_TOTAL_CAP: u32 = 8192;
+const DRAIN_TOTAL_CAP: u32 = 32768;
 
-/// Send buffer size per client for batching (kept small, heap allocated)
-const SEND_BUFFER_SIZE: usize = 8 * 1024; // 8KB per client
+/// Send buffer size per client for batching
+/// Larger buffer = fewer syscalls = higher throughput
+const SEND_BUFFER_SIZE: usize = 256 * 1024; // 256KB per client
 
 /// Maximum sends per client per iteration (prevents starvation)
-const MAX_SENDS_PER_CLIENT: u32 = 256;
+const MAX_SENDS_PER_CLIENT: u32 = 1024;
 
 /// Encode buffer size
 const ENCODE_BUF_SIZE: usize = 512;
 
-/// Poll sleep when idle (microseconds)
-const IDLE_SLEEP_US: u64 = 100;
+/// Poll sleep when idle (microseconds) - keep very short to minimize latency
+const IDLE_SLEEP_US: u64 = 10;
 
 // Compile-time validation
 comptime {
@@ -532,13 +533,27 @@ pub const OutputSender = struct {
     fn runLoop(self: *Self) void {
         std.log.debug("OutputSender: Thread started", .{});
 
+        var consecutive_empty: u32 = 0;
+        const SPIN_THRESHOLD: u32 = 1000;  // Spin this many times before sleeping
+        const YIELD_THRESHOLD: u32 = 100;   // Yield after this many spins
+
         while (self.running.load(.acquire)) {
             const drained = self.drainOnce();
 
             if (drained == 0) {
+                consecutive_empty += 1;
                 self.stats.idle_cycles += 1;
-                // Brief sleep when idle to avoid spinning
-                std.Thread.sleep(IDLE_SLEEP_US * std.time.ns_per_us);
+
+                if (consecutive_empty > SPIN_THRESHOLD) {
+                    // Been idle for a while, sleep to reduce CPU
+                    std.Thread.sleep(IDLE_SLEEP_US * std.time.ns_per_us);
+                } else if (consecutive_empty > YIELD_THRESHOLD) {
+                    // Yield to other threads but stay ready
+                    std.Thread.yield() catch {};
+                }
+                // Else: pure spin for lowest latency
+            } else {
+                consecutive_empty = 0;
             }
         }
 
@@ -620,7 +635,7 @@ pub const OutputSender = struct {
         }
     }
 
-    /// Send data to a specific client
+    /// Send data to a specific client (with framing)
     fn sendToClient(
         self: *Self,
         client_id: config.ClientId,
@@ -631,32 +646,47 @@ pub const OutputSender = struct {
 
         const client = self.findClient(client_id) orelse {
             // Client not registered - this can happen during disconnect races
+            // or if client disconnected before we finished processing outputs
+            self.stats.messages_dropped += 1;
+            const is_critical = (msg_type == .trade or msg_type == .reject);
+            if (is_critical) self.stats.critical_drops += 1;
             return;
         };
 
         const send_buf = client.send_buf orelse {
             // No send buffer allocated
+            self.stats.messages_dropped += 1;
             return;
         };
 
         const is_critical = (msg_type == .trade or msg_type == .reject);
 
+        // Frame format: 4-byte big-endian length + payload
+        const total_len = 4 + data.len;
+
         // Try to batch into send buffer
-        if (client.send_len + data.len <= SEND_BUFFER_SIZE) {
+        if (client.send_len + total_len <= SEND_BUFFER_SIZE) {
+            // Write 4-byte length prefix (big-endian) - same format as tcp_client.queueFramedSend
+            std.mem.writeInt(u32, send_buf[client.send_len..][0..4], @intCast(data.len), .big);
+            client.send_len += 4;
+            
+            // Write payload
             @memcpy(send_buf[client.send_len..][0..data.len], data);
             client.send_len += data.len;
 
-            // Flush if buffer is getting full or we hit batch size
-            if (client.send_len >= SEND_BUFFER_SIZE - ENCODE_BUF_SIZE) {
+            // Flush if buffer is getting full
+            if (client.send_len >= SEND_BUFFER_SIZE - ENCODE_BUF_SIZE - 4) {
                 self.flushClient(client);
             }
         } else {
             // Buffer full - flush first, then add
             self.flushClient(client);
 
-            if (data.len <= SEND_BUFFER_SIZE) {
-                @memcpy(send_buf[0..data.len], data);
-                client.send_len = data.len;
+            if (total_len <= SEND_BUFFER_SIZE) {
+                // Write 4-byte length prefix (big-endian)
+                std.mem.writeInt(u32, send_buf[0..4], @intCast(data.len), .big);
+                @memcpy(send_buf[4..][0..data.len], data);
+                client.send_len = total_len;
             } else {
                 // Message too large for buffer (shouldn't happen)
                 std.log.err("OutputSender: Message too large: {} bytes", .{data.len});
@@ -677,6 +707,7 @@ pub const OutputSender = struct {
 
         const callback = self.send_callback orelse {
             // No send callback - just discard
+            std.log.warn("OutputSender: No send callback, discarding {} bytes for client {}", .{ client.send_len, client.client_id });
             client.send_len = 0;
             return;
         };
@@ -704,11 +735,13 @@ pub const OutputSender = struct {
                     std.Thread.sleep(10 * std.time.ns_per_us);
                 },
                 .error_disconnected => {
+                    std.log.debug("OutputSender: Client {} disconnected during send", .{client.client_id});
                     client.send_errors += 1;
                     self.stats.send_errors += 1;
                     break;
                 },
                 .error_other => {
+                    std.log.debug("OutputSender: Send error for client {}", .{client.client_id});
                     client.send_errors += 1;
                     self.stats.send_errors += 1;
                     break;
@@ -765,6 +798,7 @@ pub const OutputSender = struct {
 
     /// Creates a send callback that uses POSIX send() directly
     /// For use when you want the OutputSender to bypass TcpClient buffering
+    /// NOTE: This sends raw data without framing - the caller must frame messages
     pub fn makeDirectSendCallback() SendCallback {
         return struct {
             fn send(
@@ -780,7 +814,7 @@ pub const OutputSender = struct {
                 else
                     0;
 
-                _ = std.posix.send(fd, data, flags) catch |err| {
+                const sent = std.posix.send(fd, data, flags) catch |err| {
                     if (err == error.WouldBlock) return .would_block;
                     if (err == error.BrokenPipe or
                         err == error.ConnectionResetByPeer or
@@ -790,6 +824,12 @@ pub const OutputSender = struct {
                     }
                     return .error_other;
                 };
+
+                // If we sent less than requested, report would_block
+                // so the caller knows to retry
+                if (sent < data.len) {
+                    return .would_block;
+                }
 
                 return .success;
             }
