@@ -15,6 +15,7 @@ const MatchingEngine = @import("core/matching_engine.zig").MatchingEngine;
 const Server = @import("transport/server.zig").Server;
 const ThreadedServer = @import("threading/threaded_server.zig").ThreadedServer;
 const cfg = @import("transport/config.zig");
+const proc = @import("threading/processor.zig");
 
 pub const VERSION = "0.1.0";
 pub const BUILD_MODE = @tagName(builtin.mode);
@@ -361,6 +362,12 @@ fn printThreadedStats(server: *ThreadedServer) void {
 // Main Entry Point
 // ============================================================================
 pub fn main() !void {
+    std.debug.print("Struct sizes:\n", .{});
+    std.debug.print("  InputMsg: {} bytes\n", .{@sizeOf(msg.InputMsg)});
+    std.debug.print("  OutputMsg: {} bytes\n", .{@sizeOf(msg.OutputMsg)});
+    std.debug.print("  NewOrderMsg: {} bytes\n", .{@sizeOf(msg.NewOrderMsg)});
+    std.debug.print("  ProcessorInput: {} bytes\n", .{@sizeOf(proc.ProcessorInput)});
+    std.debug.print("  ProcessorOutput: {} bytes\n", .{@sizeOf(proc.ProcessorOutput)});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

@@ -569,18 +569,30 @@ pub const OutputSender = struct {
     fn drainOnce(self: *Self) u32 {
         var total_drained: u32 = 0;
 
-        // Drain all processor queues
+        // Batch buffer for efficient dequeue
+        var batch: [64]proc.ProcessorOutput = undefined;
+
+        // Drain all processor queues using batch dequeue
         for (self.processor_queues) |queue| {
             var queue_drained: u32 = 0;
 
             while (queue_drained < DRAIN_LIMIT_PER_QUEUE and
                 total_drained < DRAIN_TOTAL_CAP)
             {
-                const output = queue.pop() orelse break;
-                self.processOutput(&output.message);
-                queue_drained += 1;
-                total_drained += 1;
-                self.stats.messages_drained += 1;
+                // Batch dequeue for efficiency - amortizes atomic operations
+                const batch_size = @min(batch.len, DRAIN_LIMIT_PER_QUEUE - queue_drained);
+                const count = queue.popBatch(batch[0..batch_size]);
+                
+                if (count == 0) break;
+                
+                // Process the batch
+                for (batch[0..count]) |*output| {
+                    self.processOutput(&output.message);
+                }
+                
+                queue_drained += @intCast(count);
+                total_drained += @intCast(count);
+                self.stats.messages_drained += count;
             }
 
             if (total_drained >= DRAIN_TOTAL_CAP) break;
