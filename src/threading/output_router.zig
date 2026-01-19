@@ -1,511 +1,343 @@
-//! Output Router - Routes processor outputs to per-client queues
+//! Output router thread.
 //!
-//! Matches the C server output_router architecture:
-//! - Drains processor output queues (SPSC, lock-free)
-//! - Routes messages to per-client output queues (SPSC, lock-free)
-//! - Optional multicast callback (broadcast in addition to unicast)
-//! - Router does NO socket IO; TCP server drains client queues
+//! Drains processor output queues (proc.OutputQueue) and routes msg.OutputMsg
+//! to per-client output queues used by TcpClient.
 //!
-//! Flow:
-//!   Processor 0 → Output Queue 0 ┐
-//!                                 ├→ Output Router ─┬→ Per-client queues (TCP server drains)
-//!   Processor 1 → Output Queue 1 ┘                  └→ Multicast callback
-//!
-//! Power of Ten Compliance:
-//! - Rule 2: All loops bounded (ROUTER_BATCH_SIZE, MAX_DRAIN_ITERATIONS, MAX_CLIENTS)
-//! - Rule 3: No allocation in hot path
-//! - Rule 5: Assertions validate state
-//! - Rule 7: All queue ops checked
+//! Matches ThreadedServerV8 expectations:
+//! - init() returns *OutputRouter
+//! - start/stop/deinit lifecycle
+//! - registerClient/unregisterClient
+//! - getStats() returning RouterStats with critical_drops field
+//! - multicast hooks (trade + top_of_book)
 
 const std = @import("std");
+
 const msg = @import("../protocol/message_types.zig");
-const proc = @import("processor.zig");
 const config = @import("../transport/config.zig");
-const SpscQueue = @import("../collections/spsc_queue.zig").SpscQueue;
+const proc = @import("processor.zig");
+
+// MUST match what threaded_server imports:
+const tcp_client = @import("../transport/tcp_client.zig");
+pub const OutputQueue = tcp_client.OutputQueue;
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Batch size for dequeuing from processor queues
-pub const ROUTER_BATCH_SIZE: u32 = 32;
+pub const MAX_OUTPUT_QUEUES: usize = 2;
 
-/// Sleep time when idle (nanoseconds) - 1 microsecond like C server
-const IDLE_SLEEP_NS: u64 = 1000;
+pub const ROUTER_BATCH_SIZE: usize = 64;
 
-/// Maximum clients to support
-pub const MAX_CLIENTS: u32 = 128;
+// small idle sleep; router is queue-to-queue only, so it can be aggressive
+const SLEEP_TIME_NS: u64 = 1_000; // 1us
 
-/// Per-client output queue capacity
-pub const CLIENT_QUEUE_CAPACITY: u32 = 8192;
-
-/// Maximum drain iterations during shutdown
-const MAX_DRAIN_ITERATIONS: u32 = 100;
-
-/// Max processors supported (C supports 1 or 2; keep this explicit)
-const MAX_PROCESSOR_QUEUES: u32 = 2;
+// Drain bounds (P10 Rule 2)
+const MAX_DRAIN_PER_QUEUE_PER_TICK: usize = 8192;
+const MAX_TOTAL_DRAIN_PER_TICK: usize = 16384;
 
 // ============================================================================
-// Per-Client Output Queue
-// ============================================================================
-
-/// Output message for client queue (smaller than ProcessorOutput)
-pub const ClientOutput = struct {
-    message: msg.OutputMsg,
-};
-
-/// Per-client output queue type (producer: router, consumer: TCP server)
-pub const ClientOutputQueue = SpscQueue(ClientOutput, CLIENT_QUEUE_CAPACITY);
-
-/// Client output slot state
-pub const ClientOutputState = struct {
-    queue: ClientOutputQueue,
-    client_id: config.ClientId,
-    active: std.atomic.Value(bool),
-
-    // Stats
-    messages_enqueued: u64,
-    messages_dropped: u64,
-    critical_drops: u64,
-
-    const Self = @This();
-
-    pub fn init() Self {
-        return .{
-            .queue = .{},
-            .client_id = 0,
-            .active = std.atomic.Value(bool).init(false),
-            .messages_enqueued = 0,
-            .messages_dropped = 0,
-            .critical_drops = 0,
-        };
-    }
-
-    pub fn reset(self: *Self) void {
-        // Drain queue
-        while (self.queue.pop() != null) {}
-        self.client_id = 0;
-        self.messages_enqueued = 0;
-        self.messages_dropped = 0;
-        self.critical_drops = 0;
-        self.active.store(false, .release);
-    }
-
-    pub fn isActive(self: *const Self) bool {
-        return self.active.load(.acquire);
-    }
-};
-
-// ============================================================================
-// Multicast Callback
-// ============================================================================
-
-pub const MulticastCallback = *const fn (message: *const msg.OutputMsg, ctx: ?*anyopaque) void;
-
-// ============================================================================
-// Output Router Statistics
+// Stats
 // ============================================================================
 
 pub const RouterStats = struct {
-    /// Total messages drained from processor queues
-    messages_drained: u64,
-    /// Messages routed to client queues (successful enqueue)
-    messages_routed: u64,
-    /// Messages dropped (client not found or client queue full)
-    messages_dropped: u64,
-    /// Critical messages dropped (trades, rejects)
-    critical_drops: u64,
-    /// Multicast messages sent
-    multicast_messages: u64,
-    /// Idle cycles (no work done)
-    idle_cycles: u64,
-    /// Per-processor drain counts
-    from_processor: [MAX_PROCESSOR_QUEUES]u64,
+    messages_routed: u64 = 0,
+    messages_dropped: u64 = 0,
+    critical_drops: u64 = 0,
+    messages_from_processor: [MAX_OUTPUT_QUEUES]u64 = [_]u64{0} ** MAX_OUTPUT_QUEUES,
 
     pub fn init() RouterStats {
-        return std.mem.zeroes(RouterStats);
+        return .{};
     }
 };
 
 // ============================================================================
-// Output Router
+// Multicast Hook
+// ============================================================================
+
+pub const MulticastCallback = *const fn (out_msg: *const msg.OutputMsg, ctx: ?*anyopaque) void;
+
+// ============================================================================
+// Client Registry (client_id -> queue pointer)
+// ============================================================================
+
+const ClientRegistry = struct {
+    slots: []std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !ClientRegistry {
+        const n: usize = @intCast(config.CLIENT_ID_UDP_BASE);
+        var slots = try allocator.alloc(std.atomic.Value(usize), n);
+        for (slots) |*s| s.* = std.atomic.Value(usize).init(0);
+        return .{ .slots = slots, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ClientRegistry) void {
+        self.allocator.free(self.slots);
+        self.* = undefined;
+    }
+
+    fn idx(client_id: config.ClientId, len: usize) ?usize {
+        if (client_id == 0) return null;
+        const i: usize = @intCast(client_id);
+        if (i >= len) return null;
+        return i;
+    }
+
+    pub fn get(self: *ClientRegistry, client_id: config.ClientId) ?*OutputQueue {
+        const i = idx(client_id, self.slots.len) orelse return null;
+        const p = self.slots[i].load(.acquire);
+        if (p == 0) return null;
+        return @ptrFromInt(p);
+    }
+
+    pub fn set(self: *ClientRegistry, client_id: config.ClientId, q: ?*OutputQueue) void {
+        const i = idx(client_id, self.slots.len) orelse return;
+        const p: usize = if (q) |qq| @intFromPtr(qq) else 0;
+        self.slots[i].store(p, .release);
+    }
+};
+
+// ============================================================================
+// OutputRouter
 // ============================================================================
 
 pub const OutputRouter = struct {
-    /// Processor output queues to drain
+    allocator: std.mem.Allocator,
     processor_queues: []const *proc.OutputQueue,
 
-    /// Per-client slots
-    clients: [MAX_CLIENTS]ClientOutputState,
+    registry: ClientRegistry,
 
-    /// Fast lookup: client_id % MAX_CLIENTS -> slot index
-    ///
-    /// IMPORTANT: collisions can happen. If we detect a collision, we set the
-    /// bucket to null and rely on slow-path scan for correctness.
-    client_index: [MAX_CLIENTS]?u8,
-
-    /// Active client count
-    active_clients: std.atomic.Value(u32),
-
-    /// Round-robin cursor for processor queue polling (fairness)
-    rr_cursor: u32,
-
-    /// Multicast callback
-    multicast_callback: ?MulticastCallback,
-    multicast_ctx: ?*anyopaque,
-    multicast_enabled: bool,
-
-    /// Thread handle
+    running: std.atomic.Value(bool),
     thread: ?std.Thread,
 
-    /// Running flag
-    running: std.atomic.Value(bool),
+    multicast_enabled: bool,
+    multicast_cb: ?MulticastCallback,
+    multicast_ctx: ?*anyopaque,
 
-    /// Statistics
     stats: RouterStats,
-
-    /// Allocator
-    allocator: std.mem.Allocator,
 
     const Self = @This();
 
-    // ========================================================================
+    // ------------------------------------------------------------------------
     // Lifecycle
-    // ========================================================================
+    // ------------------------------------------------------------------------
 
     pub fn init(
         allocator: std.mem.Allocator,
         processor_queues: []const *proc.OutputQueue,
     ) !*Self {
-        // Rule 5: Preconditions
         std.debug.assert(processor_queues.len >= 1);
-        std.debug.assert(processor_queues.len <= MAX_PROCESSOR_QUEUES);
+        std.debug.assert(processor_queues.len <= MAX_OUTPUT_QUEUES);
 
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        self.* = .{
-            .processor_queues = processor_queues,
-            .clients = undefined,
-            .client_index = [_]?u8{null} ** MAX_CLIENTS,
-            .active_clients = std.atomic.Value(u32).init(0),
-            .rr_cursor = 0,
-            .multicast_callback = null,
-            .multicast_ctx = null,
-            .multicast_enabled = false,
-            .thread = null,
-            .running = std.atomic.Value(bool).init(false),
-            .stats = RouterStats.init(),
-            .allocator = allocator,
-        };
+        var registry = try ClientRegistry.init(allocator);
+        errdefer registry.deinit();
 
-        for (&self.clients) |*c| {
-            c.* = ClientOutputState.init();
-        }
+        self.* = .{
+            .allocator = allocator,
+            .processor_queues = processor_queues,
+            .registry = registry,
+            .running = std.atomic.Value(bool).init(false),
+            .thread = null,
+            .multicast_enabled = false,
+            .multicast_cb = null,
+            .multicast_ctx = null,
+            .stats = RouterStats.init(),
+        };
 
         return self;
     }
 
     pub fn deinit(self: *Self) void {
         self.stop();
+        self.registry.deinit();
         self.allocator.destroy(self);
     }
-
-    // ========================================================================
-    // Configuration
-    // ========================================================================
-
-    pub fn setMulticastCallback(
-        self: *Self,
-        callback: ?MulticastCallback,
-        ctx: ?*anyopaque,
-    ) void {
-        self.multicast_callback = callback;
-        self.multicast_ctx = ctx;
-    }
-
-    pub fn setMulticastEnabled(self: *Self, enabled: bool) void {
-        self.multicast_enabled = enabled;
-    }
-
-    // ========================================================================
-    // Client Management
-    // ========================================================================
-
-    /// Register client; returns pointer to client's output queue.
-    pub fn registerClient(self: *Self, client_id: config.ClientId) ?*ClientOutputQueue {
-        if (client_id == 0) return null;
-
-        // Find free slot (bounded by MAX_CLIENTS)
-        var slot_idx: ?usize = null;
-        for (&self.clients, 0..) |*client, i| {
-            if (!client.isActive()) {
-                slot_idx = i;
-                break;
-            }
-        }
-
-        const idx = slot_idx orelse {
-            std.log.warn("OutputRouter: No free client slots for client {}", .{client_id});
-            return null;
-        };
-
-        const client = &self.clients[idx];
-        // Reset slot contents (queue already empty because inactive, but be safe)
-        client.reset();
-        client.client_id = client_id;
-
-        // Fast lookup bucket
-        const hash_idx: usize = @intCast(client_id % MAX_CLIENTS);
-
-        // Collision handling: if bucket is empty -> set it.
-        // If bucket already points at an active different client -> disable fast path for that bucket.
-        if (self.client_index[hash_idx]) |existing_idx| {
-            const existing = &self.clients[existing_idx];
-            if (existing.isActive() and existing.client_id != client_id) {
-                // Collision: turn off fast path for this bucket.
-                self.client_index[hash_idx] = null;
-            } else {
-                self.client_index[hash_idx] = @intCast(idx);
-            }
-        } else {
-            self.client_index[hash_idx] = @intCast(idx);
-        }
-
-        client.active.store(true, .release);
-        _ = self.active_clients.fetchAdd(1, .monotonic);
-
-        std.log.info("OutputRouter: Registered client {} in slot {}", .{ client_id, idx });
-        return &client.queue;
-    }
-
-    pub fn unregisterClient(self: *Self, client_id: config.ClientId) void {
-        if (client_id == 0) return;
-
-        for (&self.clients, 0..) |*client, i| {
-            if (client.isActive() and client.client_id == client_id) {
-                std.log.info("OutputRouter: Unregistering client {} (enqueued={}, dropped={})", .{
-                    client_id,
-                    client.messages_enqueued,
-                    client.messages_dropped,
-                });
-
-                client.reset();
-                _ = self.active_clients.fetchSub(1, .monotonic);
-
-                // Clear fast path bucket ONLY if it points to this slot.
-                const hash_idx: usize = @intCast(client_id % MAX_CLIENTS);
-                if (self.client_index[hash_idx]) |idx| {
-                    if (idx == @as(u8, @intCast(i))) {
-                        self.client_index[hash_idx] = null;
-                    }
-                }
-                return;
-            }
-        }
-    }
-
-    fn findClient(self: *Self, client_id: config.ClientId) ?*ClientOutputState {
-        if (client_id == 0) return null;
-
-        const hash_idx: usize = @intCast(client_id % MAX_CLIENTS);
-        if (self.client_index[hash_idx]) |idx| {
-            const client = &self.clients[idx];
-            if (client.isActive() and client.client_id == client_id) {
-                return client;
-            }
-        }
-
-        // Slow path scan (bounded by MAX_CLIENTS)
-        for (&self.clients) |*client| {
-            if (client.isActive() and client.client_id == client_id) return client;
-        }
-
-        return null;
-    }
-
-    // ========================================================================
-    // Thread Control
-    // ========================================================================
 
     pub fn start(self: *Self) !void {
         if (self.running.load(.acquire)) return error.AlreadyRunning;
 
-        std.log.info("OutputRouter: Starting (queues={}, max_clients={})", .{
-            self.processor_queues.len,
-            MAX_CLIENTS,
-        });
-
         self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+
+        std.log.info("OutputRouter started (processor_queues={d})", .{self.processor_queues.len});
     }
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
 
-        std.log.info("OutputRouter: Stopping...", .{});
         self.running.store(false, .release);
-
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
 
-        // Drain remaining messages (bounded)
-        self.drainRemaining();
+        // best-effort final drain
+        var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
+        _ = self.drainOnce(batch[0..]);
 
-        std.log.info("OutputRouter: Stopped (drained={}, routed={}, dropped={}, critical={})", .{
-            self.stats.messages_drained,
+        std.log.info("OutputRouter stopped (routed={}, dropped={}, critical_drops={})", .{
             self.stats.messages_routed,
             self.stats.messages_dropped,
             self.stats.critical_drops,
         });
     }
 
-    // ========================================================================
-    // Main Loop
-    // ========================================================================
+    // ------------------------------------------------------------------------
+    // Multicast configuration
+    // ------------------------------------------------------------------------
 
-    fn runLoop(self: *Self) void {
-        std.log.debug("OutputRouter: Thread started", .{});
-
-        while (self.running.load(.acquire)) {
-            const drained = self.drainOnce();
-
-            if (drained == 0) {
-                self.stats.idle_cycles += 1;
-                std.Thread.sleep(IDLE_SLEEP_NS);
-            }
-        }
-
-        std.log.debug("OutputRouter: Thread exiting", .{});
+    pub fn setMulticastEnabled(self: *Self, enabled: bool) void {
+        self.multicast_enabled = enabled;
     }
 
-    /// Drain processor output queues and route to client queues.
-    /// Returns number of messages processed.
-    fn drainOnce(self: *Self) u32 {
-        var total: u32 = 0;
-        var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
-
-        const nqs: u32 = @intCast(self.processor_queues.len);
-        std.debug.assert(nqs >= 1 and nqs <= MAX_PROCESSOR_QUEUES);
-
-        // Round-robin start index (fairness)
-        const start = self.rr_cursor % nqs;
-        self.rr_cursor = (self.rr_cursor + 1) % nqs;
-
-        // Bounded loop: at most nqs queues
-        var i: u32 = 0;
-        while (i < nqs) : (i += 1) {
-            const q_idx: u32 = (start + i) % nqs;
-            const queue = self.processor_queues[q_idx];
-
-            const count = queue.popBatch(&batch);
-            if (count == 0) continue;
-
-            // Process batch (bounded by ROUTER_BATCH_SIZE)
-            for (batch[0..count]) |*out| {
-                self.routeMessage(&out.message);
-            }
-
-            total += @intCast(count);
-            self.stats.messages_drained += count;
-            self.stats.from_processor[q_idx] += count;
-        }
-
-        return total;
+    pub fn setMulticastCallback(self: *Self, cb: MulticastCallback, ctx: ?*anyopaque) void {
+        self.multicast_cb = cb;
+        self.multicast_ctx = ctx;
     }
 
-    fn drainRemaining(self: *Self) void {
-        var iterations: u32 = 0;
+    // ------------------------------------------------------------------------
+    // Client registration
+    // ------------------------------------------------------------------------
 
-        while (iterations < MAX_DRAIN_ITERATIONS) : (iterations += 1) {
-            const drained = self.drainOnce();
-            if (drained == 0) break;
-        }
+    pub fn registerClient(self: *Self, client_id: config.ClientId) ?*OutputQueue {
+        if (client_id == 0) return null;
 
-        if (iterations == MAX_DRAIN_ITERATIONS) {
-            std.log.warn("OutputRouter: Drain limit reached; some messages may remain", .{});
-        }
-    }
+        if (self.registry.get(client_id)) |existing| return existing;
 
-    // ========================================================================
-    // Routing
-    // ========================================================================
-
-    fn routeMessage(self: *Self, out_msg: *const msg.OutputMsg) void {
-        switch (out_msg.msg_type) {
-            .ack, .cancel_ack, .reject => {
-                self.routeToClient(out_msg);
-            },
-            .trade => {
-                self.routeToClient(out_msg);
-                if (self.multicast_enabled) self.publishMulticast(out_msg);
-            },
-            .top_of_book => {
-                if (out_msg.client_id != 0) self.routeToClient(out_msg);
-                if (self.multicast_enabled) self.publishMulticast(out_msg);
-            },
-        }
-    }
-
-    fn routeToClient(self: *Self, out_msg: *const msg.OutputMsg) void {
-        if (out_msg.client_id == 0) return;
-
-        const client = self.findClient(out_msg.client_id) orelse {
-            self.stats.messages_dropped += 1;
-            const is_critical = (out_msg.msg_type == .trade or out_msg.msg_type == .reject);
-            if (is_critical) self.stats.critical_drops += 1;
-            return;
+        const q = self.allocator.create(OutputQueue) catch {
+            std.log.err("OutputRouter: failed to allocate OutputQueue for client {}", .{client_id});
+            return null;
         };
 
-        const output = ClientOutput{ .message = out_msg.* };
-        if (client.queue.push(output)) {
-            client.messages_enqueued += 1;
-            self.stats.messages_routed += 1;
+        // Be robust to whether OutputQueue has init() or not
+        if (@hasDecl(OutputQueue, "init")) {
+            q.* = OutputQueue.init();
         } else {
-            client.messages_dropped += 1;
-            self.stats.messages_dropped += 1;
-
-            const is_critical = (out_msg.msg_type == .trade or out_msg.msg_type == .reject);
-            if (is_critical) {
-                client.critical_drops += 1;
-                self.stats.critical_drops += 1;
-                std.log.err("OutputRouter: CRITICAL DROP client={} type={s}", .{
-                    out_msg.client_id,
-                    @tagName(out_msg.msg_type),
-                });
-            }
+            q.* = .{};
         }
+
+        self.registry.set(client_id, q);
+        std.log.debug("OutputRouter: registered client {}", .{client_id});
+        return q;
     }
 
-    fn publishMulticast(self: *Self, out_msg: *const msg.OutputMsg) void {
-        if (self.multicast_callback) |cb| {
-            cb(out_msg, self.multicast_ctx);
-            self.stats.multicast_messages += 1;
+    pub fn unregisterClient(self: *Self, client_id: config.ClientId) void {
+        if (client_id == 0) return;
+
+        const q = self.registry.get(client_id);
+        self.registry.set(client_id, null);
+
+        if (q) |qq| {
+            self.allocator.destroy(qq);
         }
+
+        std.log.debug("OutputRouter: unregistered client {}", .{client_id});
     }
 
-    // ========================================================================
-    // Statistics
-    // ========================================================================
+    // ------------------------------------------------------------------------
+    // Stats
+    // ------------------------------------------------------------------------
 
     pub fn getStats(self: *const Self) RouterStats {
         return self.stats;
     }
 
-    pub fn isHealthy(self: *const Self) bool {
-        return self.stats.critical_drops == 0;
+    // ------------------------------------------------------------------------
+    // Main loop
+    // ------------------------------------------------------------------------
+
+    fn runLoop(self: *Self) void {
+        var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
+
+        while (self.running.load(.acquire)) {
+            const drained = self.drainOnce(batch[0..]);
+            if (drained == 0) {
+                std.time.sleep(SLEEP_TIME_NS);
+            }
+        }
+    }
+
+    fn drainOnce(self: *Self, batch: []proc.ProcessorOutput) usize {
+        var total: usize = 0;
+
+        for (self.processor_queues, 0..) |q, qi| {
+            var per_q: usize = 0;
+
+            while (per_q < MAX_DRAIN_PER_QUEUE_PER_TICK and total < MAX_TOTAL_DRAIN_PER_TICK) {
+                const want = @min(batch.len, MAX_DRAIN_PER_QUEUE_PER_TICK - per_q);
+                const got = q.popBatch(batch[0..want]);
+                if (got == 0) break;
+
+                if (qi < MAX_OUTPUT_QUEUES) self.stats.messages_from_processor[qi] += got;
+
+                for (batch[0..got]) |*po| {
+                    self.routeOne(po);
+                }
+
+                per_q += got;
+                total += got;
+            }
+
+            if (total >= MAX_TOTAL_DRAIN_PER_TICK) break;
+        }
+
+        return total;
+    }
+
+    fn isCritical(out_msg: *const msg.OutputMsg) bool {
+        return switch (out_msg.msg_type) {
+            .trade, .reject => true,
+            .ack, .cancel_ack, .top_of_book => false,
+        };
+    }
+
+    fn maybeMulticast(self: *Self, out_msg: *const msg.OutputMsg) void {
+        if (!self.multicast_enabled) return;
+
+        switch (out_msg.msg_type) {
+            .trade, .top_of_book => {},
+            else => return,
+        }
+
+        if (self.multicast_cb) |cb| {
+            cb(out_msg, self.multicast_ctx);
+        }
+    }
+
+    fn clientQueueEnqueue(q: *OutputQueue, out_msg: msg.OutputMsg) bool {
+        // Support either push() or send() depending on your OutputQueue type
+        if (@hasDecl(OutputQueue, "push")) {
+            return q.push(out_msg);
+        }
+        if (@hasDecl(OutputQueue, "send")) {
+            return q.send(out_msg);
+        }
+        // If neither exists, compilation should fail (intentional)
+        @compileError("TcpClient.OutputQueue must expose push(msg.OutputMsg)->bool or send(msg.OutputMsg)->bool");
+    }
+
+    fn routeOne(self: *Self, po: *const proc.ProcessorOutput) void {
+        const client_id: config.ClientId = @intCast(po.client_id);
+        const out_msg: *const msg.OutputMsg = &po.message;
+
+        const q = self.registry.get(client_id) orelse {
+            self.stats.messages_dropped += 1;
+            if (isCritical(out_msg)) self.stats.critical_drops += 1;
+            return;
+        };
+
+        if (!clientQueueEnqueue(q, po.message)) {
+            self.stats.messages_dropped += 1;
+            if (isCritical(out_msg)) self.stats.critical_drops += 1;
+            return;
+        }
+
+        self.stats.messages_routed += 1;
+
+        // multicast is "side channel" for trade / TOB
+        self.maybeMulticast(out_msg);
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-test "OutputRouter compiles" {
-    _ = OutputRouter;
-    _ = ClientOutputState;
-    _ = ClientOutputQueue;
-}
-

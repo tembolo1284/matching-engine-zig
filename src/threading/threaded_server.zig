@@ -212,8 +212,7 @@ pub const ServerStats = struct {
     }
 
     pub fn isHealthy(self: ServerStats) bool {
-        return self.totalCriticalDrops() == 0 and
-            self.tcp_send_failures == 0;
+        return self.totalCriticalDrops() == 0 and self.tcp_send_failures == 0;
     }
 
     pub fn totalOutputs(self: ServerStats) u64 {
@@ -231,10 +230,13 @@ pub const ThreadedServerV8 = struct {
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
+
     input_queues: [NUM_PROCESSORS]*proc.InputQueue,
     output_queues: [NUM_PROCESSORS]*proc.OutputQueue,
     processors: [NUM_PROCESSORS]?proc.Processor,
+
     output_router: ?*OutputRouter,
+
     encode_buf: [ENCODE_BUF_SIZE]u8,
     batch_mgr: BatchManager,
     cfg: config.Config,
@@ -256,7 +258,6 @@ pub const ThreadedServerV8 = struct {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        // Create input/output queues
         for (0..NUM_PROCESSORS) |i| {
             self.input_queues[i] = try allocator.create(proc.InputQueue);
             self.input_queues[i].* = .{};
@@ -269,8 +270,8 @@ pub const ThreadedServerV8 = struct {
         }
         errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.output_queues[i]);
 
-        // Create output router (drains processor output queues to client queues)
-        self.output_router = try OutputRouter.init(allocator, &self.output_queues);
+        // REQUIRED FIX: pass a slice
+        self.output_router = try OutputRouter.init(allocator, self.output_queues[0..]);
         errdefer if (self.output_router) |router| router.deinit();
 
         self.tcp = TcpServer.init(allocator);
@@ -283,6 +284,7 @@ pub const ThreadedServerV8 = struct {
         self.allocator = allocator;
         self.running = std.atomic.Value(bool).init(false);
         self.poll_count = 0;
+
         self.messages_routed = .{
             std.atomic.Value(u64).init(0),
             std.atomic.Value(u64).init(0),
@@ -297,50 +299,41 @@ pub const ThreadedServerV8 = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Always try to stop, regardless of running state
         self.stopForce();
-        
+
         self.tcp.deinit();
         self.udp.deinit();
         self.multicast.deinit();
-        
+
         if (self.output_router) |router| {
             router.deinit();
             self.output_router = null;
         }
-        
+
         for (0..NUM_PROCESSORS) |i| {
             self.allocator.destroy(self.input_queues[i]);
             self.allocator.destroy(self.output_queues[i]);
         }
         self.allocator.destroy(self);
     }
-    
-    /// Force stop all components - called by deinit even if start() failed
+
     fn stopForce(self: *Self) void {
         std.log.debug("stopForce: stopping all components...", .{});
-        
-        // Signal stop
         self.running.store(false, .release);
-        
-        // Stop output router first
-        if (self.output_router) |router| {
-            router.stop();
-        }
-        
-        // Stop transport
+
+        if (self.output_router) |router| router.stop();
+
         self.tcp.stop();
         self.udp.stop();
         self.multicast.stop();
-        
-        // Stop ALL processors (even if start() didn't complete)
+
         for (&self.processors) |*p| {
             if (p.*) |*processor| {
                 processor.deinit();
                 p.* = null;
             }
         }
-        
+
         std.log.debug("stopForce: all components stopped", .{});
     }
 
@@ -349,7 +342,6 @@ pub const ThreadedServerV8 = struct {
         std.log.info("Starting threaded server v8 (C-style output processing)...", .{});
         std.log.info("Config: channel_capacity={d}", .{proc.CHANNEL_CAPACITY});
 
-        // Start processors
         for (0..NUM_PROCESSORS) |i| {
             const id: proc.ProcessorId = @enumFromInt(i);
             self.processors[i] = try proc.Processor.init(
@@ -360,7 +352,6 @@ pub const ThreadedServerV8 = struct {
             );
             self.processors[i].?.start() catch |err| {
                 std.log.err("Failed to start processor {d}: {any}", .{ i, err });
-                // Clean up already-started processors
                 for (0..i) |j| {
                     if (self.processors[j]) |*p| {
                         p.deinit();
@@ -370,8 +361,7 @@ pub const ThreadedServerV8 = struct {
                 return err;
             };
         }
-        
-        // errdefer to stop processors if anything below fails
+
         errdefer {
             std.log.debug("start() failed, cleaning up processors...", .{});
             for (&self.processors) |*p| {
@@ -382,32 +372,26 @@ pub const ThreadedServerV8 = struct {
             }
         }
 
-        // Configure and start output router
         if (self.output_router) |router| {
-            // Configure multicast if enabled
             if (self.cfg.mcast_enabled) {
                 router.setMulticastEnabled(true);
                 router.setMulticastCallback(onMulticastPublish, self);
             }
             try router.start();
         }
-        
-        // errdefer to stop router if TCP/UDP fails
+
         errdefer {
-            if (self.output_router) |router| {
-                router.stop();
-            }
+            if (self.output_router) |router| router.stop();
         }
 
-        // Start TCP server
         if (self.cfg.tcp_enabled) {
             self.tcp.on_message = onTcpMessage;
             self.tcp.on_disconnect = onTcpDisconnect;
             self.tcp.on_connect = onTcpConnect;
             self.tcp.callback_ctx = self;
             self.tcp.start(self.cfg.tcp_addr, self.cfg.tcp_port) catch |err| {
-                std.log.err("Failed to start TCP server on {s}:{d}: {any}", .{ 
-                    self.cfg.tcp_addr, self.cfg.tcp_port, err 
+                std.log.err("Failed to start TCP server on {s}:{d}: {any}", .{
+                    self.cfg.tcp_addr, self.cfg.tcp_port, err,
                 });
                 return err;
             };
@@ -415,14 +399,12 @@ pub const ThreadedServerV8 = struct {
             std.log.info("TCP server disabled by config", .{});
         }
 
-        // Start UDP server
         if (self.cfg.udp_enabled) {
             self.udp.on_message = onUdpMessage;
             self.udp.callback_ctx = self;
             try self.udp.start(self.cfg.udp_addr, self.cfg.udp_port);
         }
 
-        // Start multicast publisher
         if (self.cfg.mcast_enabled) {
             try self.multicast.start(
                 self.cfg.mcast_group,
@@ -440,17 +422,12 @@ pub const ThreadedServerV8 = struct {
         std.log.info("Stopping threaded server v8...", .{});
         self.running.store(false, .release);
 
-        // Stop output router first (it needs to drain remaining outputs)
-        if (self.output_router) |router| {
-            router.stop();
-        }
+        if (self.output_router) |router| router.stop();
 
-        // Stop transport
         self.tcp.stop();
         self.udp.stop();
         self.multicast.stop();
 
-        // Stop processors
         for (&self.processors) |*p| {
             if (p.*) |*processor| {
                 processor.deinit();
@@ -469,13 +446,9 @@ pub const ThreadedServerV8 = struct {
         std.log.info("Threaded server v8 event loop exited", .{});
     }
 
-    /// v8 poll loop - simplified because TcpServer.poll() now handles output
-    /// processing internally (before epoll_wait, like C server)
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
         std.debug.assert(timeout_ms >= 0);
 
-        // TCP poll now processes output queues BEFORE waiting for events
-        // This matches the C server's tcp_listener.c architecture exactly
         if (self.cfg.tcp_enabled) {
             _ = try self.tcp.poll(timeout_ms);
         }
@@ -486,10 +459,6 @@ pub const ThreadedServerV8 = struct {
 
         self.poll_count += 1;
     }
-
-    // ========================================================================
-    // Input Routing
-    // ========================================================================
 
     fn routeMessage(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
         std.debug.assert(self.running.load(.acquire));
@@ -538,31 +507,17 @@ pub const ThreadedServerV8 = struct {
         }
     }
 
-    // ========================================================================
-    // Client Management with Output Router
-    // ========================================================================
-
     fn registerClientWithRouter(self: *Self, client_id: config.ClientId) ?*OutputQueue {
         if (self.output_router) |router| {
-            if (router.registerClient(client_id)) |queue| {
-                return queue;
-            }
+            if (router.registerClient(client_id)) |queue| return queue;
         }
         return null;
     }
 
     fn unregisterClientFromRouter(self: *Self, client_id: config.ClientId) void {
-        if (self.output_router) |router| {
-            router.unregisterClient(client_id);
-        }
+        if (self.output_router) |router| router.unregisterClient(client_id);
     }
 
-    // ========================================================================
-    // Callbacks
-    // ========================================================================
-
-    /// Called when a TCP client connects
-    /// Returns the client's output queue pointer (for TcpClient to drain)
     fn onTcpConnect(client_id: config.ClientId, fd: std.posix.fd_t, ctx: ?*anyopaque) ?*OutputQueue {
         _ = fd;
         const self: *Self = @ptrCast(@alignCast(ctx.?));
@@ -580,10 +535,8 @@ pub const ThreadedServerV8 = struct {
 
         std.log.info("Client {d} disconnected, sending cancel-on-disconnect", .{client_id});
 
-        // Unregister from output router
         self.unregisterClientFromRouter(client_id);
 
-        // Send cancel-on-disconnect
         const cancel_msg = msg.InputMsg.flush();
         const input = proc.ProcessorInput{
             .message = cancel_msg,
@@ -604,10 +557,6 @@ pub const ThreadedServerV8 = struct {
         _ = self.multicast.publish(out_msg);
     }
 
-    // ========================================================================
-    // Statistics
-    // ========================================================================
-
     pub fn getStats(self: *const Self) ServerStats {
         var stats = ServerStats{
             .messages_routed = undefined,
@@ -617,11 +566,9 @@ pub const ThreadedServerV8 = struct {
             .tcp_send_failures = self.tcp_send_failures.load(.monotonic),
             .tcp_queue_failures = self.tcp_queue_failures.load(.monotonic),
             .processor_stats = undefined,
-            .router_stats = if (self.output_router) |router|
-                router.getStats()
-            else
-                RouterStats.init(),
+            .router_stats = if (self.output_router) |router| router.getStats() else RouterStats.init(),
         };
+
         for (0..NUM_PROCESSORS) |i| {
             stats.messages_routed[i] = self.messages_routed[i].load(.monotonic);
             if (self.processors[i]) |*p|
@@ -629,6 +576,7 @@ pub const ThreadedServerV8 = struct {
             else
                 stats.processor_stats[i] = std.mem.zeroes(proc.ProcessorStats);
         }
+
         return stats;
     }
 
@@ -645,9 +593,7 @@ pub const ThreadedServerV8 = struct {
 // Backward Compatibility Aliases
 // ============================================================================
 
-/// Current recommended version
 pub const ThreadedServer = ThreadedServerV8;
-
-/// Legacy aliases
 pub const ThreadedServerV7 = ThreadedServerV8;
 pub const ThreadedServerV6 = ThreadedServerV8;
+
