@@ -1,6 +1,6 @@
-//! Threaded server with I/O thread, dual processor threads, and dedicated output sender.
+//! Threaded server with I/O thread, dual processor threads, and output router.
 //!
-//! VERSION v6 - Architecture mirrors C matching engine
+//! VERSION v7 - Architecture matches C matching engine exactly
 //!
 //! Thread Architecture:
 //! ```
@@ -9,7 +9,7 @@
 //!   │  - TCP/UDP accept & receive                                     │
 //!   │  - Parse input messages                                         │
 //!   │  - Route to processor input queues                              │
-//!   │  - NO output handling (delegated to OutputSender)               │
+//!   │  - Drains client output queues on EPOLLOUT (via TcpServer)      │
 //!   └──────────────────────────┬──────────────────────────────────────┘
 //!                              │
 //!              ┌───────────────┴───────────────┐
@@ -26,28 +26,28 @@
 //!              └───────────────┬───────────────┘
 //!                              ▼
 //!   ┌─────────────────────────────────────────────────────────────────┐
-//!   │                    Output Sender Thread                         │
+//!   │                    Output Router Thread                         │
 //!   │  - Drains ALL processor output queues                           │
-//!   │  - Encodes messages (binary/CSV per client)                     │
-//!   │  - Routes to per-client output queues                           │
-//!   │  - Sends via blocking I/O (dedicated thread = OK)               │
+//!   │  - Routes to per-client output queues (lock-free SPSC)          │
 //!   │  - Handles multicast publishing                                 │
+//!   │  - Very fast: queue-to-queue only, no socket I/O                │
 //!   └─────────────────────────────────────────────────────────────────┘
+//!
+//!   Per-client output queues are drained by TcpServer on EPOLLOUT events.
 //! ```
 //!
-//! Key Changes from v5:
-//! 1. I/O thread no longer drains output queues or flushes TCP
-//! 2. New OutputSender thread handles all output processing
-//! 3. Blocking sends are acceptable since OutputSender is dedicated
-//! 4. Cleaner separation of concerns
-//! 5. Better backpressure handling via per-client queues
+//! Key Changes from v6:
+//! 1. OutputRouter replaces OutputSender - only does queue routing, no socket I/O
+//! 2. TcpClient has per-client output queue pointer
+//! 3. TcpServer drains client output queues during EPOLLOUT
+//! 4. Matches C server's output_router + tcp_client architecture exactly
 //!
 //! Benefits:
-//! - I/O thread can focus purely on input processing
-//! - Output processing doesn't block input handling
-//! - Blocking sends simplify the code (no EPOLLOUT complexity)
+//! - OutputRouter thread is extremely fast (queue ops only)
+//! - Socket I/O stays in I/O thread where it belongs
 //! - Per-client queues isolate slow clients
-//! - Matches proven C architecture
+//! - Matches proven C architecture that achieves 3K+ orders/sec
+
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -55,12 +55,14 @@ const csv_codec = @import("../protocol/csv_codec.zig");
 const binary_codec = @import("../protocol/binary_codec.zig");
 const TcpServer = @import("../transport/tcp_server.zig").TcpServer;
 const TcpClient = @import("../transport/tcp_client.zig").TcpClient;
+const OutputQueue = @import("../transport/tcp_client.zig").OutputQueue;
 const udp_server = @import("../transport/udp_server.zig");
 const UdpServer = udp_server.UdpServer;
 const MulticastPublisher = @import("../transport/multicast.zig").MulticastPublisher;
 const config = @import("../transport/config.zig");
 const proc = @import("processor.zig");
-const OutputSender = @import("output_sender.zig").OutputSender;
+const OutputRouter = @import("output_router.zig").OutputRouter;
+const RouterStats = @import("output_router.zig").RouterStats;
 
 // ============================================================================
 // Configuration
@@ -70,6 +72,10 @@ pub const NUM_PROCESSORS: usize = 2;
 
 /// Poll timeout - 0 for maximum input throughput
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
+
+/// How often to drain all client output queues (poll cycles)
+/// Set to 1 for most responsive output delivery
+const OUTPUT_DRAIN_INTERVAL: u32 = 1;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
@@ -88,7 +94,7 @@ comptime {
 }
 
 // ============================================================================
-// Output Batching for UDP (unchanged from v5)
+// Output Batching for UDP (unchanged)
 // ============================================================================
 
 const ClientBatch = struct {
@@ -195,7 +201,7 @@ pub const ServerStats = struct {
     tcp_send_failures: u64,
     tcp_queue_failures: u64,
     processor_stats: [NUM_PROCESSORS]proc.ProcessorStats,
-    output_sender_stats: OutputSender.OutputSenderStats,
+    router_stats: RouterStats,
 
     pub fn totalProcessed(self: ServerStats) u64 {
         var total: u64 = 0;
@@ -206,14 +212,13 @@ pub const ServerStats = struct {
     pub fn totalCriticalDrops(self: ServerStats) u64 {
         var total: u64 = 0;
         for (self.processor_stats) |ps| total += ps.critical_drops;
-        total += self.output_sender_stats.critical_drops;
+        total += self.router_stats.critical_drops;
         return total;
     }
 
     pub fn isHealthy(self: ServerStats) bool {
         return self.totalCriticalDrops() == 0 and
-            self.tcp_send_failures == 0 and
-            self.output_sender_stats.isHealthy();
+            self.tcp_send_failures == 0;
     }
 
     pub fn totalOutputs(self: ServerStats) u64 {
@@ -224,29 +229,28 @@ pub const ServerStats = struct {
 };
 
 // ============================================================================
-// Threaded Server v6 - With Dedicated Output Sender
+// Threaded Server v7 - With Output Router (C-style architecture)
 // ============================================================================
 
-pub const ThreadedServerV6 = struct {
+pub const ThreadedServerV7 = struct {
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
     input_queues: [NUM_PROCESSORS]*proc.InputQueue,
     output_queues: [NUM_PROCESSORS]*proc.OutputQueue,
     processors: [NUM_PROCESSORS]?proc.Processor,
-    output_sender: ?*OutputSender,
+    output_router: ?*OutputRouter,
     encode_buf: [ENCODE_BUF_SIZE]u8,
     batch_mgr: BatchManager,
     cfg: config.Config,
     allocator: std.mem.Allocator,
     running: std.atomic.Value(bool),
+    poll_count: u64,
 
-    // Statistics (only for input side now)
+    // Statistics
     messages_routed: [NUM_PROCESSORS]std.atomic.Value(u64),
     messages_dropped: std.atomic.Value(u64),
     disconnect_cancels: std.atomic.Value(u64),
-
-    // Legacy stats for compatibility (output sender tracks these now)
     outputs_dispatched: std.atomic.Value(u64),
     tcp_send_failures: std.atomic.Value(u64),
     tcp_queue_failures: std.atomic.Value(u64),
@@ -270,10 +274,9 @@ pub const ThreadedServerV6 = struct {
         }
         errdefer for (0..NUM_PROCESSORS) |i| allocator.destroy(self.output_queues[i]);
 
-        // Create output sender (drains processor output queues)
-        // Note: The slice points to self.output_queues which lives as long as self
-        self.output_sender = try OutputSender.init(allocator, &self.output_queues);
-        errdefer if (self.output_sender) |os| os.deinit();
+        // Create output router (drains processor output queues to client queues)
+        self.output_router = try OutputRouter.init(allocator, &self.output_queues);
+        errdefer if (self.output_router) |router| router.deinit();
 
         self.tcp = TcpServer.init(allocator);
         self.udp = UdpServer.init();
@@ -284,6 +287,7 @@ pub const ThreadedServerV6 = struct {
         self.cfg = cfg;
         self.allocator = allocator;
         self.running = std.atomic.Value(bool).init(false);
+        self.poll_count = 0;
         self.messages_routed = .{
             std.atomic.Value(u64).init(0),
             std.atomic.Value(u64).init(0),
@@ -303,9 +307,9 @@ pub const ThreadedServerV6 = struct {
         self.udp.deinit();
         self.multicast.deinit();
 
-        if (self.output_sender) |os| {
-            os.deinit();
-            self.output_sender = null;
+        if (self.output_router) |router| {
+            router.deinit();
+            self.output_router = null;
         }
 
         for (0..NUM_PROCESSORS) |i| {
@@ -318,7 +322,7 @@ pub const ThreadedServerV6 = struct {
     pub fn start(self: *Self) !void {
         std.debug.assert(!self.running.load(.acquire));
 
-        std.log.info("Starting threaded server v6 (dedicated output sender)...", .{});
+        std.log.info("Starting threaded server v7 (C-style output router)...", .{});
         std.log.info("Config: channel_capacity={d}", .{proc.CHANNEL_CAPACITY});
 
         // Start processors
@@ -333,29 +337,22 @@ pub const ThreadedServerV6 = struct {
             try self.processors[i].?.start();
         }
 
-        // Configure and start output sender
-        if (self.output_sender) |os| {
-            // Set up send callback that uses direct POSIX send
-            os.setSendCallback(OutputSender.makeDirectSendCallback(), null);
-
+        // Configure and start output router
+        if (self.output_router) |router| {
             // Configure multicast if enabled
             if (self.cfg.mcast_enabled) {
-                os.setMulticastEnabled(true);
-                os.setMulticastCallback(onMulticastPublish, self);
+                router.setMulticastEnabled(true);
+                router.setMulticastCallback(onMulticastPublish, self);
             }
 
-            os.setDefaultProtocol(
-                if (self.cfg.use_binary_protocol) .binary else .csv,
-            );
-
-            try os.start();
+            try router.start();
         }
 
         // Start TCP server
         if (self.cfg.tcp_enabled) {
             self.tcp.on_message = onTcpMessage;
             self.tcp.on_disconnect = onTcpDisconnect;
-            self.tcp.on_connect = onTcpConnect;  // NEW: register connect callback
+            self.tcp.on_connect = onTcpConnect;
             self.tcp.callback_ctx = self;
             try self.tcp.start(self.cfg.tcp_addr, self.cfg.tcp_port);
         }
@@ -377,18 +374,18 @@ pub const ThreadedServerV6 = struct {
         }
 
         self.running.store(true, .release);
-        std.log.info("Threaded server v6 started ({d} processors + output sender)", .{NUM_PROCESSORS});
+        std.log.info("Threaded server v7 started ({d} processors + output router)", .{NUM_PROCESSORS});
     }
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
 
-        std.log.info("Stopping threaded server v6...", .{});
+        std.log.info("Stopping threaded server v7...", .{});
         self.running.store(false, .release);
 
-        // Stop output sender first (it needs to drain remaining outputs)
-        if (self.output_sender) |os| {
-            os.stop();
+        // Stop output router first (it needs to drain remaining outputs)
+        if (self.output_router) |router| {
+            router.stop();
         }
 
         // Stop transport
@@ -404,25 +401,24 @@ pub const ThreadedServerV6 = struct {
             }
         }
 
-        std.log.info("Threaded server v6 stopped", .{});
+        std.log.info("Threaded server v7 stopped", .{});
     }
 
     pub fn run(self: *Self) !void {
-        std.log.info("Threaded server v6 running...", .{});
+        std.log.info("Threaded server v7 running...", .{});
 
         while (self.running.load(.acquire)) {
             try self.pollOnce(DEFAULT_POLL_TIMEOUT_MS);
         }
 
-        std.log.info("Threaded server v6 event loop exited", .{});
+        std.log.info("Threaded server v7 event loop exited", .{});
     }
 
-    /// v6 poll loop - I/O thread only handles input now!
-    /// Output processing is handled by dedicated OutputSender thread.
+    /// v7 poll loop
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
         std.debug.assert(timeout_ms >= 0);
 
-        // Service socket events (input only)
+        // Service socket events
         if (self.cfg.tcp_enabled) {
             _ = try self.tcp.poll(timeout_ms);
         }
@@ -431,13 +427,17 @@ pub const ThreadedServerV6 = struct {
             _ = self.udp.poll() catch {};
         }
 
-        // NOTE: No output draining here!
-        // The OutputSender thread handles all output processing.
-        // This keeps the I/O thread focused on input handling.
+        self.poll_count += 1;
+
+        // Periodically drain all client output queues
+        // This ensures outputs get sent even without EPOLLOUT events
+        if (self.poll_count % OUTPUT_DRAIN_INTERVAL == 0) {
+            self.tcp.drainAllClientOutputQueues();
+        }
     }
 
     // ========================================================================
-    // Input Routing (unchanged from v5)
+    // Input Routing
     // ========================================================================
 
     fn routeMessage(self: *Self, message: *const msg.InputMsg, client_id: config.ClientId) void {
@@ -488,24 +488,21 @@ pub const ThreadedServerV6 = struct {
     }
 
     // ========================================================================
-    // Client Management Integration
+    // Client Management with Output Router
     // ========================================================================
 
-    fn registerClientWithOutputSender(self: *Self, client_id: config.ClientId, fd: std.posix.fd_t) void {
-        if (self.output_sender) |os| {
-            const registered = os.registerClient(client_id, fd, null);
-            if (registered) {
-                std.log.debug("Registered client {} with OutputSender (fd={})", .{ client_id, fd });
-            } else {
-                std.log.warn("Failed to register client {} with OutputSender", .{client_id});
+    fn registerClientWithRouter(self: *Self, client_id: config.ClientId) ?*OutputQueue {
+        if (self.output_router) |router| {
+            if (router.registerClient(client_id)) |queue| {
+                return queue;
             }
         }
+        return null;
     }
 
-    fn unregisterClientFromOutputSender(self: *Self, client_id: config.ClientId) void {
-        if (self.output_sender) |os| {
-            os.unregisterClient(client_id);
-            std.log.debug("Unregistered client {} from OutputSender", .{client_id});
+    fn unregisterClientFromRouter(self: *Self, client_id: config.ClientId) void {
+        if (self.output_router) |router| {
+            router.unregisterClient(client_id);
         }
     }
 
@@ -513,10 +510,12 @@ pub const ThreadedServerV6 = struct {
     // Callbacks
     // ========================================================================
 
-    /// NEW: Called when a TCP client connects
-    fn onTcpConnect(client_id: config.ClientId, fd: std.posix.fd_t, ctx: ?*anyopaque) void {
+    /// Called when a TCP client connects
+    /// Returns the client's output queue pointer (for TcpClient to drain)
+    fn onTcpConnect(client_id: config.ClientId, fd: std.posix.fd_t, ctx: ?*anyopaque) ?*OutputQueue {
+        _ = fd;
         const self: *Self = @ptrCast(@alignCast(ctx.?));
-        self.registerClientWithOutputSender(client_id, fd);
+        return self.registerClientWithRouter(client_id);
     }
 
     fn onTcpMessage(client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void {
@@ -530,8 +529,8 @@ pub const ThreadedServerV6 = struct {
 
         std.log.info("Client {d} disconnected, sending cancel-on-disconnect", .{client_id});
 
-        // Unregister from output sender
-        self.unregisterClientFromOutputSender(client_id);
+        // Unregister from output router
+        self.unregisterClientFromRouter(client_id);
 
         // Send cancel-on-disconnect
         const cancel_msg = msg.InputMsg.flush();
@@ -567,10 +566,10 @@ pub const ThreadedServerV6 = struct {
             .tcp_send_failures = self.tcp_send_failures.load(.monotonic),
             .tcp_queue_failures = self.tcp_queue_failures.load(.monotonic),
             .processor_stats = undefined,
-            .output_sender_stats = if (self.output_sender) |os|
-                os.getStats()
+            .router_stats = if (self.output_router) |router|
+                router.getStats()
             else
-                OutputSender.OutputSenderStats.init(),
+                RouterStats.init(),
         };
 
         for (0..NUM_PROCESSORS) |i| {
@@ -594,8 +593,11 @@ pub const ThreadedServerV6 = struct {
 };
 
 // ============================================================================
-// Backward Compatibility Alias
+// Backward Compatibility Aliases
 // ============================================================================
 
-/// Alias for backward compatibility - use ThreadedServerV6 for new code
-pub const ThreadedServer = ThreadedServerV6;
+/// Current recommended version
+pub const ThreadedServer = ThreadedServerV7;
+
+/// Legacy alias
+pub const ThreadedServerV6 = ThreadedServerV7;
