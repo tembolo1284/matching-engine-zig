@@ -1,11 +1,11 @@
 //! TCP client connection state and buffer management.
 //!
-//! OPTIMIZED VERSION v5 - OutputRouter Integration
+//! OPTIMIZED VERSION v6 - C Server Architecture Match
 //!
-//! Key changes from v4:
-//! 1. Added output_queue pointer for per-client output queue (from OutputRouter)
-//! 2. TCP server drains output queue during EPOLLOUT, encodes messages, sends
-//! 3. This matches the C server architecture for high throughput
+//! Key changes from v5:
+//! 1. Added drainOutputQueueOne() - drains exactly ONE message (matches C server)
+//! 2. C server processes one message per client per iteration to ensure fairness
+//! 3. This prevents slow clients from starving fast clients
 //!
 //! Data flow:
 //!   Processor → OutputRouter → Client.output_queue → TcpServer drains → socket
@@ -42,7 +42,7 @@ pub const FRAME_HEADER_SIZE: u32 = 4;
 pub const MAX_MESSAGE_SIZE: u32 = 4 * 16384;
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
-/// Maximum messages to drain from output queue per write event
+/// Maximum messages to drain from output queue per write event (for batch drain)
 pub const MAX_OUTPUT_DRAIN_PER_WRITE: u32 = 1024;
 
 const RECV_COMPACT_THRESHOLD: u32 = RECV_BUFFER_SIZE / 2;
@@ -84,7 +84,7 @@ pub const ClientStats = struct {
     send_calls: u64,
     send_would_block: u64,
     send_full_flushes: u64,
-    output_queue_drained: u64,  // NEW: messages drained from output queue
+    output_queue_drained: u64, // messages drained from output queue
 
     pub fn init() ClientStats {
         return .{
@@ -202,12 +202,10 @@ pub const TcpClient = struct {
         if (self.fd >= 0) {
             posix.close(self.fd);
         }
-
         if (self.allocator) |alloc| {
             if (self.recv_buf) |buf| alloc.free(buf);
             if (self.send_buf) |buf| alloc.free(buf);
         }
-
         self.* = .{};
     }
 
@@ -224,7 +222,7 @@ pub const TcpClient = struct {
     }
 
     // ========================================================================
-    // Output Queue (NEW)
+    // Output Queue
     // ========================================================================
 
     /// Set the output queue pointer (called by ThreadedServer on connect)
@@ -240,8 +238,61 @@ pub const TcpClient = struct {
         return false;
     }
 
-    /// Drain output queue into send buffer.
-    /// Encodes messages and queues them for sending.
+    /// Drain exactly ONE message from output queue into send buffer.
+    /// This matches the C server's process_output_queues() behavior:
+    /// - One message per client per iteration
+    /// - Ensures fair distribution across clients
+    /// - Prevents slow clients from blocking fast ones
+    /// Returns 1 if a message was drained, 0 otherwise.
+    pub fn drainOutputQueueOne(self: *Self) u32 {
+        const queue = self.output_queue orelse return 0;
+        const send_buf = self.send_buf orelse return 0;
+
+        // Pop ONE message from queue
+        const output = queue.pop() orelse return 0;
+        const out_msg = &output.message;
+
+        const use_binary = (self.protocol == .binary);
+
+        // Encode message
+        const encoded_len = if (use_binary)
+            binary_codec.encodeOutput(out_msg, &self.encode_buf) catch {
+                // Encode error - message lost
+                return 0;
+            }
+        else
+            csv_codec.encodeOutput(out_msg, &self.encode_buf) catch {
+                return 0;
+            };
+
+        // Check if we have space in send buffer (with framing)
+        const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(encoded_len));
+        const available = SEND_BUFFER_SIZE - self.send_len;
+        if (frame_size > available) {
+            // Send buffer full - this message is lost
+            // In production, we'd want to handle this better
+            std.log.warn("TcpClient: Send buffer full, dropping message for client {}", .{self.client_id});
+            self.stats.buffer_overflows += 1;
+            return 0;
+        }
+
+        // Write frame header (4-byte big-endian length)
+        const hdr = send_buf[self.send_len..][0..4];
+        std.mem.writeInt(u32, hdr, @intCast(encoded_len), .big);
+        self.send_len += FRAME_HEADER_SIZE;
+
+        // Write encoded payload
+        @memcpy(send_buf[self.send_len..][0..encoded_len], self.encode_buf[0..encoded_len]);
+        self.send_len += @intCast(encoded_len);
+
+        self.stats.output_queue_drained += 1;
+        self.stats.messages_sent += 1;
+
+        return 1;
+    }
+
+    /// Drain multiple messages from output queue into send buffer.
+    /// Use this for batch processing in EPOLLOUT handler.
     /// Returns number of messages drained.
     pub fn drainOutputQueue(self: *Self) u32 {
         const queue = self.output_queue orelse return 0;
@@ -269,11 +320,8 @@ pub const TcpClient = struct {
             // Check if we have space in send buffer (with framing)
             const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(encoded_len));
             const available = SEND_BUFFER_SIZE - self.send_len;
-
             if (frame_size > available) {
                 // Send buffer full - can't drain more
-                // Note: This message is lost! In production, we'd want to
-                // put it back or handle this better. For now, log it.
                 std.log.warn("TcpClient: Send buffer full, dropping message for client {}", .{self.client_id});
                 self.stats.buffer_overflows += 1;
                 break;
@@ -326,13 +374,11 @@ pub const TcpClient = struct {
     fn compactRecv(self: *Self) void {
         const recv_buf = self.recv_buf orelse return;
         const unread = self.recvDataLen();
-
         if (unread == 0) {
             self.recv_read = 0;
             self.recv_write = 0;
             return;
         }
-
         if (self.recv_read == 0) return;
 
         std.mem.copyForwards(u8, recv_buf[0..unread], recv_buf[self.recv_read..self.recv_write]);
@@ -343,12 +389,10 @@ pub const TcpClient = struct {
     fn ensureRecvSpace(self: *Self) bool {
         const avail = RECV_BUFFER_SIZE - self.recv_write;
         if (avail > 0) return true;
-
         if (self.recv_read > 0) {
             self.compactRecv();
             return (RECV_BUFFER_SIZE - self.recv_write) > 0;
         }
-
         return false;
     }
 
@@ -389,7 +433,6 @@ pub const TcpClient = struct {
     pub fn consumeBytes(self: *Self, bytes: u32) void {
         std.debug.assert(bytes <= self.recvDataLen());
         self.recv_read += bytes;
-
         if (self.recv_read == self.recv_write) {
             self.recv_read = 0;
             self.recv_write = 0;
@@ -417,7 +460,6 @@ pub const TcpClient = struct {
     pub fn extractFrame(self: *Self) FrameResult {
         const recv_buf = self.recv_buf orelse return .empty;
         const unread = self.recvDataLen();
-
         if (unread == 0) return .empty;
         if (unread < FRAME_HEADER_SIZE) return .incomplete;
 
@@ -679,10 +721,8 @@ pub fn ClientPool(comptime capacity: u32) type {
 
         pub fn getAggregateStats(self: *const Self) AggregateStats {
             var stats = AggregateStats{};
-
             for (self.clients) |client| {
                 if (!client.state.isActive()) continue;
-
                 stats.active_clients += 1;
                 stats.total_messages_in += client.stats.messages_received;
                 stats.total_messages_out += client.stats.messages_sent;
@@ -694,7 +734,6 @@ pub fn ClientPool(comptime capacity: u32) type {
                 stats.total_full_flushes += client.stats.send_full_flushes;
                 stats.total_output_queue_drained += client.stats.output_queue_drained;
             }
-
             return stats;
         }
 

@@ -1,6 +1,6 @@
 //! Threaded server with I/O thread, dual processor threads, and output router.
 //!
-//! VERSION v7 - Architecture matches C matching engine exactly
+//! VERSION v8 - C Server Architecture Match
 //!
 //! Thread Architecture:
 //! ```
@@ -9,7 +9,7 @@
 //!   │  - TCP/UDP accept & receive                                     │
 //!   │  - Parse input messages                                         │
 //!   │  - Route to processor input queues                              │
-//!   │  - Drains client output queues on EPOLLOUT (via TcpServer)      │
+//!   │  - Processes output queues BEFORE epoll_wait (C server pattern) │
 //!   └──────────────────────────┬──────────────────────────────────────┘
 //!                              │
 //!              ┌───────────────┴───────────────┐
@@ -33,21 +33,19 @@
 //!   │  - Very fast: queue-to-queue only, no socket I/O                │
 //!   └─────────────────────────────────────────────────────────────────┘
 //!
-//!   Per-client output queues are drained by TcpServer on EPOLLOUT events.
+//!   Per-client output queues are drained by TcpServer BEFORE epoll_wait.
 //! ```
 //!
-//! Key Changes from v6:
-//! 1. OutputRouter replaces OutputSender - only does queue routing, no socket I/O
-//! 2. TcpClient has per-client output queue pointer
-//! 3. TcpServer drains client output queues during EPOLLOUT
-//! 4. Matches C server's output_router + tcp_client architecture exactly
+//! Key Changes from v7:
+//! 1. TcpServer.poll() now processes output queues BEFORE waiting for events
+//! 2. This matches C server's tcp_listener.c exactly
+//! 3. No more OUTPUT_DRAIN_INTERVAL - draining happens every poll cycle
+//! 4. Output sending is much more responsive
 //!
 //! Benefits:
-//! - OutputRouter thread is extremely fast (queue ops only)
-//! - Socket I/O stays in I/O thread where it belongs
-//! - Per-client queues isolate slow clients
+//! - Maximum output throughput - no waiting for EPOLLOUT
 //! - Matches proven C architecture that achieves 3K+ orders/sec
-
+//! - Simpler code - no periodic drain logic in this file
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
@@ -70,12 +68,9 @@ const RouterStats = @import("output_router.zig").RouterStats;
 
 pub const NUM_PROCESSORS: usize = 2;
 
-/// Poll timeout - 0 for maximum input throughput
+/// Poll timeout - 0 for maximum throughput, small value for responsiveness
+/// With C-style output processing, 0 is fine - outputs processed before wait
 const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
-
-/// How often to drain all client output queues (poll cycles)
-/// Set to 1 for most responsive output delivery
-const OUTPUT_DRAIN_INTERVAL: u32 = 1;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
@@ -229,10 +224,10 @@ pub const ServerStats = struct {
 };
 
 // ============================================================================
-// Threaded Server v7 - With Output Router (C-style architecture)
+// Threaded Server v8 - C Server Architecture Match
 // ============================================================================
 
-pub const ThreadedServerV7 = struct {
+pub const ThreadedServerV8 = struct {
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
@@ -306,12 +301,10 @@ pub const ThreadedServerV7 = struct {
         self.tcp.deinit();
         self.udp.deinit();
         self.multicast.deinit();
-
         if (self.output_router) |router| {
             router.deinit();
             self.output_router = null;
         }
-
         for (0..NUM_PROCESSORS) |i| {
             self.allocator.destroy(self.input_queues[i]);
             self.allocator.destroy(self.output_queues[i]);
@@ -321,8 +314,7 @@ pub const ThreadedServerV7 = struct {
 
     pub fn start(self: *Self) !void {
         std.debug.assert(!self.running.load(.acquire));
-
-        std.log.info("Starting threaded server v7 (C-style output router)...", .{});
+        std.log.info("Starting threaded server v8 (C-style output processing)...", .{});
         std.log.info("Config: channel_capacity={d}", .{proc.CHANNEL_CAPACITY});
 
         // Start processors
@@ -344,7 +336,6 @@ pub const ThreadedServerV7 = struct {
                 router.setMulticastEnabled(true);
                 router.setMulticastCallback(onMulticastPublish, self);
             }
-
             try router.start();
         }
 
@@ -374,13 +365,12 @@ pub const ThreadedServerV7 = struct {
         }
 
         self.running.store(true, .release);
-        std.log.info("Threaded server v7 started ({d} processors + output router)", .{NUM_PROCESSORS});
+        std.log.info("Threaded server v8 started ({d} processors + output router)", .{NUM_PROCESSORS});
     }
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
-
-        std.log.info("Stopping threaded server v7...", .{});
+        std.log.info("Stopping threaded server v8...", .{});
         self.running.store(false, .release);
 
         // Stop output router first (it needs to drain remaining outputs)
@@ -401,24 +391,24 @@ pub const ThreadedServerV7 = struct {
             }
         }
 
-        std.log.info("Threaded server v7 stopped", .{});
+        std.log.info("Threaded server v8 stopped", .{});
     }
 
     pub fn run(self: *Self) !void {
-        std.log.info("Threaded server v7 running...", .{});
-
+        std.log.info("Threaded server v8 running...", .{});
         while (self.running.load(.acquire)) {
             try self.pollOnce(DEFAULT_POLL_TIMEOUT_MS);
         }
-
-        std.log.info("Threaded server v7 event loop exited", .{});
+        std.log.info("Threaded server v8 event loop exited", .{});
     }
 
-    /// v7 poll loop
+    /// v8 poll loop - simplified because TcpServer.poll() now handles output
+    /// processing internally (before epoll_wait, like C server)
     pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
         std.debug.assert(timeout_ms >= 0);
 
-        // Service socket events
+        // TCP poll now processes output queues BEFORE waiting for events
+        // This matches the C server's tcp_listener.c architecture exactly
         if (self.cfg.tcp_enabled) {
             _ = try self.tcp.poll(timeout_ms);
         }
@@ -428,12 +418,6 @@ pub const ThreadedServerV7 = struct {
         }
 
         self.poll_count += 1;
-
-        // Periodically drain all client output queues
-        // This ensures outputs get sent even without EPOLLOUT events
-        if (self.poll_count % OUTPUT_DRAIN_INTERVAL == 0) {
-            self.tcp.drainAllClientOutputQueues();
-        }
     }
 
     // ========================================================================
@@ -571,7 +555,6 @@ pub const ThreadedServerV7 = struct {
             else
                 RouterStats.init(),
         };
-
         for (0..NUM_PROCESSORS) |i| {
             stats.messages_routed[i] = self.messages_routed[i].load(.monotonic);
             if (self.processors[i]) |*p|
@@ -579,7 +562,6 @@ pub const ThreadedServerV7 = struct {
             else
                 stats.processor_stats[i] = std.mem.zeroes(proc.ProcessorStats);
         }
-
         return stats;
     }
 
@@ -597,7 +579,8 @@ pub const ThreadedServerV7 = struct {
 // ============================================================================
 
 /// Current recommended version
-pub const ThreadedServer = ThreadedServerV7;
+pub const ThreadedServer = ThreadedServerV8;
 
-/// Legacy alias
-pub const ThreadedServerV6 = ThreadedServerV7;
+/// Legacy aliases
+pub const ThreadedServerV7 = ThreadedServerV8;
+pub const ThreadedServerV6 = ThreadedServerV8;
