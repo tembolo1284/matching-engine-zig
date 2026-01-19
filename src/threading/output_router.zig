@@ -298,7 +298,7 @@ pub const OutputRouter = struct {
         while (self.running.load(.acquire)) {
             const drained = self.drainOnce(batch[0..]);
             if (drained == 0) {
-                std.time.sleep(SLEEP_TIME_NS);
+                std.Thread.sleep(SLEEP_TIME_NS);
             }
         }
     }

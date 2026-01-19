@@ -225,6 +225,16 @@ pub const TcpClient = struct {
     }
 
     // ------------------------------------------------------------------------
+    // Idle duration tracking
+    // ------------------------------------------------------------------------
+
+    /// Get seconds since last activity
+    pub fn getIdleDuration(self: *const Self) i64 {
+        const now = std.time.timestamp();
+        return now - self.last_active;
+    }
+
+    // ------------------------------------------------------------------------
     // Output queue
     // ------------------------------------------------------------------------
 
@@ -294,6 +304,62 @@ pub const TcpClient = struct {
         self.pending_output = null;
 
         return 1;
+    }
+
+    // ------------------------------------------------------------------------
+    // Direct send methods (used by tcp_server)
+    // ------------------------------------------------------------------------
+
+    /// Queue a framed send (4-byte length prefix + payload)
+    /// Returns true if successfully queued, false if buffer full
+    pub fn queueFramedSend(self: *Self, data: []const u8) bool {
+        const send_buf = self.send_buf orelse return false;
+        const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(data.len));
+        const available = SEND_BUFFER_SIZE - self.send_len;
+
+        if (frame_size > available) {
+            self.stats.buffer_overflows += 1;
+            return false;
+        }
+
+        // Write 4-byte length header (big-endian)
+        const hdr = send_buf[self.send_len..][0..4];
+        std.mem.writeInt(u32, hdr, @intCast(data.len), .big);
+        self.send_len += FRAME_HEADER_SIZE;
+
+        // Write payload
+        @memcpy(send_buf[self.send_len..][0..data.len], data);
+        self.send_len += @intCast(data.len);
+
+        self.send_frames_pending += 1;
+        return true;
+    }
+
+    /// Queue a raw send (no framing)
+    /// Returns true if successfully queued, false if buffer full
+    pub fn queueRawSend(self: *Self, data: []const u8) bool {
+        const send_buf = self.send_buf orelse return false;
+        const available = SEND_BUFFER_SIZE - self.send_len;
+
+        if (data.len > available) {
+            self.stats.buffer_overflows += 1;
+            return false;
+        }
+
+        @memcpy(send_buf[self.send_len..][0..data.len], data);
+        self.send_len += @intCast(data.len);
+
+        // Raw sends count as one "frame" for stats purposes
+        self.send_frames_pending += 1;
+        return true;
+    }
+
+    /// Record that a message was sent (for stats tracking via direct sends)
+    pub fn recordMessageSent(self: *Self) void {
+        // Note: This is called by tcp_server for direct sends.
+        // For output queue drains, messages_sent is incremented in flushSend()
+        // when the send buffer is fully flushed.
+        // This method is kept for backward compatibility with direct send paths.
     }
 
     // ------------------------------------------------------------------------
@@ -531,6 +597,18 @@ pub fn ClientPool(comptime capacity: u32) type {
 
         const Self = @This();
 
+        /// Aggregate statistics across all clients
+        /// Field names match what tcp_server.zig expects
+        pub const AggregateStats = struct {
+            active_clients: u32 = 0,
+            total_messages_in: u64 = 0,
+            total_messages_out: u64 = 0,
+            total_bytes_in: u64 = 0,
+            total_bytes_out: u64 = 0,
+            total_decode_errors: u64 = 0,
+            total_buffer_overflows: u64 = 0,
+        };
+
         pub fn allocate(self: *Self) ?*TcpClient {
             for (&self.clients) |*client| {
                 if (client.isDisconnected()) return client;
@@ -554,6 +632,22 @@ pub fn ClientPool(comptime capacity: u32) type {
 
         pub fn getActive(self: *Self) ActiveIterator {
             return .{ .pool = self, .index = 0 };
+        }
+
+        pub fn getAggregateStats(self: *Self) AggregateStats {
+            var agg = AggregateStats{};
+            for (&self.clients) |*client| {
+                if (client.state.isActive()) {
+                    agg.active_clients += 1;
+                    agg.total_messages_in += client.stats.messages_received;
+                    agg.total_messages_out += client.stats.messages_sent;
+                    agg.total_bytes_in += client.stats.bytes_received;
+                    agg.total_bytes_out += client.stats.bytes_sent;
+                    agg.total_decode_errors += client.stats.decode_errors;
+                    agg.total_buffer_overflows += client.stats.buffer_overflows;
+                }
+            }
+            return agg;
         }
 
         pub const ActiveIterator = struct {
