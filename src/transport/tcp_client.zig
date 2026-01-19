@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+
 const config = @import("config.zig");
 const codec = @import("../protocol/codec.zig");
 const net_utils = @import("net_utils.zig");
@@ -20,8 +21,10 @@ const msg = @import("../protocol/message_types.zig");
 const binary_codec = @import("../protocol/binary_codec.zig");
 const csv_codec = @import("../protocol/csv_codec.zig");
 
-pub const OutputQueue = @import("../threading/output_router.zig").ClientOutputQueue;
-pub const ClientOutput = @import("../threading/output_router.zig").ClientOutput;
+// Import from client_output_queue (breaks circular dependency)
+const client_queue = @import("../collections/client_output_queue.zig");
+pub const OutputQueue = client_queue.ClientOutputQueue;
+pub const ClientOutput = client_queue.ClientOutput;
 
 // ============================================================================
 // Platform
@@ -73,15 +76,12 @@ pub const ClientStats = struct {
     messages_sent: u64, // counts frames fully sent (matches C)
     bytes_received: u64,
     bytes_sent: u64,
-
     frames_dropped: u64,
     buffer_overflows: u64,
     decode_errors: u64,
-
     send_calls: u64,
     send_would_block: u64,
     send_full_flushes: u64,
-
     output_queue_drained: u64, // number of outputs moved into send buffer (enqueued frames)
 
     pub fn init() ClientStats {
@@ -254,7 +254,6 @@ pub const TcpClient = struct {
 
         const output = self.pending_output.?;
         const out_msg = &output.message;
-
         const use_binary = (self.protocol == .binary);
 
         // Encode
@@ -293,6 +292,7 @@ pub const TcpClient = struct {
 
         // Successfully staged; clear pending.
         self.pending_output = null;
+
         return 1;
     }
 
@@ -404,6 +404,7 @@ pub const TcpClient = struct {
     pub fn extractFrame(self: *Self) FrameResult {
         const recv_buf = self.recv_buf orelse return .empty;
         const unread = self.recvDataLen();
+
         if (unread == 0) return .empty;
         if (unread < FRAME_HEADER_SIZE) return .incomplete;
 
@@ -433,7 +434,6 @@ pub const TcpClient = struct {
         self.recv_read += total_len;
         self.stats.messages_received += 1;
         self.resetErrors();
-
         if (self.recv_read == self.recv_write) {
             self.recv_read = 0;
             self.recv_write = 0;
@@ -571,4 +571,3 @@ pub fn ClientPool(comptime capacity: u32) type {
         };
     };
 }
-
