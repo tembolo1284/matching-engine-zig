@@ -297,19 +297,51 @@ pub const ThreadedServerV8 = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.stop();
+        // Always try to stop, regardless of running state
+        self.stopForce();
+        
         self.tcp.deinit();
         self.udp.deinit();
         self.multicast.deinit();
+        
         if (self.output_router) |router| {
             router.deinit();
             self.output_router = null;
         }
+        
         for (0..NUM_PROCESSORS) |i| {
             self.allocator.destroy(self.input_queues[i]);
             self.allocator.destroy(self.output_queues[i]);
         }
         self.allocator.destroy(self);
+    }
+    
+    /// Force stop all components - called by deinit even if start() failed
+    fn stopForce(self: *Self) void {
+        std.log.debug("stopForce: stopping all components...", .{});
+        
+        // Signal stop
+        self.running.store(false, .release);
+        
+        // Stop output router first
+        if (self.output_router) |router| {
+            router.stop();
+        }
+        
+        // Stop transport
+        self.tcp.stop();
+        self.udp.stop();
+        self.multicast.stop();
+        
+        // Stop ALL processors (even if start() didn't complete)
+        for (&self.processors) |*p| {
+            if (p.*) |*processor| {
+                processor.deinit();
+                p.* = null;
+            }
+        }
+        
+        std.log.debug("stopForce: all components stopped", .{});
     }
 
     pub fn start(self: *Self) !void {
@@ -326,7 +358,28 @@ pub const ThreadedServerV8 = struct {
                 self.input_queues[i],
                 self.output_queues[i],
             );
-            try self.processors[i].?.start();
+            self.processors[i].?.start() catch |err| {
+                std.log.err("Failed to start processor {d}: {any}", .{ i, err });
+                // Clean up already-started processors
+                for (0..i) |j| {
+                    if (self.processors[j]) |*p| {
+                        p.deinit();
+                        self.processors[j] = null;
+                    }
+                }
+                return err;
+            };
+        }
+        
+        // errdefer to stop processors if anything below fails
+        errdefer {
+            std.log.debug("start() failed, cleaning up processors...", .{});
+            for (&self.processors) |*p| {
+                if (p.*) |*processor| {
+                    processor.deinit();
+                    p.* = null;
+                }
+            }
         }
 
         // Configure and start output router
@@ -338,6 +391,13 @@ pub const ThreadedServerV8 = struct {
             }
             try router.start();
         }
+        
+        // errdefer to stop router if TCP/UDP fails
+        errdefer {
+            if (self.output_router) |router| {
+                router.stop();
+            }
+        }
 
         // Start TCP server
         if (self.cfg.tcp_enabled) {
@@ -345,7 +405,14 @@ pub const ThreadedServerV8 = struct {
             self.tcp.on_disconnect = onTcpDisconnect;
             self.tcp.on_connect = onTcpConnect;
             self.tcp.callback_ctx = self;
-            try self.tcp.start(self.cfg.tcp_addr, self.cfg.tcp_port);
+            self.tcp.start(self.cfg.tcp_addr, self.cfg.tcp_port) catch |err| {
+                std.log.err("Failed to start TCP server on {s}:{d}: {any}", .{ 
+                    self.cfg.tcp_addr, self.cfg.tcp_port, err 
+                });
+                return err;
+            };
+        } else {
+            std.log.info("TCP server disabled by config", .{});
         }
 
         // Start UDP server

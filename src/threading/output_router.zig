@@ -1,28 +1,21 @@
 //! Output Router - Routes processor outputs to per-client queues
 //!
-//! This matches the C server's output_router architecture:
+//! Matches the C server's output_router architecture:
 //! - Drains processor output queues (SPSC, lock-free)
 //! - Routes messages to per-client output queues (SPSC, lock-free)
-//! - Broadcasts to multicast (if enabled)
-//! - Very fast because it only does queue operations, no socket I/O
-//!
-//! The TCP server thread handles actual socket sends from client queues.
+//! - Optionally publishes multicast (callback)
+//! - No socket I/O here; TCP server thread drains per-client queues.
 //!
 //! Flow:
 //!   Processor 0 → Output Queue 0 ┐
 //!                                 ├→ Output Router ─┬→ Per-client queues (TCP server drains)
 //!   Processor 1 → Output Queue 1 ┘                  └→ Multicast callback
 //!
-//! Performance:
-//! - Sleep only 1 microsecond when idle (matches C server)
-//! - Batch dequeue for efficiency
-//! - No socket operations in this thread
-//!
-//! NASA Power of Ten Compliance:
-//! - Rule 2: All loops bounded by ROUTER_BATCH_SIZE, MAX_DRAIN_ITERATIONS
-//! - Rule 3: No dynamic allocation in hot path
-//! - Rule 5: Assertions validate state
-//! - Rule 7: All queue operations checked
+//! Performance / P10:
+//! - Bounded loops (Rule 2): ROUTER_BATCH_SIZE, MAX_DRAIN_ITERATIONS, MAX_CLIENTS
+//! - No dynamic allocation in hot path (Rule 3)
+//! - Assertions where appropriate (Rule 5)
+//! - All queue ops checked (Rule 7)
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -41,7 +34,7 @@ pub const ROUTER_BATCH_SIZE: u32 = 32;
 const MAX_DRAIN_ITERATIONS: u32 = 100;
 
 /// Sleep time when idle (nanoseconds) - 1 microsecond like C server
-const IDLE_SLEEP_NS: u64 = 1000;
+const IDLE_SLEEP_NS: u64 = 1_000;
 
 /// Maximum clients to support
 pub const MAX_CLIENTS: u32 = 128;
@@ -65,14 +58,14 @@ pub const ClientOutputQueue = SpscQueue(ClientOutput, CLIENT_QUEUE_CAPACITY);
 pub const ClientOutputState = struct {
     /// Output queue (producer: router, consumer: TCP server)
     queue: ClientOutputQueue,
-    
+
     /// Client ID (0 = inactive)
     client_id: config.ClientId,
-    
+
     /// Active flag
     active: std.atomic.Value(bool),
-    
-    /// Statistics
+
+    /// Statistics (single-writer: router thread)
     messages_enqueued: u64,
     messages_dropped: u64,
     critical_drops: u64,
@@ -91,13 +84,16 @@ pub const ClientOutputState = struct {
     }
 
     pub fn reset(self: *Self) void {
-        // Drain any remaining messages
+        // Drain any remaining messages (bounded by queue capacity)
         while (self.queue.pop() != null) {}
+
         self.client_id = 0;
-        self.active.store(false, .release);
         self.messages_enqueued = 0;
         self.messages_dropped = 0;
         self.critical_drops = 0;
+
+        // Make inactive last
+        self.active.store(false, .release);
     }
 
     pub fn isActive(self: *const Self) bool {
@@ -120,7 +116,7 @@ pub const RouterStats = struct {
     messages_drained: u64,
     /// Messages routed to client queues
     messages_routed: u64,
-    /// Messages dropped (client queue full or not found)
+    /// Messages dropped (client not found or queue full)
     messages_dropped: u64,
     /// Critical messages dropped (trades, rejects)
     critical_drops: u64,
@@ -128,7 +124,7 @@ pub const RouterStats = struct {
     multicast_messages: u64,
     /// Idle cycles (no work done)
     idle_cycles: u64,
-    /// Per-processor drain counts
+    /// Per-processor drain counts (kept at 2 to match your current processor design)
     from_processor: [2]u64,
 
     pub fn init() RouterStats {
@@ -147,10 +143,7 @@ pub const OutputRouter = struct {
     /// Per-client output states
     clients: [MAX_CLIENTS]ClientOutputState,
 
-    /// Client lookup index (client_id % MAX_CLIENTS -> slot index)
-    client_index: [MAX_CLIENTS]?u8,
-
-    /// Active client count
+    /// Active client count (informational)
     active_clients: std.atomic.Value(u32),
 
     /// Multicast callback
@@ -164,7 +157,7 @@ pub const OutputRouter = struct {
     /// Running flag
     running: std.atomic.Value(bool),
 
-    /// Statistics
+    /// Statistics (single-writer: router thread)
     stats: RouterStats,
 
     /// Allocator
@@ -186,7 +179,6 @@ pub const OutputRouter = struct {
         self.* = .{
             .processor_queues = processor_queues,
             .clients = undefined,
-            .client_index = [_]?u8{null} ** MAX_CLIENTS,
             .active_clients = std.atomic.Value(u32).init(0),
             .multicast_callback = null,
             .multicast_ctx = null,
@@ -197,7 +189,6 @@ pub const OutputRouter = struct {
             .allocator = allocator,
         };
 
-        // Initialize all client slots
         for (&self.clients) |*client| {
             client.* = ClientOutputState.init();
         }
@@ -231,10 +222,18 @@ pub const OutputRouter = struct {
     // Client Management
     // ========================================================================
 
-    /// Register a client for output routing
-    /// Returns pointer to client's output queue for TCP server to drain
+    /// Register a client for output routing.
+    /// Returns pointer to client's output queue for TCP server to drain.
+    ///
+    /// NOTE: We intentionally avoid hashed indices here. The previous `client_id % MAX_CLIENTS`
+    /// approach is collision-prone and can cause misrouting/drops. Linear scan is bounded (128).
     pub fn registerClient(self: *Self, client_id: config.ClientId) ?*ClientOutputQueue {
         if (client_id == 0) return null;
+
+        // If already registered, return existing queue (idempotent-ish)
+        if (self.findClient(client_id)) |existing| {
+            return &existing.queue;
+        }
 
         // Find free slot
         var slot_idx: ?usize = null;
@@ -251,16 +250,15 @@ pub const OutputRouter = struct {
         };
 
         const client = &self.clients[idx];
+
+        // Initialize slot
+        client.queue = .{}; // reset queue struct
         client.client_id = client_id;
         client.messages_enqueued = 0;
         client.messages_dropped = 0;
         client.critical_drops = 0;
 
-        // Update index for fast lookup
-        const hash_idx = client_id % MAX_CLIENTS;
-        self.client_index[hash_idx] = @intCast(idx);
-
-        // Mark active (must be last - release fence)
+        // Mark active last (publish)
         client.active.store(true, .release);
         _ = self.active_clients.fetchAdd(1, .monotonic);
 
@@ -272,48 +270,29 @@ pub const OutputRouter = struct {
     pub fn unregisterClient(self: *Self, client_id: config.ClientId) void {
         if (client_id == 0) return;
 
-        for (&self.clients, 0..) |*client, i| {
+        for (&self.clients) |*client| {
             if (client.client_id == client_id and client.isActive()) {
-                std.log.info("OutputRouter: Unregistering client {} (enqueued={}, dropped={})", .{
-                    client_id,
-                    client.messages_enqueued,
-                    client.messages_dropped,
-                });
+                std.log.info(
+                    "OutputRouter: Unregistering client {} (enqueued={}, dropped={}, critical={})",
+                    .{ client_id, client.messages_enqueued, client.messages_dropped, client.critical_drops },
+                );
+
                 client.reset();
                 _ = self.active_clients.fetchSub(1, .monotonic);
-
-                // Clear index
-                const hash_idx = client_id % MAX_CLIENTS;
-                if (self.client_index[hash_idx]) |idx| {
-                    if (idx == i) {
-                        self.client_index[hash_idx] = null;
-                    }
-                }
                 return;
             }
         }
     }
 
-    /// Find client by ID
+    /// Find client by ID (bounded linear scan; safe and predictable)
     fn findClient(self: *Self, client_id: config.ClientId) ?*ClientOutputState {
         if (client_id == 0) return null;
 
-        // Fast path: check index
-        const hash_idx = client_id % MAX_CLIENTS;
-        if (self.client_index[hash_idx]) |idx| {
-            const client = &self.clients[idx];
-            if (client.client_id == client_id and client.isActive()) {
-                return client;
-            }
-        }
-
-        // Slow path: linear scan (handles hash collisions)
         for (&self.clients) |*client| {
             if (client.client_id == client_id and client.isActive()) {
                 return client;
             }
         }
-
         return null;
     }
 
@@ -322,9 +301,7 @@ pub const OutputRouter = struct {
     // ========================================================================
 
     pub fn start(self: *Self) !void {
-        if (self.running.load(.acquire)) {
-            return error.AlreadyRunning;
-        }
+        if (self.running.load(.acquire)) return error.AlreadyRunning;
 
         std.log.info("OutputRouter: Starting (queues={}, max_clients={})", .{
             self.processor_queues.len,
@@ -346,14 +323,19 @@ pub const OutputRouter = struct {
             self.thread = null;
         }
 
-        // Final drain
-        _ = self.drainOnce();
+        // Drain remaining work (bounded)
+        var iters: u32 = 0;
+        while (iters < MAX_DRAIN_ITERATIONS) : (iters += 1) {
+            const drained = self.drainOnce();
+            if (drained == 0) break;
+        }
 
-        std.log.info("OutputRouter: Stopped (drained={}, routed={}, dropped={}, critical={})", .{
+        std.log.info("OutputRouter: Stopped (drained={}, routed={}, dropped={}, critical={}, multicast={})", .{
             self.stats.messages_drained,
             self.stats.messages_routed,
             self.stats.messages_dropped,
             self.stats.critical_drops,
+            self.stats.multicast_messages,
         });
     }
 
@@ -385,20 +367,19 @@ pub const OutputRouter = struct {
         // Batch buffer for efficient dequeue
         var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
 
-        // Drain all processor queues
         for (self.processor_queues, 0..) |queue, q_idx| {
             const count = queue.popBatch(&batch);
-
             if (count == 0) continue;
 
-            // Process the batch
+            // Route the batch
             for (batch[0..count]) |*output| {
                 self.routeMessage(&output.message);
             }
 
             total_drained += @intCast(count);
             self.stats.messages_drained += count;
-            if (q_idx < 2) {
+
+            if (q_idx < self.stats.from_processor.len) {
                 self.stats.from_processor[q_idx] += count;
             }
         }
@@ -414,41 +395,33 @@ pub const OutputRouter = struct {
                 self.routeToClient(out_msg);
             },
             .trade => {
-                // Trade to buyer
+                // Trade to buyer/specific client_id field in out_msg
                 self.routeToClient(out_msg);
                 // Also multicast
-                if (self.multicast_enabled) {
-                    self.publishMulticast(out_msg);
-                }
+                if (self.multicast_enabled) self.publishMulticast(out_msg);
             },
             .top_of_book => {
                 // Unicast if client specified
-                if (out_msg.client_id != 0) {
-                    self.routeToClient(out_msg);
-                }
+                if (out_msg.client_id != 0) self.routeToClient(out_msg);
                 // Also multicast
-                if (self.multicast_enabled) {
-                    self.publishMulticast(out_msg);
-                }
+                if (self.multicast_enabled) self.publishMulticast(out_msg);
             },
         }
     }
 
     /// Route message to a specific client's output queue
     fn routeToClient(self: *Self, out_msg: *const msg.OutputMsg) void {
-        if (out_msg.client_id == 0) return;
+        const client_id = out_msg.client_id;
+        if (client_id == 0) return;
 
-        const client = self.findClient(out_msg.client_id) orelse {
-            // Client not registered - this happens during disconnect races
+        const client = self.findClient(client_id) orelse {
+            // Client not registered (disconnect races)
             self.stats.messages_dropped += 1;
             const is_critical = (out_msg.msg_type == .trade or out_msg.msg_type == .reject);
-            if (is_critical) {
-                self.stats.critical_drops += 1;
-            }
+            if (is_critical) self.stats.critical_drops += 1;
             return;
         };
 
-        // Enqueue to client's output queue
         const output = ClientOutput{ .message = out_msg.* };
         if (client.queue.push(output)) {
             client.messages_enqueued += 1;
@@ -463,7 +436,7 @@ pub const OutputRouter = struct {
                 client.critical_drops += 1;
                 self.stats.critical_drops += 1;
                 std.log.err("OutputRouter: CRITICAL DROP client={} type={s}", .{
-                    out_msg.client_id,
+                    client_id,
                     @tagName(out_msg.msg_type),
                 });
             }
@@ -495,10 +468,9 @@ pub const OutputRouter = struct {
 // Tests
 // ============================================================================
 
-test "OutputRouter basic" {
-    // This would require setting up processor queues which is complex
-    // Just verify compilation
+test "OutputRouter compiles" {
     _ = OutputRouter;
     _ = ClientOutputState;
     _ = ClientOutputQueue;
 }
+

@@ -1,11 +1,17 @@
 //! TCP client connection state and buffer management.
 //!
-//! OPTIMIZED VERSION v6 - C Server Architecture Match
+//! FIXED VERSION v7 - C Server Architecture Match (Write-Side)
 //!
-//! Key changes from v5:
-//! 1. Added drainOutputQueueOne() - drains exactly ONE message (matches C server)
-//! 2. C server processes one message per client per iteration to ensure fairness
-//! 3. This prevents slow clients from starving fast clients
+//! Key fixes vs your v6:
+//! 1) Replaced 16MB multi-message send buffer with C-style per-message write_state.
+//!    - ONE framed message pending at a time (header+payload)
+//!    - Partial writes resume via EPOLLOUT
+//!    - No "pop then drop because send buffer is full"
+//! 2) drainOutputQueueOne() now:
+//!    - Does NOTHING if a write is pending
+//!    - Pops exactly ONE message and initializes write_state
+//! 3) encode_buf increased to 4096 (matches C MAX_FRAMED_MESSAGE_SIZE)
+//! 4) Added strict framing payload max (4096) to match C message_framing.
 //!
 //! Data flow:
 //!   Processor → OutputRouter → Client.output_queue → TcpServer drains → socket
@@ -21,7 +27,6 @@ const binary_codec = @import("../protocol/binary_codec.zig");
 const csv_codec = @import("../protocol/csv_codec.zig");
 
 // Import OutputRouter types (forward declaration to avoid circular deps)
-// The actual queue is set by ThreadedServer after OutputRouter registration
 pub const OutputQueue = @import("../threading/output_router.zig").ClientOutputQueue;
 pub const ClientOutput = @import("../threading/output_router.zig").ClientOutput;
 
@@ -33,26 +38,35 @@ const is_linux = builtin.os.tag == .linux;
 const SEND_FLAGS: u32 = if (is_linux) posix.MSG.NOSIGNAL else 0;
 
 // ============================================================================
-// Configuration
+// Configuration (Receive-side stays flexible; Write-side matches C framing)
 // ============================================================================
 
-pub const RECV_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB receive buffer
-pub const SEND_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB send buffer for burst handling
+pub const RECV_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB receive buffer (fine)
 pub const FRAME_HEADER_SIZE: u32 = 4;
-pub const MAX_MESSAGE_SIZE: u32 = 4 * 16384;
+
+// Receive-side max message size (your protocol frames are small; keep large if you want)
+pub const MAX_MESSAGE_SIZE: u32 = 4 * 16384; // 65536
+
+// Write-side framing: MATCH C EXACTLY
+pub const MAX_FRAMED_MESSAGE_SIZE: u32 = 4096; // C: MAX_FRAMED_MESSAGE_SIZE
+pub const FRAMING_BUFFER_SIZE: u32 = MAX_FRAMED_MESSAGE_SIZE + FRAME_HEADER_SIZE + 256; // C: FRAMING_BUFFER_SIZE
+
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
-/// Maximum messages to drain from output queue per write event (for batch drain)
+/// NOTE: With C-style write_state, we don't batch-drain into a giant send buffer.
+/// We keep this constant for compatibility; it's no longer used for write buffering.
 pub const MAX_OUTPUT_DRAIN_PER_WRITE: u32 = 1024;
 
 const RECV_COMPACT_THRESHOLD: u32 = RECV_BUFFER_SIZE / 2;
 
 comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
-    std.debug.assert(SEND_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
     std.debug.assert(MAX_MESSAGE_SIZE > 0);
     std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
     std.debug.assert(FRAME_HEADER_SIZE == 4);
+
+    // C-style write buffer invariants
+    std.debug.assert(FRAMING_BUFFER_SIZE > MAX_FRAMED_MESSAGE_SIZE + FRAME_HEADER_SIZE);
 }
 
 // ============================================================================
@@ -124,29 +138,28 @@ pub const TcpClient = struct {
     client_id: config.ClientId = 0,
     state: ClientState = .disconnected,
 
-    // === Heap-Allocated Buffers ===
+    // === Heap-Allocated Buffers (receive only; send is now fixed write_state) ===
     recv_buf: ?[]u8 = null,
-    send_buf: ?[]u8 = null,
     allocator: ?std.mem.Allocator = null,
 
     // === Receive Buffer Indices ===
     recv_read: u32 = 0,
     recv_write: u32 = 0,
 
-    // === Send Buffer Indices ===
-    send_len: u32 = 0,
-    send_pos: u32 = 0,
-
     // === Protocol ===
     protocol: codec.Protocol = .unknown,
 
     // === Output Queue (from OutputRouter) ===
-    /// Pointer to this client's output queue in OutputRouter
-    /// Set by ThreadedServer when client connects
     output_queue: ?*OutputQueue = null,
 
-    // === Encode buffer for output queue draining ===
-    encode_buf: [256]u8 = undefined,
+    // === Encode buffer (payload only) ===
+    encode_buf: [MAX_FRAMED_MESSAGE_SIZE]u8 = undefined,
+
+    // === C-style Write State (ONE framed message pending) ===
+    has_pending_write: bool = false,
+    write_total_len: u32 = 0,
+    write_written: u32 = 0,
+    write_buf: [FRAMING_BUFFER_SIZE]u8 = undefined,
 
     // === Error Tracking ===
     consecutive_errors: u32 = 0,
@@ -172,9 +185,6 @@ pub const TcpClient = struct {
         const recv_buf = try allocator.alloc(u8, RECV_BUFFER_SIZE);
         errdefer allocator.free(recv_buf);
 
-        const send_buf = try allocator.alloc(u8, SEND_BUFFER_SIZE);
-        errdefer allocator.free(send_buf);
-
         const now = std.time.timestamp();
 
         return .{
@@ -182,15 +192,18 @@ pub const TcpClient = struct {
             .client_id = client_id,
             .state = .connected,
             .recv_buf = recv_buf,
-            .send_buf = send_buf,
             .allocator = allocator,
             .recv_read = 0,
             .recv_write = 0,
-            .send_len = 0,
-            .send_pos = 0,
             .protocol = .unknown,
             .output_queue = null,
             .encode_buf = undefined,
+
+            .has_pending_write = false,
+            .write_total_len = 0,
+            .write_written = 0,
+            .write_buf = undefined,
+
             .consecutive_errors = 0,
             .stats = ClientStats.init(),
             .connect_time = now,
@@ -204,7 +217,6 @@ pub const TcpClient = struct {
         }
         if (self.allocator) |alloc| {
             if (self.recv_buf) |buf| alloc.free(buf);
-            if (self.send_buf) |buf| alloc.free(buf);
         }
         self.* = .{};
     }
@@ -225,12 +237,10 @@ pub const TcpClient = struct {
     // Output Queue
     // ========================================================================
 
-    /// Set the output queue pointer (called by ThreadedServer on connect)
     pub fn setOutputQueue(self: *Self, queue: *OutputQueue) void {
         self.output_queue = queue;
     }
 
-    /// Check if there are messages in the output queue
     pub fn hasOutputQueueMessages(self: *const Self) bool {
         if (self.output_queue) |queue| {
             return !queue.isEmpty();
@@ -238,15 +248,83 @@ pub const TcpClient = struct {
         return false;
     }
 
-    /// Drain exactly ONE message from output queue into send buffer.
-    /// This matches the C server's process_output_queues() behavior:
-    /// - One message per client per iteration
-    /// - Ensures fair distribution across clients
-    /// - Prevents slow clients from blocking fast ones
-    /// Returns 1 if a message was drained, 0 otherwise.
+    // ========================================================================
+    // C-style write_state helpers
+    // ========================================================================
+
+    fn initWriteState(self: *Self, payload: []const u8) bool {
+        if (payload.len == 0) return false;
+
+        if (payload.len > MAX_FRAMED_MESSAGE_SIZE) {
+            // This matches C behavior: reject too-large framed payloads.
+            self.stats.frames_dropped += 1;
+            return false;
+        }
+
+        // [4-byte big-endian length][payload]
+        std.mem.writeInt(u32, self.write_buf[0..4], @intCast(payload.len), .big);
+        @memcpy(self.write_buf[4..][0..payload.len], payload);
+
+        self.write_total_len = FRAME_HEADER_SIZE + @as(u32, @intCast(payload.len));
+        self.write_written = 0;
+        self.has_pending_write = true;
+        return true;
+    }
+
+    /// Attempt ONE non-blocking send() for the current pending framed message.
+    /// Returns:
+    /// - true  if the pending message is complete (no longer pending)
+    /// - false if still pending (partial write)
+    /// Errors:
+    /// - error.WouldBlock on EAGAIN/EWOULDBLOCK
+    pub fn flushWriteStateOnce(self: *Self) !bool {
+        if (!self.has_pending_write) return true;
+
+        const remaining: u32 = self.write_total_len - self.write_written;
+        if (remaining == 0) {
+            self.has_pending_write = false;
+            self.write_total_len = 0;
+            self.write_written = 0;
+            return true;
+        }
+
+        const slice = self.write_buf[self.write_written..self.write_total_len];
+
+        const sent = posix.send(self.fd, slice, SEND_FLAGS) catch |err| {
+            if (net_utils.isWouldBlock(err)) {
+                self.stats.send_would_block += 1;
+                return error.WouldBlock;
+            }
+            return err;
+        };
+
+        self.stats.send_calls += 1;
+        self.write_written += @intCast(sent);
+        self.stats.bytes_sent += sent;
+        self.touch();
+
+        if (self.write_written >= self.write_total_len) {
+            self.has_pending_write = false;
+            self.write_total_len = 0;
+            self.write_written = 0;
+            self.stats.send_full_flushes += 1;
+            return true;
+        }
+        return false;
+    }
+
+    /// True if there is a pending write in progress.
+    pub fn hasPendingWrite(self: *const Self) bool {
+        return self.has_pending_write;
+    }
+
+    /// Drain exactly ONE message from output queue into write_state.
+    /// IMPORTANT: Does nothing if there is already a pending write.
+    /// Returns 1 if a message was dequeued and write_state initialized.
     pub fn drainOutputQueueOne(self: *Self) u32 {
+        if (self.has_pending_write) return 0;
+
         const queue = self.output_queue orelse return 0;
-        const send_buf = self.send_buf orelse return 0;
 
         // Pop ONE message from queue
         const output = queue.pop() orelse return 0;
@@ -254,94 +332,35 @@ pub const TcpClient = struct {
 
         const use_binary = (self.protocol == .binary);
 
-        // Encode message
+        // Encode payload into encode_buf (payload only; framing in initWriteState)
         const encoded_len = if (use_binary)
             binary_codec.encodeOutput(out_msg, &self.encode_buf) catch {
-                // Encode error - message lost
+                self.stats.decode_errors += 1;
                 return 0;
             }
         else
             csv_codec.encodeOutput(out_msg, &self.encode_buf) catch {
+                self.stats.decode_errors += 1;
                 return 0;
             };
 
-        // Check if we have space in send buffer (with framing)
-        const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(encoded_len));
-        const available = SEND_BUFFER_SIZE - self.send_len;
-        if (frame_size > available) {
-            // Send buffer full - this message is lost
-            // In production, we'd want to handle this better
-            std.log.warn("TcpClient: Send buffer full, dropping message for client {}", .{self.client_id});
+        // Initialize write state (C-style). If too large, it's dropped.
+        if (!self.initWriteState(self.encode_buf[0..encoded_len])) {
+            // Too large or invalid
             self.stats.buffer_overflows += 1;
             return 0;
         }
 
-        // Write frame header (4-byte big-endian length)
-        const hdr = send_buf[self.send_len..][0..4];
-        std.mem.writeInt(u32, hdr, @intCast(encoded_len), .big);
-        self.send_len += FRAME_HEADER_SIZE;
-
-        // Write encoded payload
-        @memcpy(send_buf[self.send_len..][0..encoded_len], self.encode_buf[0..encoded_len]);
-        self.send_len += @intCast(encoded_len);
-
         self.stats.output_queue_drained += 1;
         self.stats.messages_sent += 1;
-
         return 1;
     }
 
-    /// Drain multiple messages from output queue into send buffer.
-    /// Use this for batch processing in EPOLLOUT handler.
-    /// Returns number of messages drained.
+    /// Legacy: batch drain (no longer used in C-style design).
+    /// Kept for compatibility; now just drains at most 1 because we only allow
+    /// one pending write at a time.
     pub fn drainOutputQueue(self: *Self) u32 {
-        const queue = self.output_queue orelse return 0;
-        const send_buf = self.send_buf orelse return 0;
-
-        var drained: u32 = 0;
-        const use_binary = (self.protocol == .binary);
-
-        while (drained < MAX_OUTPUT_DRAIN_PER_WRITE) {
-            // Pop message from queue
-            const output = queue.pop() orelse break;
-            const out_msg = &output.message;
-
-            // Encode message
-            const encoded_len = if (use_binary)
-                binary_codec.encodeOutput(out_msg, &self.encode_buf) catch {
-                    // Encode error - skip this message
-                    continue;
-                }
-            else
-                csv_codec.encodeOutput(out_msg, &self.encode_buf) catch {
-                    continue;
-                };
-
-            // Check if we have space in send buffer (with framing)
-            const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(encoded_len));
-            const available = SEND_BUFFER_SIZE - self.send_len;
-            if (frame_size > available) {
-                // Send buffer full - can't drain more
-                std.log.warn("TcpClient: Send buffer full, dropping message for client {}", .{self.client_id});
-                self.stats.buffer_overflows += 1;
-                break;
-            }
-
-            // Write frame header (4-byte big-endian length)
-            const hdr = send_buf[self.send_len..][0..4];
-            std.mem.writeInt(u32, hdr, @intCast(encoded_len), .big);
-            self.send_len += FRAME_HEADER_SIZE;
-
-            // Write encoded payload
-            @memcpy(send_buf[self.send_len..][0..encoded_len], self.encode_buf[0..encoded_len]);
-            self.send_len += @intCast(encoded_len);
-
-            drained += 1;
-            self.stats.output_queue_drained += 1;
-            self.stats.messages_sent += 1;
-        }
-
-        return drained;
+        return self.drainOutputQueueOne();
     }
 
     // ========================================================================
@@ -454,7 +473,7 @@ pub const TcpClient = struct {
     }
 
     // ========================================================================
-    // Frame Extraction
+    // Frame Extraction (Receive-side framing)
     // ========================================================================
 
     pub fn extractFrame(self: *Self) FrameResult {
@@ -468,6 +487,7 @@ pub const TcpClient = struct {
         const msg_len = std.mem.readInt(u32, hdr, .big);
 
         if (msg_len > MAX_MESSAGE_SIZE) {
+            // Protocol error / oversized input; drop header and move on
             self.recv_read += FRAME_HEADER_SIZE;
             self.stats.frames_dropped += 1;
             if (self.recv_read == self.recv_write) {
@@ -497,134 +517,68 @@ pub const TcpClient = struct {
     }
 
     // ========================================================================
-    // Send Operations
+    // Send Operations (Compatibility wrappers)
     // ========================================================================
 
-    /// Queue a framed message for sending.
-    /// Returns false if buffer is full.
+    /// Legacy API: queue a framed message for sending.
+    /// With C-style write_state, this only succeeds if no pending write exists.
     pub fn queueFramedSend(self: *Self, data: []const u8) bool {
-        const send_buf = self.send_buf orelse return false;
-        const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(data.len));
-        const available = SEND_BUFFER_SIZE - self.send_len;
-
-        if (frame_size > available) {
+        if (self.has_pending_write) {
             self.stats.buffer_overflows += 1;
             return false;
         }
-
-        // Write length header
-        const hdr = send_buf[self.send_len..][0..4];
-        std.mem.writeInt(u32, hdr, @intCast(data.len), .big);
-        self.send_len += FRAME_HEADER_SIZE;
-
-        // Write payload
-        @memcpy(send_buf[self.send_len..][0..data.len], data);
-        self.send_len += @intCast(data.len);
-
-        return true;
+        return self.initWriteState(data);
     }
 
-    /// Queue raw data without framing.
+    /// Legacy API: queue raw data without framing (rarely used in your engine).
+    /// For safety, we still frame it the same way; TCP stream requires framing.
     pub fn queueRawSend(self: *Self, data: []const u8) bool {
-        const send_buf = self.send_buf orelse return false;
-        const available = SEND_BUFFER_SIZE - self.send_len;
-
-        if (data.len > available) {
-            self.stats.buffer_overflows += 1;
-            return false;
-        }
-
-        @memcpy(send_buf[self.send_len..][0..data.len], data);
-        self.send_len += @intCast(data.len);
-
-        return true;
+        return self.queueFramedSend(data);
     }
 
-    /// Flush send buffer - SINGLE send() call, non-blocking.
-    /// Returns WouldBlock if socket isn't ready (caller should enable EPOLLOUT).
-    /// Returns normally when some data was sent (may still have pending data).
+    /// Legacy API: flush send buffer once.
+    /// Now flushes the pending write_state once.
     pub fn flushSend(self: *Self) !void {
-        if (self.send_pos >= self.send_len) return; // Nothing to send
-
-        const send_buf = self.send_buf orelse return;
-
-        const sent = posix.send(
-            self.fd,
-            send_buf[self.send_pos..self.send_len],
-            SEND_FLAGS,
-        ) catch |err| {
-            if (net_utils.isWouldBlock(err)) {
-                self.stats.send_would_block += 1;
-                return error.WouldBlock;
-            }
-            return err;
-        };
-
-        self.stats.send_calls += 1;
-        self.send_pos += @intCast(sent);
-        self.stats.bytes_sent += sent;
-        self.touch();
-
-        // Check if we sent everything
-        if (self.send_pos == self.send_len) {
-            // Buffer fully sent, reset
-            self.send_pos = 0;
-            self.send_len = 0;
-            self.stats.send_full_flushes += 1;
-        }
-        // If not fully sent, caller should enable EPOLLOUT and call again later
+        _ = try self.flushWriteStateOnce();
     }
 
-    /// Flush send buffer completely (blocking-style, for shutdown).
-    /// Loops until all data sent or error.
+    /// Legacy API: flush fully (shutdown).
+    /// This now loops on the pending message until complete.
     pub fn flushSendFully(self: *Self) !void {
-        const send_buf = self.send_buf orelse return;
-
         var attempts: u32 = 0;
         const max_attempts: u32 = 10000;
 
-        while (self.send_pos < self.send_len and attempts < max_attempts) : (attempts += 1) {
-            const sent = posix.send(
-                self.fd,
-                send_buf[self.send_pos..self.send_len],
-                SEND_FLAGS,
-            ) catch |err| {
-                if (net_utils.isWouldBlock(err)) {
-                    self.stats.send_would_block += 1;
+        while (self.has_pending_write and attempts < max_attempts) : (attempts += 1) {
+            const done = self.flushWriteStateOnce() catch |err| {
+                if (err == error.WouldBlock) {
                     std.Thread.sleep(100_000); // 100us
                     continue;
                 }
                 return err;
             };
-
-            self.stats.send_calls += 1;
-            self.send_pos += @intCast(sent);
-            self.stats.bytes_sent += sent;
-        }
-
-        if (self.send_pos == self.send_len) {
-            self.send_pos = 0;
-            self.send_len = 0;
+            if (done) break;
         }
     }
 
+    /// Legacy API: indicates if socket has pending data to send.
     pub fn hasPendingSend(self: *const Self) bool {
-        return self.send_pos < self.send_len;
+        return self.has_pending_write;
     }
 
-    /// Check if there's work to do (pending send OR output queue messages)
     pub fn hasWorkToDo(self: *const Self) bool {
-        if (self.hasPendingSend()) return true;
+        if (self.hasPendingWrite()) return true;
         if (self.hasOutputQueueMessages()) return true;
         return false;
     }
 
+    /// Approximate send buffer usage (compat): 0 or 100 depending on pending.
     pub fn getSendBufferUsage(self: *const Self) u32 {
-        return (self.send_len * 100) / SEND_BUFFER_SIZE;
+        return if (self.has_pending_write) 100 else 0;
     }
 
     pub fn getPendingSendBytes(self: *const Self) u32 {
-        return self.send_len - self.send_pos;
+        if (!self.has_pending_write) return 0;
+        return self.write_total_len - self.write_written;
     }
 
     pub fn recordMessageSent(self: *Self) void {
@@ -751,3 +705,4 @@ pub fn ClientPool(comptime capacity: u32) type {
         };
     };
 }
+
