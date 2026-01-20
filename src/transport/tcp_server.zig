@@ -337,11 +337,15 @@ pub const TcpServer = struct {
         // CRITICAL: Process output queues FIRST, before epoll_wait
         // This matches C server's tcp_listener.c architecture exactly
         // ================================================================
-        self.processOutputQueues();
+        const has_output_work = self.processOutputQueues();
+
+        // Use timeout=0 if we have pending output work to maintain throughput
+        // This ensures we don't block waiting for input when outputs are ready
+        const effective_timeout = if (has_output_work) 0 else timeout_ms;
 
         // Now wait for events
         var results: [MAX_EVENTS]PollResult = undefined;
-        const events = try poller.wait(&results, timeout_ms);
+        const events = try poller.wait(&results, effective_timeout);
 
         var processed: usize = 0;
         for (events) |ev| {
@@ -371,8 +375,11 @@ pub const TcpServer = struct {
     /// 4. Try immediate write()
     /// 5. If partial write or EAGAIN, enable EPOLLOUT
     /// 6. Loop continues to next client
-    fn processOutputQueues(self: *Self) void {
+    ///
+    /// Returns true if any client has more output work pending
+    fn processOutputQueues(self: *Self) bool {
         var clients_processed: u32 = 0;
+        var has_more_work: bool = false;
         var iter = self.clients.getActive();
 
         while (iter.next()) |client| {
@@ -382,6 +389,7 @@ pub const TcpServer = struct {
             // Skip if already has pending write data (matches C server)
             // This prevents piling up multiple messages in the send buffer
             if (client.hasPendingSend()) {
+                has_more_work = true;
                 continue;
             }
 
@@ -397,11 +405,17 @@ pub const TcpServer = struct {
                 continue;
             }
 
+            // Track if there's more work after draining one
+            if (client.hasOutputQueueMessages()) {
+                has_more_work = true;
+            }
+
             // Try immediate write (like C server's process_output_queues)
             client.flushSend() catch |err| {
                 if (err == error.WouldBlock) {
                     // Socket buffer full - enable EPOLLOUT
                     self.updateClientPoller(client, true) catch {};
+                    has_more_work = true;
                 } else {
                     // Fatal error - will be cleaned up later
                     self.error_disconnects += 1;
@@ -412,8 +426,11 @@ pub const TcpServer = struct {
             // If we still have pending data after flush, enable EPOLLOUT
             if (client.hasPendingSend()) {
                 self.updateClientPoller(client, true) catch {};
+                has_more_work = true;
             }
         }
+
+        return has_more_work;
     }
 
     /// Legacy method - now just calls processOutputQueues

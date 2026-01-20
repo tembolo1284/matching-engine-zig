@@ -65,27 +65,36 @@ pub const TRACK_LATENCY: bool = false;
 const PANIC_ON_CRITICAL_DROP: bool = std.debug.runtime_safety;
 
 /// Spin iterations before yielding in main loop when idle
-const IDLE_SPIN_COUNT: u32 = 100;
+const IDLE_SPIN_COUNT: u32 = 1000;
 
-/// Consecutive idle polls before sleeping
+/// Consecutive idle polls (with yields) before sleeping
+const IDLE_YIELD_THRESHOLD: u32 = 100;
+
+/// Consecutive yields before sleeping
 const IDLE_SLEEP_THRESHOLD: u32 = 1000;
+
+/// Sleep duration when truly idle (nanoseconds)
+/// Keep very short to maintain responsiveness
+const IDLE_SLEEP_NS: u64 = 100; // 100ns - minimal sleep
 
 comptime {
     // CHANNEL_CAPACITY must be power of 2
     std.debug.assert(CHANNEL_CAPACITY > 0);
     std.debug.assert((CHANNEL_CAPACITY & (CHANNEL_CAPACITY - 1)) == 0);
-
     // Iteration limits must be reasonable
     std.debug.assert(MAX_POLL_ITERATIONS > 0);
     std.debug.assert(MAX_POLL_ITERATIONS <= CHANNEL_CAPACITY);
     std.debug.assert(MAX_DRAIN_ITERATIONS > 0);
     std.debug.assert(MAX_DRAIN_ITERATIONS <= CHANNEL_CAPACITY * 2);
-
     // Spin/yield counts must be bounded
     std.debug.assert(OUTPUT_SPIN_COUNT > 0);
     std.debug.assert(OUTPUT_SPIN_COUNT <= 10000);
     std.debug.assert(OUTPUT_YIELD_COUNT > 0);
     std.debug.assert(OUTPUT_YIELD_COUNT <= 1000);
+    // Idle thresholds must be in correct order
+    std.debug.assert(IDLE_SPIN_COUNT > 0);
+    std.debug.assert(IDLE_YIELD_THRESHOLD > 0);
+    std.debug.assert(IDLE_SLEEP_THRESHOLD > IDLE_YIELD_THRESHOLD);
 }
 
 // ============================================================================
@@ -139,7 +148,6 @@ pub const ProcessorId = enum(u8) {
 pub fn routeSymbol(symbol: msg.Symbol) ProcessorId {
     const first = symbol[0];
     if (first == 0) return .processor_0;
-
     const upper = first & 0xDF; // Convert to uppercase
     if (upper >= 'A' and upper <= 'M') return .processor_0;
     return .processor_1;
@@ -180,7 +188,6 @@ pub const ProcessorStats = struct {
 
 pub const Processor = struct {
     id: ProcessorId,
-
     pools: *MemoryPools,
     engine: *MatchingEngine,
     input: *InputQueue,
@@ -236,12 +243,9 @@ pub const Processor = struct {
 
     pub fn deinit(self: *Self) void {
         self.stop();
-
         self.engine.deinit();
         self.allocator.destroy(self.engine);
-
         self.allocator.destroy(self.output_buffer);
-
         self.pools.deinit();
     }
 
@@ -292,14 +296,22 @@ pub const Processor = struct {
 
         while (self.running.load(.acquire)) {
             const processed = self.pollOnce();
+
             if (processed == 0) {
                 consecutive_idle += 1;
                 self.idle_cycles +|= 1;
 
-                if (consecutive_idle > IDLE_SLEEP_THRESHOLD) {
-                    std.Thread.sleep(10 * std.time.ns_per_us);
-                } else if (consecutive_idle > IDLE_SPIN_COUNT) {
+                // Progressive backoff: spin → yield → sleep
+                // But keep everything very fast to maintain low latency
+                if (consecutive_idle < IDLE_SPIN_COUNT) {
+                    // Hot spin - just hint to CPU
+                    std.atomic.spinLoopHint();
+                } else if (consecutive_idle < IDLE_SLEEP_THRESHOLD) {
+                    // Yield to other threads
                     std.Thread.yield() catch {};
+                } else {
+                    // Brief sleep - but very short!
+                    std.Thread.sleep(IDLE_SLEEP_NS);
                 }
             } else {
                 consecutive_idle = 0;
@@ -350,7 +362,6 @@ pub const Processor = struct {
             0;
 
         const outputs = self.output_buffer.slice();
-
         for (outputs) |out_msg| {
             // IMPORTANT FIX: carry client_id in ProcessorOutput
             const proc_output = ProcessorOutput{
@@ -409,7 +420,6 @@ pub const Processor = struct {
 
         if (is_critical) {
             self.critical_drops += 1;
-
             std.log.err(
                 "CRITICAL OUTPUT DROPPED: {s} type={s} client={d} symbol={s} user={d} order={d}",
                 .{
@@ -427,7 +437,6 @@ pub const Processor = struct {
                     },
                 },
             );
-
             if (PANIC_ON_CRITICAL_DROP) {
                 @panic("Critical output message dropped - output queue overflow");
             }
@@ -443,7 +452,6 @@ pub const Processor = struct {
 
     fn drainRemaining(self: *Self) void {
         var drained: u32 = 0;
-
         while (drained < MAX_DRAIN_ITERATIONS) : (drained += 1) {
             const input_msg = self.input.pop() orelse break;
             self.handleMessage(&input_msg);
@@ -534,6 +542,7 @@ test "ProcessorStats default values" {
         .non_critical_drops = 0,
         .idle_cycles = 0,
     };
+
     try std.testing.expectEqual(@as(u64, 0), stats.messages_processed);
     try std.testing.expectEqual(@as(u64, 0), stats.critical_drops);
     try std.testing.expect(stats.isHealthy());
@@ -555,6 +564,7 @@ test "ProcessorStats average processing time" {
         .non_critical_drops = 0,
         .idle_cycles = 0,
     };
+
     try std.testing.expectEqual(@as(i64, 10000), stats.avgProcessingTimeNs());
 }
 
@@ -563,13 +573,17 @@ test "PushResult flags" {
     const spin_path = Processor.PushResult{ .success = true, .spin_waited = true, .yield_waited = false };
     const yield_path = Processor.PushResult{ .success = true, .spin_waited = true, .yield_waited = true };
     const failed = Processor.PushResult{ .success = false, .spin_waited = true, .yield_waited = true };
+
     try std.testing.expect(fast_path.success);
     try std.testing.expect(!fast_path.spin_waited);
+
     try std.testing.expect(spin_path.success);
     try std.testing.expect(spin_path.spin_waited);
     try std.testing.expect(!spin_path.yield_waited);
+
     try std.testing.expect(yield_path.success);
     try std.testing.expect(yield_path.yield_waited);
+
     try std.testing.expect(!failed.success);
 }
 
@@ -589,4 +603,3 @@ test "Configuration constants are valid" {
     try std.testing.expect(OUTPUT_SPIN_COUNT > 0);
     try std.testing.expect(OUTPUT_YIELD_COUNT > 0);
 }
-

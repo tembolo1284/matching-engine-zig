@@ -49,8 +49,12 @@ pub const MAX_TCP_CLIENTS: usize = 4096;
 /// Cache line size for alignment
 const CACHE_LINE_SIZE: usize = 64;
 
-/// Small idle sleep; router is queue-to-queue only, so it can be aggressive
-const SLEEP_TIME_NS: u64 = 1_000; // 1us
+/// Sleep time when idle - keep very short for responsiveness
+/// Router is queue-to-queue only, so it can afford to spin aggressively
+const SLEEP_TIME_NS: u64 = 100; // 100ns - minimal sleep
+
+/// Spin count before sleeping
+const IDLE_SPIN_COUNT: u32 = 1000;
 
 /// Drain bounds (P10 Rule 2)
 const MAX_DRAIN_PER_QUEUE_PER_TICK: usize = 8192;
@@ -345,11 +349,21 @@ pub const OutputRouter = struct {
 
     fn runLoop(self: *Self) void {
         var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
+        var consecutive_idle: u32 = 0;
 
         while (self.running.load(.acquire)) {
             const drained = self.drainOnce(batch[0..]);
             if (drained == 0) {
-                std.Thread.sleep(SLEEP_TIME_NS);
+                consecutive_idle += 1;
+                if (consecutive_idle < IDLE_SPIN_COUNT) {
+                    // Hot spin
+                    std.atomic.spinLoopHint();
+                } else {
+                    // Brief sleep
+                    std.Thread.sleep(SLEEP_TIME_NS);
+                }
+            } else {
+                consecutive_idle = 0;
             }
         }
     }
