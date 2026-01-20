@@ -76,6 +76,10 @@ const MAX_SENDS_PER_WRITABLE: u32 = 512;
 /// This matches C server's approach of processing all clients each iteration
 const MAX_CLIENTS_PER_OUTPUT_CYCLE: u32 = MAX_CLIENTS;
 
+/// Maximum messages to drain from output queue per client per cycle
+/// Higher value = better throughput, lower value = fairer distribution
+const MAX_DRAIN_PER_CLIENT: u32 = 64;
+
 /// Maximum client ID value - must fit within OutputRouter's registry.
 /// Client IDs cycle through [1, MAX_CLIENT_ID_VALUE].
 const MAX_CLIENT_ID_VALUE: config.ClientId = @intCast(output_router.MAX_TCP_CLIENTS - 1);
@@ -386,46 +390,56 @@ pub const TcpServer = struct {
             if (clients_processed >= MAX_CLIENTS_PER_OUTPUT_CYCLE) break;
             clients_processed += 1;
 
-            // Skip if already has pending write data (matches C server)
-            // This prevents piling up multiple messages in the send buffer
-            if (client.hasPendingSend()) {
-                has_more_work = true;
-                continue;
-            }
-
-            // Check if there are messages in the output queue
-            if (!client.hasOutputQueueMessages()) {
-                continue;
-            }
-
-            // Drain ONE message from output queue into send buffer
-            // (C server also processes one message at a time per client)
-            const drained = client.drainOutputQueueOne();
-            if (drained == 0) {
-                continue;
-            }
-
-            // Track if there's more work after draining one
-            if (client.hasOutputQueueMessages()) {
-                has_more_work = true;
-            }
-
-            // Try immediate write (like C server's process_output_queues)
-            client.flushSend() catch |err| {
-                if (err == error.WouldBlock) {
-                    // Socket buffer full - enable EPOLLOUT
-                    self.updateClientPoller(client, true) catch {};
-                    has_more_work = true;
-                } else {
-                    // Fatal error - will be cleaned up later
-                    self.error_disconnects += 1;
+            // Process multiple messages per client for better throughput
+            var messages_this_client: u32 = 0;
+            
+            while (messages_this_client < MAX_DRAIN_PER_CLIENT) : (messages_this_client += 1) {
+                // If we have pending send data, try to flush it first
+                if (client.hasPendingSend()) {
+                    client.flushSend() catch |err| {
+                        if (err == error.WouldBlock) {
+                            // Socket buffer full - enable EPOLLOUT and move to next client
+                            self.updateClientPoller(client, true) catch {};
+                            has_more_work = true;
+                            break;
+                        }
+                        // Fatal error
+                        self.error_disconnects += 1;
+                        break;
+                    };
+                    
+                    // If still have pending data after flush, can't add more
+                    if (client.hasPendingSend()) {
+                        has_more_work = true;
+                        break;
+                    }
                 }
-                continue;
-            };
 
-            // If we still have pending data after flush, enable EPOLLOUT
-            if (client.hasPendingSend()) {
-                self.updateClientPoller(client, true) catch {};
+                // Check if there are messages in the output queue
+                if (!client.hasOutputQueueMessages()) {
+                    break;
+                }
+
+                // Drain ONE message from output queue into send buffer
+                const drained = client.drainOutputQueueOne();
+                if (drained == 0) {
+                    break;
+                }
+
+                // Try immediate write
+                client.flushSend() catch |err| {
+                    if (err == error.WouldBlock) {
+                        self.updateClientPoller(client, true) catch {};
+                        has_more_work = true;
+                        break;
+                    }
+                    self.error_disconnects += 1;
+                    break;
+                };
+            }
+
+            // Check if there's still more work for this client
+            if (client.hasOutputQueueMessages() or client.hasPendingSend()) {
                 has_more_work = true;
             }
         }

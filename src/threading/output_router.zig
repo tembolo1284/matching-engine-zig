@@ -38,7 +38,7 @@ pub const OutputQueue = ClientOutputQueue;
 // ============================================================================
 
 pub const MAX_OUTPUT_QUEUES: usize = 2;
-pub const ROUTER_BATCH_SIZE: usize = 32;
+pub const ROUTER_BATCH_SIZE: usize = 256; // Increased from 32
 
 /// Maximum number of concurrent TCP clients supported.
 /// This determines the size of the client registry.
@@ -56,9 +56,9 @@ const SLEEP_TIME_NS: u64 = 100; // 100ns - minimal sleep
 /// Spin count before sleeping
 const IDLE_SPIN_COUNT: u32 = 1000;
 
-/// Drain bounds (P10 Rule 2)
-const MAX_DRAIN_PER_QUEUE_PER_TICK: usize = 8192;
-const MAX_TOTAL_DRAIN_PER_TICK: usize = 16384;
+/// Drain bounds (P10 Rule 2) - increased for better throughput
+const MAX_DRAIN_PER_QUEUE_PER_TICK: usize = 65536; // Was 8192
+const MAX_TOTAL_DRAIN_PER_TICK: usize = 131072;    // Was 16384
 
 // Compile-time validation
 comptime {
