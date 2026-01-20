@@ -20,7 +20,6 @@
 //!                                 ├→ Output Router ─┬→ Per-client queues (TCP)
 //!   Processor 1 → Output Queue 1 ┘                  └→ Multicast group (optional)
 //! ```
-
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
 const config = @import("../transport/config.zig");
@@ -41,6 +40,12 @@ pub const OutputQueue = ClientOutputQueue;
 pub const MAX_OUTPUT_QUEUES: usize = 2;
 pub const ROUTER_BATCH_SIZE: usize = 32;
 
+/// Maximum number of concurrent TCP clients supported.
+/// This determines the size of the client registry.
+/// TcpServer.MAX_CLIENTS should not exceed this value.
+/// Client IDs are assigned in range [1, MAX_TCP_CLIENTS].
+pub const MAX_TCP_CLIENTS: usize = 4096;
+
 /// Cache line size for alignment
 const CACHE_LINE_SIZE: usize = 64;
 
@@ -59,6 +64,8 @@ comptime {
     std.debug.assert(ROUTER_BATCH_SIZE <= 256);
     std.debug.assert(MAX_DRAIN_PER_QUEUE_PER_TICK > 0);
     std.debug.assert(MAX_TOTAL_DRAIN_PER_TICK >= MAX_DRAIN_PER_QUEUE_PER_TICK);
+    std.debug.assert(MAX_TCP_CLIENTS > 0);
+    std.debug.assert(MAX_TCP_CLIENTS <= 65536); // Reasonable upper bound
 }
 
 // ============================================================================
@@ -73,6 +80,7 @@ pub const RouterStats = struct {
     messages_from_processor: [MAX_OUTPUT_QUEUES]u64 = [_]u64{0} ** MAX_OUTPUT_QUEUES,
     mcast_messages: u64 = 0,
     mcast_errors: u64 = 0,
+    unknown_client_drops: u64 = 0,
 
     pub fn init() RouterStats {
         return .{};
@@ -89,16 +97,24 @@ pub const MulticastCallback = *const fn (out_msg: *const msg.OutputMsg, ctx: ?*a
 // Client Registry
 // ============================================================================
 
-/// Client registry - maps client_id to ClientOutputQueue pointer
-/// Matches C's tcp_client_registry_t concept
+/// Client registry - maps client_id to ClientOutputQueue pointer.
+///
+/// Design: Uses a fixed-size slot array indexed by client_id.
+/// Client IDs are assigned sequentially starting from 1 by TcpServer,
+/// wrapping around MAX_TCP_CLIENTS. This gives O(1) lookup.
+///
+/// The slot stores a pointer (as usize for atomic operations) to the
+/// ClientOutputQueue allocated for that client.
 const ClientRegistry = struct {
     /// Slot array: client_id -> queue pointer (stored as usize for atomics)
+    /// Index 0 is unused (CLIENT_ID_NONE = 0)
     slots: []std.atomic.Value(usize),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !ClientRegistry {
-        // Allocate slots for TCP client range (0 to CLIENT_ID_UDP_BASE)
-        const n: usize = @intCast(config.CLIENT_ID_UDP_BASE);
+        // Allocate slots for reasonable TCP client count
+        // Add 1 because client_id 0 is reserved (CLIENT_ID_NONE)
+        const n: usize = MAX_TCP_CLIENTS + 1;
         const slots = try allocator.alloc(std.atomic.Value(usize), n);
         for (slots) |*s| {
             s.* = std.atomic.Value(usize).init(0);
@@ -111,10 +127,23 @@ const ClientRegistry = struct {
         self.* = undefined;
     }
 
+    /// Convert client_id to slot index, with bounds checking.
+    /// Returns null for invalid client IDs.
+    ///
+    /// Assumes client IDs are assigned in range [1, MAX_TCP_CLIENTS] by TcpServer.
+    /// This gives direct O(1) indexing without hashing.
     fn idx(client_id: config.ClientId, len: usize) ?usize {
+        // Reject CLIENT_ID_NONE (0)
         if (client_id == 0) return null;
+
+        // Reject UDP clients (high bit set)
+        if (config.isUdpClient(client_id)) return null;
+
         const i: usize = @intCast(client_id);
+
+        // Bounds check - client ID must fit in our registry
         if (i >= len) return null;
+
         return i;
     }
 
@@ -193,6 +222,11 @@ pub const OutputRouter = struct {
             .stats = RouterStats.init(),
         };
 
+        std.log.info("OutputRouter initialized (max_clients={}, registry_slots={})", .{
+            MAX_TCP_CLIENTS,
+            self.registry.slots.len,
+        });
+
         return self;
     }
 
@@ -204,13 +238,16 @@ pub const OutputRouter = struct {
 
     pub fn start(self: *Self) !void {
         if (self.running.load(.acquire)) return error.AlreadyRunning;
+
         self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+
         std.log.info("OutputRouter started (processor_queues={d})", .{self.processor_queues.len});
     }
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
+
         self.running.store(false, .release);
         if (self.thread) |t| {
             t.join();
@@ -221,10 +258,11 @@ pub const OutputRouter = struct {
         var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
         _ = self.drainOnce(batch[0..]);
 
-        std.log.info("OutputRouter stopped (routed={}, dropped={}, critical_drops={})", .{
+        std.log.info("OutputRouter stopped (routed={}, dropped={}, critical_drops={}, unknown_client={})", .{
             self.stats.messages_routed,
             self.stats.messages_dropped,
             self.stats.critical_drops,
+            self.stats.unknown_client_drops,
         });
     }
 
@@ -249,8 +287,17 @@ pub const OutputRouter = struct {
     pub fn registerClient(self: *Self, client_id: config.ClientId) ?*ClientOutputQueue {
         if (client_id == 0) return null;
 
+        // Validate client_id is in TCP range
+        if (config.isUdpClient(client_id)) {
+            std.log.warn("OutputRouter: rejected UDP client_id {} for TCP registration", .{client_id});
+            return null;
+        }
+
         // Check if already registered
-        if (self.registry.get(client_id)) |existing| return existing;
+        if (self.registry.get(client_id)) |existing| {
+            std.log.debug("OutputRouter: client {} already registered, returning existing queue", .{client_id});
+            return existing;
+        }
 
         // Allocate new queue
         const q = self.allocator.create(ClientOutputQueue) catch {
@@ -260,19 +307,23 @@ pub const OutputRouter = struct {
         q.* = ClientOutputQueue.init();
 
         self.registry.set(client_id, q);
-        std.log.debug("OutputRouter: registered client {}", .{client_id});
+
+        std.log.debug("OutputRouter: registered client {} with new queue", .{client_id});
+
         return q;
     }
 
     /// Unregister a client and free its output queue
     pub fn unregisterClient(self: *Self, client_id: config.ClientId) void {
         if (client_id == 0) return;
+
         const q = self.registry.get(client_id);
         self.registry.set(client_id, null);
+
         if (q) |qq| {
             self.allocator.destroy(qq);
+            std.log.debug("OutputRouter: unregistered client {}", .{client_id});
         }
-        std.log.debug("OutputRouter: unregistered client {}", .{client_id});
     }
 
     /// Get client's output queue (for external access)
@@ -309,7 +360,6 @@ pub const OutputRouter = struct {
 
         for (self.processor_queues, 0..) |q, qi| {
             var per_q: usize = 0;
-
             while (per_q < MAX_DRAIN_PER_QUEUE_PER_TICK and total < MAX_TOTAL_DRAIN_PER_TICK) {
                 const want = @min(batch.len, MAX_DRAIN_PER_QUEUE_PER_TICK - per_q);
                 const got = q.popBatch(batch[0..want]);
@@ -326,10 +376,8 @@ pub const OutputRouter = struct {
                 per_q += got;
                 total += got;
             }
-
             if (total >= MAX_TOTAL_DRAIN_PER_TICK) break;
         }
-
         return total;
     }
 
@@ -364,6 +412,7 @@ pub const OutputRouter = struct {
         // Get client's queue
         const q = self.registry.get(client_id) orelse {
             self.stats.messages_dropped += 1;
+            self.stats.unknown_client_drops += 1;
             if (isCritical(out_msg)) self.stats.critical_drops += 1;
             return;
         };
@@ -441,4 +490,37 @@ test "OutputRouter - stats" {
     const stats = router.getStats();
     try std.testing.expectEqual(@as(u64, 0), stats.messages_routed);
     try std.testing.expectEqual(@as(u64, 0), stats.critical_drops);
+}
+
+test "OutputRouter - rejects UDP client IDs" {
+    const allocator = std.testing.allocator;
+
+    var queue = proc.OutputQueue{};
+    const queues = [_]*proc.OutputQueue{&queue};
+
+    var router = try OutputRouter.init(allocator, &queues);
+    defer router.deinit();
+
+    // UDP client IDs should be rejected
+    const udp_id = config.CLIENT_ID_UDP_BASE + 1;
+    const q = router.registerClient(udp_id);
+    try std.testing.expect(q == null);
+}
+
+test "ClientRegistry - idx bounds" {
+    const allocator = std.testing.allocator;
+
+    var registry = try ClientRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Valid TCP client ID
+    try std.testing.expect(ClientRegistry.idx(1, registry.slots.len) != null);
+    try std.testing.expect(ClientRegistry.idx(100, registry.slots.len) != null);
+
+    // CLIENT_ID_NONE should be rejected
+    try std.testing.expect(ClientRegistry.idx(0, registry.slots.len) == null);
+
+    // UDP client IDs should be rejected
+    try std.testing.expect(ClientRegistry.idx(config.CLIENT_ID_UDP_BASE, registry.slots.len) == null);
+    try std.testing.expect(ClientRegistry.idx(config.CLIENT_ID_UDP_BASE + 1, registry.slots.len) == null);
 }

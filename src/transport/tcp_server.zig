@@ -1,7 +1,5 @@
 //! TCP server with cross-platform I/O multiplexing.
 //!
-//! OPTIMIZED VERSION v6 - C Server Architecture Match
-//!
 //! Key change: Output queue processing happens BEFORE epoll_wait, matching
 //! the C server's tcp_listener.c pattern exactly. This ensures maximum
 //! output throughput.
@@ -19,11 +17,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+
 const msg = @import("../protocol/message_types.zig");
 const codec = @import("../protocol/codec.zig");
 const config = @import("config.zig");
 const net_utils = @import("net_utils.zig");
 const tcp_client = @import("tcp_client.zig");
+const output_router = @import("../threading/output_router.zig");
+
 pub const TcpClient = tcp_client.TcpClient;
 pub const ClientState = tcp_client.ClientState;
 pub const ClientStats = tcp_client.ClientStats;
@@ -31,6 +32,7 @@ pub const ClientStats = tcp_client.ClientStats;
 const is_linux = builtin.os.tag == .linux;
 const is_darwin = builtin.os.tag.isDarwin();
 const is_bsd = builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .netbsd;
+
 const linux = if (is_linux) std.os.linux else struct {};
 const c = std.c;
 
@@ -53,7 +55,10 @@ const PollResult = struct {
     events: EventType,
 };
 
+/// Maximum concurrent TCP clients.
+/// Must not exceed output_router.MAX_TCP_CLIENTS for client ID compatibility.
 pub const MAX_CLIENTS: u32 = 64;
+
 const MAX_EVENTS: u32 = 64;
 const LISTEN_BACKLOG: u31 = 128;
 const IDLE_CHECK_INTERVAL: u32 = 100;
@@ -71,6 +76,10 @@ const MAX_SENDS_PER_WRITABLE: u32 = 512;
 /// This matches C server's approach of processing all clients each iteration
 const MAX_CLIENTS_PER_OUTPUT_CYCLE: u32 = MAX_CLIENTS;
 
+/// Maximum client ID value - must fit within OutputRouter's registry.
+/// Client IDs cycle through [1, MAX_CLIENT_ID_VALUE].
+const MAX_CLIENT_ID_VALUE: config.ClientId = @intCast(output_router.MAX_TCP_CLIENTS - 1);
+
 comptime {
     std.debug.assert(MAX_CLIENTS > 0);
     std.debug.assert(MAX_EVENTS > 0);
@@ -79,6 +88,10 @@ comptime {
     std.debug.assert(MAX_FRAMES_PER_READ_EVENT >= MAX_FRAMES_PER_CHUNK);
     std.debug.assert(SOCKET_BUFFER_SIZE >= 64 * 1024);
     std.debug.assert(MAX_SENDS_PER_WRITABLE > 0);
+    // Ensure MAX_CLIENTS fits in OutputRouter's registry
+    std.debug.assert(MAX_CLIENTS <= output_router.MAX_TCP_CLIENTS);
+    std.debug.assert(MAX_CLIENT_ID_VALUE > 0);
+    std.debug.assert(MAX_CLIENT_ID_VALUE < output_router.MAX_TCP_CLIENTS);
 }
 
 pub const MessageCallback = *const fn (client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void;
@@ -290,8 +303,8 @@ pub const TcpServer = struct {
         self.poller = poller;
 
         const platform = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
-        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={s}, idle_timeout={}s)", .{
-            address, port, self.use_framing, MAX_CLIENTS, platform, self.idle_timeout_secs,
+        std.log.info("TCP server listening on {s}:{} (framing={}, max_clients={}, backend={s}, idle_timeout={}s, max_client_id={})", .{
+            address, port, self.use_framing, MAX_CLIENTS, platform, self.idle_timeout_secs, MAX_CLIENT_ID_VALUE,
         });
     }
 
@@ -329,8 +342,8 @@ pub const TcpServer = struct {
         // Now wait for events
         var results: [MAX_EVENTS]PollResult = undefined;
         const events = try poller.wait(&results, timeout_ms);
-        var processed: usize = 0;
 
+        var processed: usize = 0;
         for (events) |ev| {
             if (ev.fd == listen_fd) {
                 self.acceptConnections();
@@ -345,11 +358,12 @@ pub const TcpServer = struct {
         if (self.idle_timeout_secs > 0 and self.poll_cycles % IDLE_CHECK_INTERVAL == 0) {
             self.checkIdleClients();
         }
+
         return processed;
     }
 
     /// Process all client output queues - matches C server's process_output_queues()
-    /// 
+    ///
     /// Key behaviors from C server:
     /// 1. Skip clients that already have pending writes (has_pending_write)
     /// 2. Dequeue ONE message from the queue
@@ -360,29 +374,29 @@ pub const TcpServer = struct {
     fn processOutputQueues(self: *Self) void {
         var clients_processed: u32 = 0;
         var iter = self.clients.getActive();
-        
+
         while (iter.next()) |client| {
             if (clients_processed >= MAX_CLIENTS_PER_OUTPUT_CYCLE) break;
             clients_processed += 1;
-            
+
             // Skip if already has pending write data (matches C server)
             // This prevents piling up multiple messages in the send buffer
             if (client.hasPendingSend()) {
                 continue;
             }
-            
+
             // Check if there are messages in the output queue
             if (!client.hasOutputQueueMessages()) {
                 continue;
             }
-            
+
             // Drain ONE message from output queue into send buffer
             // (C server also processes one message at a time per client)
             const drained = client.drainOutputQueueOne();
             if (drained == 0) {
                 continue;
             }
-            
+
             // Try immediate write (like C server's process_output_queues)
             client.flushSend() catch |err| {
                 if (err == error.WouldBlock) {
@@ -394,7 +408,7 @@ pub const TcpServer = struct {
                 }
                 continue;
             };
-            
+
             // If we still have pending data after flush, enable EPOLLOUT
             if (client.hasPendingSend()) {
                 self.updateClientPoller(client, true) catch {};
@@ -421,6 +435,7 @@ pub const TcpServer = struct {
     fn acceptConnections(self: *Self) void {
         const listen_fd = self.listen_fd orelse return;
         var accepted: u32 = 0;
+
         while (accepted < MAX_ACCEPTS_PER_POLL) : (accepted += 1) {
             self.acceptOne(listen_fd) catch |err| {
                 if (err == error.WouldBlock) break;
@@ -432,6 +447,7 @@ pub const TcpServer = struct {
 
     fn acceptOne(self: *Self, listen_fd: posix.fd_t) !void {
         var poller = self.poller orelse return error.NotStarted;
+
         var client_addr: posix.sockaddr.in = undefined;
         var addr_len: posix.socklen_t = @sizeOf(@TypeOf(client_addr));
 
@@ -453,6 +469,7 @@ pub const TcpServer = struct {
         };
 
         const client_id = self.allocateClientId();
+
         client_slot.* = TcpClient.init(self.allocator, client_fd, client_id) catch {
             posix.close(client_fd);
             return;
@@ -515,7 +532,7 @@ pub const TcpServer = struct {
                     self.disconnectClient(client);
                     return;
                 };
-                
+
                 // If we still have pending data, keep EPOLLOUT enabled and return
                 if (client.hasPendingSend()) {
                     return;
@@ -535,7 +552,6 @@ pub const TcpServer = struct {
             self.updateClientPoller(client, false) catch {};
             return;
         }
-
         // Hit iteration limit - EPOLLOUT will fire again
     }
 
@@ -569,8 +585,10 @@ pub const TcpServer = struct {
 
     fn processFramedMessagesChunk(self: *Self, client: *TcpClient, max_frames: u32) u32 {
         var frames_processed: u32 = 0;
+
         while (frames_processed < max_frames) : (frames_processed += 1) {
             const frame_result = client.extractFrame();
+
             switch (frame_result) {
                 .frame => |payload| {
                     if (client.protocol == .unknown) client.protocol = codec.detectProtocol(payload);
@@ -600,6 +618,7 @@ pub const TcpServer = struct {
 
         while (processed < max_process) {
             const remaining = data[processed..];
+
             if (client.protocol == .unknown) {
                 client.protocol = codec.detectProtocol(remaining);
                 if (client.protocol == .unknown and remaining.len < 8) break;
@@ -608,6 +627,7 @@ pub const TcpServer = struct {
             const result = codec.Codec.decodeInput(remaining) catch |err| {
                 if (err == codec.CodecError.IncompleteMessage) break;
                 self.decode_errors += 1;
+
                 if (client.recordDecodeError()) {
                     self.error_disconnects += 1;
                     self.disconnectClient(client);
@@ -643,26 +663,33 @@ pub const TcpServer = struct {
 
     pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
         const client = self.clients.findById(client_id) orelse return false;
+
         const ok = if (self.use_framing) client.queueFramedSend(data) else client.queueRawSend(data);
         if (!ok) return false;
+
         client.recordMessageSent();
+
         if (client.hasPendingSend()) {
             self.updateClientPoller(client, true) catch return false;
         }
+
         return true;
     }
 
     pub fn broadcast(self: *Self, data: []const u8) u32 {
         var sent_count: u32 = 0;
         var iter = self.clients.getActive();
+
         while (iter.next()) |client| {
             if (client.state != .connected) continue;
             const ok = if (self.use_framing) client.queueFramedSend(data) else client.queueRawSend(data);
             if (!ok) continue;
             client.recordMessageSent();
+
             if (client.hasPendingSend()) self.updateClientPoller(client, true) catch {};
             sent_count += 1;
         }
+
         return sent_count;
     }
 
@@ -676,10 +703,12 @@ pub const TcpServer = struct {
 
     fn disconnectClientInternal(self: *Self, client: *TcpClient, invoke_callback: bool) void {
         if (client.state == .disconnected) return;
+
         const client_id = client.client_id;
         const fd = client.fd;
 
         if (self.poller) |*poller| poller.remove(fd);
+
         client.reset();
         self.clients.active_count -= 1;
         self.total_disconnections += 1;
@@ -701,19 +730,31 @@ pub const TcpServer = struct {
         }
     }
 
+    /// Allocate a unique client ID in range [1, MAX_CLIENT_ID_VALUE].
+    /// This ensures client IDs fit within OutputRouter's registry.
     fn allocateClientId(self: *Self) config.ClientId {
         var attempts: u32 = 0;
         const max_attempts = MAX_CLIENTS + 10;
+
         while (attempts < max_attempts) : (attempts += 1) {
             const id = self.next_client_id;
-            self.next_client_id +%= 1;
-            if (self.next_client_id == 0 or self.next_client_id >= config.CLIENT_ID_UDP_BASE) {
+
+            // Advance to next ID, wrapping within valid range
+            self.next_client_id += 1;
+            if (self.next_client_id > MAX_CLIENT_ID_VALUE) {
                 self.next_client_id = 1;
             }
+
+            // Check if ID is available (not in use by active client)
             if (self.clients.findById(id) == null) return id;
         }
+
+        // Fallback (should rarely happen with MAX_CLIENTS << MAX_CLIENT_ID_VALUE)
         const id = self.next_client_id;
-        self.next_client_id +%= 1;
+        self.next_client_id += 1;
+        if (self.next_client_id > MAX_CLIENT_ID_VALUE) {
+            self.next_client_id = 1;
+        }
         return id;
     }
 

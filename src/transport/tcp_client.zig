@@ -355,7 +355,7 @@ pub const TcpClient = struct {
     }
 
     /// Record that a message was sent (for stats tracking via direct sends)
-    pub fn recordMessageSent(self: *Self) void {
+    pub fn recordMessageSent(_: *Self) void {
         // Note: This is called by tcp_server for direct sends.
         // For output queue drains, messages_sent is incremented in flushSend()
         // when the send buffer is fully flushed.
@@ -634,7 +634,7 @@ pub fn ClientPool(comptime capacity: u32) type {
             return .{ .pool = self, .index = 0 };
         }
 
-        pub fn getAggregateStats(self: *Self) AggregateStats {
+        pub fn getAggregateStats(self: *const Self) AggregateStats {
             var agg = AggregateStats{};
             for (&self.clients) |*client| {
                 if (client.state.isActive()) {
