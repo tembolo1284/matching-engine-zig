@@ -38,7 +38,7 @@ const config = @import("../transport/config.zig");
 
 /// Queue capacity - must be power of 2 for efficient modulo
 /// Matches C's approach with ring buffer
-pub const QUEUE_CAPACITY: usize = 4096;
+pub const QUEUE_CAPACITY: usize = 8192;
 const QUEUE_MASK: usize = QUEUE_CAPACITY - 1;
 
 // Compile-time validation

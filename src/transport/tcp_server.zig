@@ -405,9 +405,10 @@ pub const TcpServer = struct {
             }
 
             // Check if there are messages in the output queue
-            if (!client.hasOutputQueueMessages()) {
-                continue;
-            }
+            // if (!client.hasOutputQueueMessages()) {
+            //     continue;
+            // }
+             
             // Drain ONE message from output queue into send buffer
             const drained: u32 = client.drainOutputQueueOne();
             

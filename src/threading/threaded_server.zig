@@ -70,7 +70,7 @@ pub const NUM_PROCESSORS: usize = 2;
 
 /// Poll timeout - 0 for maximum throughput, small value for responsiveness
 /// With C-style output processing, 0 is fine - outputs processed before wait
-const DEFAULT_POLL_TIMEOUT_MS: i32 = 0;
+const DEFAULT_POLL_TIMEOUT_MS: i32 = 1;
 
 /// UDP sizing
 const MAX_UDP_PAYLOAD: usize = 1400;
