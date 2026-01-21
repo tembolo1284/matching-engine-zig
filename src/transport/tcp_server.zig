@@ -63,8 +63,8 @@ const MAX_EVENTS: u32 = 64;
 const LISTEN_BACKLOG: u31 = 128;
 const IDLE_CHECK_INTERVAL: u32 = 100;
 const MAX_ACCEPTS_PER_POLL: u32 = 16;
-const MAX_FRAMES_PER_CHUNK: u32 = 256;
-const MAX_FRAMES_PER_READ_EVENT: u32 = 65536;
+const MAX_FRAMES_PER_CHUNK: u32 = 64;
+const MAX_FRAMES_PER_READ_EVENT: u32 = 256;
 const MAX_RAW_BYTES_PER_CHUNK: u32 = 16384;
 const MAX_RAW_BYTES_PER_READ_EVENT: u32 = 1024 * 1024;
 const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
@@ -268,7 +268,9 @@ pub const TcpServer = struct {
     idle_timeouts: u64 = 0,
     error_disconnects: u64 = 0,
     poll_cycles: u64 = 0,
-
+    
+    output_drain_calls: u64 = 0,
+    output_messages_drained: u64 = 0,
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -321,6 +323,10 @@ pub const TcpServer = struct {
             self.listen_fd = null;
         }
         std.log.info("TCP server stopped (total connections: {})", .{self.total_connections});
+        std.log.info("TCP server drain stats: calls={}, messages_drained={}", .{
+            self.output_drain_calls,
+            self.output_messages_drained
+        });
     }
 
     pub fn isRunning(self: *const Self) bool {
@@ -378,8 +384,12 @@ pub const TcpServer = struct {
     ///
     /// Returns true if any client has more output work pending
     fn processOutputQueues(self: *Self) bool {
+        self.output_drain_calls +=1;
+
         var clients_processed: u32 = 0;
         var has_more_work: bool = false;
+        var skipped_pending: u32 = 0;
+
         var iter = self.clients.getActive();
 
         while (iter.next()) |client| {
@@ -390,6 +400,7 @@ pub const TcpServer = struct {
             // This prevents piling up multiple messages in the send buffer
             if (client.hasPendingSend()) {
                 has_more_work = true;
+                skipped_pending += 1;
                 continue;
             }
 
@@ -397,9 +408,12 @@ pub const TcpServer = struct {
             if (!client.hasOutputQueueMessages()) {
                 continue;
             }
-
             // Drain ONE message from output queue into send buffer
-            const drained = client.drainOutputQueueOne();
+            const drained: u32 = client.drainOutputQueueOne();
+            
+            if (drained > 0) {
+                self.output_messages_drained += 1;
+            }
             if (drained == 0) {
                 continue;
             }
@@ -427,6 +441,10 @@ pub const TcpServer = struct {
                 self.updateClientPoller(client, true) catch {};
                 has_more_work = true;
             }
+        }
+
+        if (skipped_pending > 0) {
+            std.log.warn("Skipped {} clients due to pending send", .{skipped_pending});
         }
 
         return has_more_work;
@@ -508,7 +526,12 @@ pub const TcpServer = struct {
         if (self.on_connect) |cb| {
             if (cb(client_id, client_fd, self.callback_ctx)) |output_queue| {
                 client_slot.setOutputQueue(output_queue);
+                std.log.warn("Client {} output_queue SET", .{client_id});
+            } else {
+                std.log.warn("Client {} output_queue NOT SET (callback returned null)", .{client_id});
             }
+        } else {
+            std.log.warn("Client {} - no on_connect callback!", .{client_id});
         }
     }
 

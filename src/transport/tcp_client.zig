@@ -244,7 +244,9 @@ pub const TcpClient = struct {
 
     pub fn hasOutputQueueMessages(self: *const Self) bool {
         if (self.pending_output != null) return true;
-        if (self.output_queue) |q| return !q.isEmpty();
+        if (self.output_queue) |q| { 
+            return q.size() > 0;
+        }
         return false;
     }
 
