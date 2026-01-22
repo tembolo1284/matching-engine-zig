@@ -442,6 +442,11 @@ pub const OutputRouter = struct {
         }
 
         self.stats.messages_routed += 1;
+        
+        if (self.stats.messages_routed % 10000 == 0) {
+            const ts = std.time.milliTimestamp();
+            std.log.warn("OutputRouter: routed {} messages at ts={}", .{self.stats.messages_routed, ts});
+        }
 
         // Multicast is "side channel" for trade/TOB
         self.maybeMulticast(out_msg);

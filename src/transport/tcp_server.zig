@@ -63,8 +63,8 @@ const MAX_EVENTS: u32 = 64;
 const LISTEN_BACKLOG: u31 = 128;
 const IDLE_CHECK_INTERVAL: u32 = 100;
 const MAX_ACCEPTS_PER_POLL: u32 = 16;
-const MAX_FRAMES_PER_CHUNK: u32 = 64;
-const MAX_FRAMES_PER_READ_EVENT: u32 = 256;
+const MAX_FRAMES_PER_CHUNK: u32 = 16;
+const MAX_FRAMES_PER_READ_EVENT: u32 = 32;
 const MAX_RAW_BYTES_PER_CHUNK: u32 = 16384;
 const MAX_RAW_BYTES_PER_READ_EVENT: u32 = 1024 * 1024;
 const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
@@ -446,6 +446,11 @@ pub const TcpServer = struct {
 
         if (skipped_pending > 0) {
             std.log.warn("Skipped {} clients due to pending send", .{skipped_pending});
+        }
+
+        if (self.output_messages_drained % 10000 == 0 and self.output_messages_drained > 0) {
+            const ts = std.time.milliTimestamp();
+            std.log.warn("TcpServer: drained {} messages at ts={}", .{self.output_messages_drained, ts});
         }
 
         return has_more_work;
