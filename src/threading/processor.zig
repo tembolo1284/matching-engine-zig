@@ -384,6 +384,10 @@ pub const Processor = struct {
                 }
             }
         }
+        if (self.outputs_generated % 10000 == 0 and self.outputs_generated > 0) {
+            const ts = std.time.milliTimestamp();
+            std.log.warn("Processor {}: generated {} outputs at ts={}", .{@intFromEnum(self.id), self.outputs_generated, ts});
+        }
     }
 
     const PushResult = struct {

@@ -54,7 +54,7 @@ const CACHE_LINE_SIZE: usize = 64;
 const SLEEP_TIME_NS: u64 = 100; // 100ns - minimal sleep
 
 /// Spin count before sleeping
-const IDLE_SPIN_COUNT: u32 = 1000;
+const IDLE_SPIN_COUNT: u32 = 100000;
 
 /// Drain bounds (P10 Rule 2) - increased for better throughput
 const MAX_DRAIN_PER_QUEUE_PER_TICK: usize = 65536; // Was 8192
@@ -348,6 +348,9 @@ pub const OutputRouter = struct {
     // ------------------------------------------------------------------------
 
     fn runLoop(self: *Self) void {
+        for (self.processor_queues, 0..) |q, i| {
+            std.log.warn("OutputRouter sees queue[{}] at {x}", .{i, @intFromPtr(q)});
+        }
         var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
         var consecutive_idle: u32 = 0;
 
@@ -373,12 +376,20 @@ pub const OutputRouter = struct {
         var total: usize = 0;
 
         for (self.processor_queues, 0..) |q, qi| {
+            const q_size = q.size();
+            if (q_size > 0) {
+                std.log.warn("drainOnce: queue[{}] has {} items", .{qi, q_size});
+            }
+
             var per_q: usize = 0;
             while (per_q < MAX_DRAIN_PER_QUEUE_PER_TICK and total < MAX_TOTAL_DRAIN_PER_TICK) {
                 const want = @min(batch.len, MAX_DRAIN_PER_QUEUE_PER_TICK - per_q);
                 const got = q.popBatch(batch[0..want]);
                 if (got == 0) break;
-
+               
+                if (got > 100) {
+                    std.log.warn("drainOnce: popped {} from queue [{}]", .{got, qi});
+                }
                 if (qi < MAX_OUTPUT_QUEUES) {
                     self.stats.messages_from_processor[qi] += got;
                 }

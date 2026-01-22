@@ -1,6 +1,5 @@
 //! Threaded server with I/O thread, dual processor threads, and output router.
 //!
-//! VERSION v8 - C Server Architecture Match
 //!
 //! Thread Architecture:
 //! ```
@@ -223,10 +222,10 @@ pub const ServerStats = struct {
 };
 
 // ============================================================================
-// Threaded Server v8 - C Server Architecture Match
+// Threaded Server - C Server Architecture Match
 // ============================================================================
 
-pub const ThreadedServerV8 = struct {
+pub const ThreadedServer = struct {
     tcp: TcpServer,
     udp: UdpServer,
     multicast: MulticastPublisher,
@@ -273,6 +272,11 @@ pub const ThreadedServerV8 = struct {
         // REQUIRED FIX: pass a slice
         self.output_router = try OutputRouter.init(allocator, self.output_queues[0..]);
         errdefer if (self.output_router) |router| router.deinit();
+
+        std.log.warn("Queue addresses: output_queues[0]={x}, output_queues[1]={x}", .{
+            @intFromPtr(self.output_queues[0]),
+            @intFromPtr(self.output_queues[1]),
+        });
 
         self.tcp = TcpServer.init(allocator);
         self.udp = UdpServer.init();
@@ -373,10 +377,10 @@ pub const ThreadedServerV8 = struct {
         }
 
         if (self.output_router) |router| {
-            if (self.cfg.mcast_enabled) {
-                router.setMulticastEnabled(true);
-                router.setMulticastCallback(onMulticastPublish, self);
-            }
+            // if (self.cfg.mcast_enabled) {
+            //     router.setMulticastEnabled(true);
+            //     router.setMulticastCallback(onMulticastPublish, self);
+            // }
             try router.start();
         }
 
@@ -588,12 +592,4 @@ pub const ThreadedServerV8 = struct {
         self.running.store(false, .release);
     }
 };
-
-// ============================================================================
-// Backward Compatibility Aliases
-// ============================================================================
-
-pub const ThreadedServer = ThreadedServerV8;
-pub const ThreadedServerV7 = ThreadedServerV8;
-pub const ThreadedServerV6 = ThreadedServerV8;
 
