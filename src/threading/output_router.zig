@@ -14,7 +14,7 @@ pub const OutputQueue = ClientOutputQueue;
 // Configuration
 // ============================================================================
 pub const MAX_OUTPUT_QUEUES: usize = 2;
-pub const ROUTER_BATCH_SIZE: usize = 256;
+pub const ROUTER_BATCH_SIZE: usize = 32;
 pub const MAX_TCP_CLIENTS: usize = 4096;
 const SLEEP_TIME_NS: u64 = 100;
 const IDLE_SPIN_COUNT: u32 = 100000;

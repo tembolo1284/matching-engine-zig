@@ -72,7 +72,7 @@ const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
 
 /// Maximum send() flush loops per client per output drain cycle.
 /// This is the critical knob to avoid "1 msg per cycle" behavior.
-const MAX_PUMP_ITERS_PER_CLIENT: u32 = 8192;
+const MAX_PUMP_ITERS_PER_CLIENT: u32 = 1;
 
 /// Maximum client ID value - must fit within OutputRouter's registry.
 /// Client IDs cycle through [1, MAX_CLIENT_ID_VALUE].
