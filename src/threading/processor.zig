@@ -193,7 +193,6 @@ pub const Processor = struct {
     input: *InputQueue,
     output: *OutputQueue,
     output_buffer: *OutputBuffer,
-
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,
@@ -252,10 +251,8 @@ pub const Processor = struct {
     pub fn start(self: *Self) !void {
         std.debug.assert(!self.running.load(.acquire));
         std.debug.assert(self.thread == null);
-
         self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
-
         std.log.info("{s} started (latency_tracking={}, panic_on_critical_drop={})", .{
             self.id.name(),
             TRACK_LATENCY,
@@ -265,15 +262,12 @@ pub const Processor = struct {
 
     pub fn stop(self: *Self) void {
         if (!self.running.load(.acquire)) return;
-
         std.log.info("{s} stopping...", .{self.id.name()});
         self.running.store(false, .release);
-
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
-
         std.log.info(
             "{s} stopped (processed={d}, outputs={d}, backpressure={d}, spins={d}, yields={d}, critical_drops={d}, non_critical_drops={d})",
             .{
@@ -291,85 +285,64 @@ pub const Processor = struct {
 
     fn runLoop(self: *Self) void {
         std.log.debug("{s} thread started", .{self.id.name()});
-
         var consecutive_idle: u32 = 0;
-
         while (self.running.load(.acquire)) {
             const processed = self.pollOnce();
-
             if (processed == 0) {
                 consecutive_idle += 1;
                 self.idle_cycles +|= 1;
-
                 // Progressive backoff: spin → yield → sleep
-                // But keep everything very fast to maintain low latency
                 if (consecutive_idle < IDLE_SPIN_COUNT) {
-                    // Hot spin - just hint to CPU
                     std.atomic.spinLoopHint();
                 } else if (consecutive_idle < IDLE_SLEEP_THRESHOLD) {
-                    // Yield to other threads
                     std.Thread.yield() catch {};
                 } else {
-                    // Brief sleep - but very short!
                     std.Thread.sleep(IDLE_SLEEP_NS);
                 }
             } else {
                 consecutive_idle = 0;
             }
         }
-
         self.drainRemaining();
         std.log.debug("{s} thread exiting", .{self.id.name()});
     }
 
     fn pollOnce(self: *Self) usize {
         var count: usize = 0;
-
         while (count < MAX_POLL_ITERATIONS) : (count += 1) {
             const input_msg = self.input.pop() orelse break;
             self.handleMessage(&input_msg);
         }
-
         return count;
     }
 
     fn handleMessage(self: *Self, input: *const ProcessorInput) void {
         std.debug.assert(input.client_id != 0 or input.message.msg_type == .flush);
-
         const start_time: i128 = if (TRACK_LATENCY) std.time.nanoTimestamp() else 0;
-
         self.output_buffer.clear();
         self.engine.processMessage(&input.message, input.client_id, self.output_buffer);
-
         if (TRACK_LATENCY) {
             const end_time = std.time.nanoTimestamp();
             const processing_time = end_time - start_time;
             const queue_latency = start_time - input.enqueue_time_ns;
-
             const processing_i64: i64 = @intCast(@min(processing_time, std.math.maxInt(i64)));
             const queue_latency_i64: i64 = @intCast(@min(@max(queue_latency, 0), std.math.maxInt(i64)));
-
             self.total_processing_time_ns += processing_i64;
             self.min_latency_ns = @min(self.min_latency_ns, queue_latency_i64);
             self.max_latency_ns = @max(self.max_latency_ns, queue_latency_i64);
         }
-
         self.messages_processed += 1;
-
         const latency_for_output: i64 = if (TRACK_LATENCY)
             @intCast(@min(@max(std.time.nanoTimestamp() - input.enqueue_time_ns, 0), std.math.maxInt(i64)))
         else
             0;
-
         const outputs = self.output_buffer.slice();
         for (outputs) |out_msg| {
-            // IMPORTANT FIX: carry client_id in ProcessorOutput
             const proc_output = ProcessorOutput{
                 .client_id = input.client_id,
                 .message = out_msg,
                 .latency_ns = latency_for_output,
             };
-
             if (self.output.push(proc_output)) {
                 self.outputs_generated += 1;
             } else {
@@ -386,7 +359,7 @@ pub const Processor = struct {
         }
         if (self.outputs_generated % 10000 == 0 and self.outputs_generated > 0) {
             const ts = std.time.milliTimestamp();
-            std.log.warn("Processor {}: generated {} outputs at ts={}", .{@intFromEnum(self.id), self.outputs_generated, ts});
+            std.log.warn("Processor {}: generated {} outputs at ts={}", .{ @intFromEnum(self.id), self.outputs_generated, ts });
         }
     }
 
@@ -404,7 +377,6 @@ pub const Processor = struct {
                 return .{ .success = true, .spin_waited = true, .yield_waited = false };
             }
         }
-
         var yields: u32 = 0;
         while (yields < OUTPUT_YIELD_COUNT) : (yields += 1) {
             std.Thread.yield() catch {};
@@ -412,7 +384,6 @@ pub const Processor = struct {
                 return .{ .success = true, .spin_waited = true, .yield_waited = true };
             }
         }
-
         return .{ .success = false, .spin_waited = true, .yield_waited = true };
     }
 
@@ -421,7 +392,6 @@ pub const Processor = struct {
             .trade, .reject => true,
             .ack, .cancel_ack, .top_of_book => false,
         };
-
         if (is_critical) {
             self.critical_drops += 1;
             std.log.err(
@@ -460,11 +430,9 @@ pub const Processor = struct {
             const input_msg = self.input.pop() orelse break;
             self.handleMessage(&input_msg);
         }
-
         if (drained > 0) {
             std.log.debug("{s} drained {d} remaining messages", .{ self.id.name(), drained });
         }
-
         if (drained >= MAX_DRAIN_ITERATIONS) {
             const remaining = self.input.size();
             if (remaining > 0) {
@@ -546,7 +514,6 @@ test "ProcessorStats default values" {
         .non_critical_drops = 0,
         .idle_cycles = 0,
     };
-
     try std.testing.expectEqual(@as(u64, 0), stats.messages_processed);
     try std.testing.expectEqual(@as(u64, 0), stats.critical_drops);
     try std.testing.expect(stats.isHealthy());
@@ -568,7 +535,6 @@ test "ProcessorStats average processing time" {
         .non_critical_drops = 0,
         .idle_cycles = 0,
     };
-
     try std.testing.expectEqual(@as(i64, 10000), stats.avgProcessingTimeNs());
 }
 
@@ -580,14 +546,11 @@ test "PushResult flags" {
 
     try std.testing.expect(fast_path.success);
     try std.testing.expect(!fast_path.spin_waited);
-
     try std.testing.expect(spin_path.success);
     try std.testing.expect(spin_path.spin_waited);
     try std.testing.expect(!spin_path.yield_waited);
-
     try std.testing.expect(yield_path.success);
     try std.testing.expect(yield_path.yield_waited);
-
     try std.testing.expect(!failed.success);
 }
 

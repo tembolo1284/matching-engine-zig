@@ -203,23 +203,28 @@ pub const OutputRouter = struct {
     pub fn getStats(self: *const Self) RouterStats {
         return self.stats;
     }
+
+
     fn runLoop(self: *Self) void {
         var batch: [ROUTER_BATCH_SIZE]proc.ProcessorOutput = undefined;
         var consecutive_idle: u32 = 0;
+    
         while (self.running.load(.acquire)) {
             const drained = self.drainOnce(batch[0..]);
             if (drained == 0) {
                 consecutive_idle += 1;
-                if (consecutive_idle < IDLE_SPIN_COUNT) {
+                if (consecutive_idle < 1000) {  // Only 1000 spins
                     std.atomic.spinLoopHint();
                 } else {
-                    std.Thread.sleep(SLEEP_TIME_NS);
+                    std.Thread.sleep(1000);  // 1 microsecond
+                    consecutive_idle = 0;  // Reset after sleep
                 }
             } else {
                 consecutive_idle = 0;
             }
         }
     }
+
     fn drainOnce(self: *Self, batch: []proc.ProcessorOutput) usize {
         var total: usize = 0;
         for (self.processor_queues, 0..) |q, qi| {
