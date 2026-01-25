@@ -1,19 +1,12 @@
 //! TCP client connection state and buffer management.
 //!
-//! Matches the C server semantics in tcp_listener.c:
-//! - process_output_queues(): for each client, if active and NOT has_pending_write,
-//!   dequeue ONE output message, frame+format it, attempt immediate write.
-//! - If partial or EAGAIN: enable EPOLLOUT and continue later.
-//! - Only count "messages_sent" when a framed write fully completes.
-//!
-//! Critical correctness fix vs old Zig:
-//! - Never "pop then drop" from output queue if send buffer is full.
-//!   We stash ONE pending output message and retry later.
-
+//! Optimized for high-throughput output processing:
+//! - Batch drain from output queue into send buffer
+//! - Minimize atomic operations per message
+//! - Match C server's efficient drain pattern
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-
 const config = @import("config.zig");
 const codec = @import("../protocol/codec.zig");
 const net_utils = @import("net_utils.zig");
@@ -29,21 +22,25 @@ pub const ClientOutput = client_queue.ClientOutput;
 // ============================================================================
 // Platform
 // ============================================================================
-
 const is_linux = builtin.os.tag == .linux;
 const SEND_FLAGS: u32 = if (is_linux) posix.MSG.NOSIGNAL else 0;
 
 // ============================================================================
 // Configuration
 // ============================================================================
-
 pub const RECV_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB
 pub const SEND_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB
 pub const FRAME_HEADER_SIZE: u32 = 4;
 pub const MAX_MESSAGE_SIZE: u32 = 4 * 16384;
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 10;
-
 const RECV_COMPACT_THRESHOLD: u32 = RECV_BUFFER_SIZE / 2;
+
+/// Maximum messages to drain from output queue in one batch.
+/// This is the KEY tunable for throughput - higher = better throughput but more latency variance.
+pub const OUTPUT_DRAIN_BATCH_SIZE: u32 = 256;
+
+/// Approximate max encoded message size (for buffer space estimation)
+const MAX_ENCODED_SIZE: u32 = 256;
 
 comptime {
     std.debug.assert(RECV_BUFFER_SIZE >= MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE);
@@ -51,12 +48,13 @@ comptime {
     std.debug.assert(MAX_MESSAGE_SIZE > 0);
     std.debug.assert(MAX_CONSECUTIVE_ERRORS > 0);
     std.debug.assert(FRAME_HEADER_SIZE == 4);
+    std.debug.assert(OUTPUT_DRAIN_BATCH_SIZE >= 1);
+    std.debug.assert(OUTPUT_DRAIN_BATCH_SIZE <= 1024);
 }
 
 // ============================================================================
 // Client State
 // ============================================================================
-
 pub const ClientState = enum(u8) {
     disconnected,
     connected,
@@ -70,10 +68,9 @@ pub const ClientState = enum(u8) {
 // ============================================================================
 // Stats
 // ============================================================================
-
 pub const ClientStats = struct {
     messages_received: u64,
-    messages_sent: u64, // counts frames fully sent (matches C)
+    messages_sent: u64,
     bytes_received: u64,
     bytes_sent: u64,
     frames_dropped: u64,
@@ -82,7 +79,7 @@ pub const ClientStats = struct {
     send_calls: u64,
     send_would_block: u64,
     send_full_flushes: u64,
-    output_queue_drained: u64, // number of outputs moved into send buffer (enqueued frames)
+    output_queue_drained: u64,
 
     pub fn init() ClientStats {
         return .{
@@ -104,7 +101,6 @@ pub const ClientStats = struct {
 // ============================================================================
 // Frame Extraction
 // ============================================================================
-
 pub const FrameResult = union(enum) {
     frame: []const u8,
     incomplete,
@@ -115,7 +111,6 @@ pub const FrameResult = union(enum) {
 // ============================================================================
 // TcpClient
 // ============================================================================
-
 pub const TcpClient = struct {
     // Connection
     fd: posix.fd_t = -1,
@@ -136,8 +131,6 @@ pub const TcpClient = struct {
     send_pos: u32 = 0,
 
     /// Number of framed messages currently buffered in send_buf but not fully sent yet.
-    /// This lets us increment stats.messages_sent only when a framed write completes
-    /// (matching C tcp_listener.c).
     send_frames_pending: u32 = 0,
 
     // Protocol
@@ -146,12 +139,8 @@ pub const TcpClient = struct {
     // Output queue
     output_queue: ?*OutputQueue = null,
 
-    // Encode scratch
-    encode_buf: [256]u8 = undefined,
-
-    // If output queue had a message but we couldn't enqueue it into send_buf yet,
-    // we stash it here and retry later (prevents pop-then-drop).
-    pending_output: ?ClientOutput = null,
+    // Encode scratch buffer
+    encode_buf: [MAX_ENCODED_SIZE]u8 = undefined,
 
     // Errors / stats
     consecutive_errors: u32 = 0,
@@ -195,7 +184,6 @@ pub const TcpClient = struct {
             .protocol = .unknown,
             .output_queue = null,
             .encode_buf = undefined,
-            .pending_output = null,
             .consecutive_errors = 0,
             .stats = ClientStats.init(),
             .connect_time = now,
@@ -224,11 +212,6 @@ pub const TcpClient = struct {
         self.last_active = std.time.timestamp();
     }
 
-    // ------------------------------------------------------------------------
-    // Idle duration tracking
-    // ------------------------------------------------------------------------
-
-    /// Get seconds since last activity
     pub fn getIdleDuration(self: *const Self) i64 {
         const now = std.time.timestamp();
         return now - self.last_active;
@@ -243,79 +226,83 @@ pub const TcpClient = struct {
     }
 
     pub fn hasOutputQueueMessages(self: *const Self) bool {
-        if (self.pending_output != null) return true;
-        if (self.output_queue) |q| { 
+        if (self.output_queue) |q| {
             return q.size() > 0;
         }
         return false;
     }
 
-    /// Attempt to drain exactly ONE output message into send buffer.
-    /// Returns 1 if a message was enqueued into send_buf, 0 otherwise.
+    /// Drain up to max_count messages from output queue into send buffer.
+    /// Returns number of messages successfully staged for sending.
     ///
-    /// IMPORTANT: This never drops a message just because send buffer is full.
-    /// If no space, we stash the message in pending_output and retry later.
-    pub fn drainOutputQueueOne(self: *Self) u32 {
+    /// This is the HOT PATH for output processing - optimized for throughput:
+    /// - Batch pop from queue (single atomic update for multiple messages)
+    /// - Encode directly into send buffer
+    /// - Track frames for stats
+    pub fn drainOutputQueueBatch(self: *Self, max_count: u32) u32 {
         const queue = self.output_queue orelse return 0;
         const send_buf = self.send_buf orelse return 0;
 
-        // Acquire the next output to attempt.
-        if (self.pending_output == null) {
-            self.pending_output = queue.pop() orelse return 0;
-        }
+        // Calculate how many messages we can fit
+        const available_space = SEND_BUFFER_SIZE - self.send_len;
+        const max_by_space = available_space / (FRAME_HEADER_SIZE + MAX_ENCODED_SIZE);
+        const to_drain = @min(max_count, @as(u32, @intCast(max_by_space)));
 
-        const output = self.pending_output.?;
-        const out_msg = &output.message;
+        if (to_drain == 0) return 0;
+
         const use_binary = (self.protocol == .binary);
+        var drained: u32 = 0;
 
-        // Encode
-        const encoded_len = if (use_binary)
-            binary_codec.encodeOutput(out_msg, &self.encode_buf) catch {
-                // Encoding failed: treat as dropped (consistent with "format failed" skip in C)
-                self.pending_output = null;
-                return 0;
+        // Drain one at a time but in a tight loop
+        // (Could optimize further with batch pop + batch encode, but this is simpler)
+        while (drained < to_drain) {
+            const output = queue.pop() orelse break;
+            const out_msg = &output.message;
+
+            // Encode message
+            const encoded_len = if (use_binary)
+                binary_codec.encodeOutput(out_msg, &self.encode_buf) catch continue
+            else
+                csv_codec.encodeOutput(out_msg, &self.encode_buf) catch continue;
+
+            const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(encoded_len));
+
+            // Double-check we have space (should always be true given max_by_space calc)
+            if (self.send_len + frame_size > SEND_BUFFER_SIZE) {
+                // No space - this shouldn't happen but handle gracefully
+                self.stats.buffer_overflows += 1;
+                break;
             }
-        else
-            csv_codec.encodeOutput(out_msg, &self.encode_buf) catch {
-                self.pending_output = null;
-                return 0;
-            };
 
-        const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(encoded_len));
-        const available = SEND_BUFFER_SIZE - self.send_len;
+            // Write frame header (big-endian length)
+            const hdr = send_buf[self.send_len..][0..4];
+            std.mem.writeInt(u32, hdr, @intCast(encoded_len), .big);
+            self.send_len += FRAME_HEADER_SIZE;
 
-        // If no space, do NOT drop. Keep pending_output and retry later.
-        if (frame_size > available) {
-            self.stats.buffer_overflows += 1;
-            return 0;
+            // Write payload
+            @memcpy(send_buf[self.send_len..][0..encoded_len], self.encode_buf[0..encoded_len]);
+            self.send_len += @intCast(encoded_len);
+
+            self.send_frames_pending += 1;
+            drained += 1;
         }
 
-        // Write length header (big-endian)
-        const hdr = send_buf[self.send_len..][0..4];
-        std.mem.writeInt(u32, hdr, @intCast(encoded_len), .big);
-        self.send_len += FRAME_HEADER_SIZE;
+        self.stats.output_queue_drained += drained;
+        return drained;
+    }
 
-        // Write payload
-        @memcpy(send_buf[self.send_len..][0..encoded_len], self.encode_buf[0..encoded_len]);
-        self.send_len += @intCast(encoded_len);
-
-        self.send_frames_pending += 1;
-        self.stats.output_queue_drained += 1;
-
-        // Successfully staged; clear pending.
-        self.pending_output = null;
-
-        return 1;
+    /// Legacy single-message drain (for compatibility)
+    pub fn drainOutputQueueOne(self: *Self) u32 {
+        return self.drainOutputQueueBatch(1);
     }
 
     // ------------------------------------------------------------------------
-    // Direct send methods (used by tcp_server)
+    // Direct send methods (used by tcp_server for non-queue sends)
     // ------------------------------------------------------------------------
 
-    /// Queue a framed send (4-byte length prefix + payload)
-    /// Returns true if successfully queued, false if buffer full
     pub fn queueFramedSend(self: *Self, data: []const u8) bool {
         const send_buf = self.send_buf orelse return false;
+
         const frame_size: u32 = FRAME_HEADER_SIZE + @as(u32, @intCast(data.len));
         const available = SEND_BUFFER_SIZE - self.send_len;
 
@@ -337,12 +324,10 @@ pub const TcpClient = struct {
         return true;
     }
 
-    /// Queue a raw send (no framing)
-    /// Returns true if successfully queued, false if buffer full
     pub fn queueRawSend(self: *Self, data: []const u8) bool {
         const send_buf = self.send_buf orelse return false;
-        const available = SEND_BUFFER_SIZE - self.send_len;
 
+        const available = SEND_BUFFER_SIZE - self.send_len;
         if (data.len > available) {
             self.stats.buffer_overflows += 1;
             return false;
@@ -350,18 +335,12 @@ pub const TcpClient = struct {
 
         @memcpy(send_buf[self.send_len..][0..data.len], data);
         self.send_len += @intCast(data.len);
-
-        // Raw sends count as one "frame" for stats purposes
         self.send_frames_pending += 1;
         return true;
     }
 
-    /// Record that a message was sent (for stats tracking via direct sends)
     pub fn recordMessageSent(_: *Self) void {
-        // Note: This is called by tcp_server for direct sends.
-        // For output queue drains, messages_sent is incremented in flushSend()
-        // when the send buffer is fully flushed.
-        // This method is kept for backward compatibility with direct send paths.
+        // Kept for backward compatibility
     }
 
     // ------------------------------------------------------------------------
@@ -394,11 +373,13 @@ pub const TcpClient = struct {
     fn compactRecv(self: *Self) void {
         const recv_buf = self.recv_buf orelse return;
         const unread = self.recvDataLen();
+
         if (unread == 0) {
             self.recv_read = 0;
             self.recv_write = 0;
             return;
         }
+
         if (self.recv_read == 0) return;
 
         std.mem.copyForwards(u8, recv_buf[0..unread], recv_buf[self.recv_read..self.recv_write]);
@@ -409,6 +390,7 @@ pub const TcpClient = struct {
     fn ensureRecvSpace(self: *Self) bool {
         const avail = RECV_BUFFER_SIZE - self.recv_write;
         if (avail > 0) return true;
+
         if (self.recv_read > 0) {
             self.compactRecv();
             return (RECV_BUFFER_SIZE - self.recv_write) > 0;
@@ -453,6 +435,7 @@ pub const TcpClient = struct {
     pub fn consumeBytes(self: *Self, bytes: u32) void {
         std.debug.assert(bytes <= self.recvDataLen());
         self.recv_read += bytes;
+
         if (self.recv_read == self.recv_write) {
             self.recv_read = 0;
             self.recv_write = 0;
@@ -502,6 +485,7 @@ pub const TcpClient = struct {
         self.recv_read += total_len;
         self.stats.messages_received += 1;
         self.resetErrors();
+
         if (self.recv_read == self.recv_write) {
             self.recv_read = 0;
             self.recv_write = 0;
@@ -516,9 +500,8 @@ pub const TcpClient = struct {
         return self.send_pos < self.send_len;
     }
 
-    /// Flush send buffer with a SINGLE non-blocking send() call.
-    /// - If WouldBlock: caller enables EPOLLOUT.
-    /// - If buffer becomes empty: we commit send_frames_pending into stats.messages_sent.
+    /// Flush send buffer to socket.
+    /// Returns error.WouldBlock if socket can't accept more data.
     pub fn flushSend(self: *Self) !void {
         if (self.send_pos >= self.send_len) return;
 
@@ -546,14 +529,11 @@ pub const TcpClient = struct {
             self.send_pos = 0;
             self.send_len = 0;
             self.stats.send_full_flushes += 1;
-
-            // Now it's safe to say these frames are "sent"
             self.stats.messages_sent += self.send_frames_pending;
             self.send_frames_pending = 0;
         }
     }
 
-    /// Work predicate: pending send OR output queue messages OR pending_output stash
     pub fn hasWorkToDo(self: *const Self) bool {
         if (self.hasPendingSend()) return true;
         if (self.hasOutputQueueMessages()) return true;
@@ -573,10 +553,6 @@ pub const TcpClient = struct {
     pub fn getProtocol(self: *const Self) codec.Protocol {
         return self.protocol;
     }
-
-    // ------------------------------------------------------------------------
-    // Misc
-    // ------------------------------------------------------------------------
 
     pub fn getStats(self: *const Self) ClientStats {
         return self.stats;
@@ -599,8 +575,6 @@ pub fn ClientPool(comptime capacity: u32) type {
 
         const Self = @This();
 
-        /// Aggregate statistics across all clients
-        /// Field names match what tcp_server.zig expects
         pub const AggregateStats = struct {
             active_clients: u32 = 0,
             total_messages_in: u64 = 0,

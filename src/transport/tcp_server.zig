@@ -1,14 +1,10 @@
 //! TCP server with cross-platform I/O multiplexing (epoll on Linux, kqueue on Darwin/BSD).
 //!
-//! Key change: Output queue processing happens BEFORE epoll_wait, matching
-//! the C server's tcp_listener.c pattern exactly.
-//!
-//! C server pattern (tcp_listener.c):
-//!   while (!shutdown) {
-//!       process_output_queues();  // FIRST - always
-//!       epoll_wait(...);          // THEN wait for events
-//!       handle_events();
-//!   }
+//! Optimized output processing pattern matching C server's tcp_listener.c:
+//! - Process ALL client output queues BEFORE epoll_wait
+//! - Batch drain from output queues (not one-at-a-time)
+//! - Immediate send attempt after staging data
+//! - Only enable EPOLLOUT if send would block
 //!
 //! Data flow:
 //!   OutputRouter → Client.output_queue → processOutputQueues() → socket
@@ -55,27 +51,18 @@ const PollResult = struct {
 };
 
 /// Maximum concurrent TCP clients.
-/// Must not exceed output_router.MAX_TCP_CLIENTS for client ID compatibility.
 pub const MAX_CLIENTS: u32 = 64;
-
 const MAX_EVENTS: u32 = 64;
 const LISTEN_BACKLOG: u31 = 128;
 const IDLE_CHECK_INTERVAL: u32 = 100;
 const MAX_ACCEPTS_PER_POLL: u32 = 16;
-
 const MAX_FRAMES_PER_CHUNK: u32 = 16;
-const MAX_FRAMES_PER_READ_EVENT: u32 = 32;
+const MAX_FRAMES_PER_READ_EVENT: u32 = 8192;
 const MAX_RAW_BYTES_PER_CHUNK: u32 = 16_384;
 const MAX_RAW_BYTES_PER_READ_EVENT: u32 = 1024 * 1024;
-
 const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
 
-/// Maximum send() flush loops per client per output drain cycle.
-/// This is the critical knob to avoid "1 msg per cycle" behavior.
-const MAX_PUMP_ITERS_PER_CLIENT: u32 = 1;
-
-/// Maximum client ID value - must fit within OutputRouter's registry.
-/// Client IDs cycle through [1, MAX_CLIENT_ID_VALUE].
+/// Maximum client ID value.
 const MAX_CLIENT_ID_VALUE: config.ClientId = @intCast(output_router.MAX_TCP_CLIENTS - 1);
 
 comptime {
@@ -88,15 +75,10 @@ comptime {
     std.debug.assert(MAX_CLIENTS <= output_router.MAX_TCP_CLIENTS);
     std.debug.assert(MAX_CLIENT_ID_VALUE > 0);
     std.debug.assert(MAX_CLIENT_ID_VALUE < output_router.MAX_TCP_CLIENTS);
-    std.debug.assert(MAX_PUMP_ITERS_PER_CLIENT > 0);
 }
 
 pub const MessageCallback = *const fn (client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void;
 pub const DisconnectCallback = *const fn (client_id: config.ClientId, ctx: ?*anyopaque) void;
-
-/// Connect callback - called when a new client connects
-/// Parameters: client_id, file descriptor, context
-/// Returns: pointer to client's output queue (from OutputRouter), or null
 pub const ConnectCallback = *const fn (client_id: config.ClientId, fd: posix.fd_t, ctx: ?*anyopaque) ?*tcp_client.OutputQueue;
 
 pub const ServerStats = struct {
@@ -189,12 +171,9 @@ const Poller = struct {
     pub fn wait(self: *Self, results: []PollResult, timeout_ms: i32) ![]PollResult {
         if (is_linux) {
             var events: [MAX_EVENTS]linux.epoll_event = undefined;
-
-            // Zig 0.15.x: std.posix.epoll_wait returns usize (NOT error union),
-            // so no `catch`. Treat it as best-effort; EINTR simply yields 0.
             const n: usize = posix.epoll_wait(self.fd, &events, timeout_ms);
-
             const count = @min(n, results.len);
+
             for (0..count) |i| {
                 results[i] = .{
                     .fd = events[i].data.fd,
@@ -208,7 +187,6 @@ const Poller = struct {
             return results[0..count];
         } else {
             var events: [MAX_EVENTS]posix.Kevent = undefined;
-
             var timeout_val: posix.timespec = .{
                 .tv_sec = @intCast(@divTrunc(timeout_ms, 1000)),
                 .tv_nsec = @intCast(@mod(timeout_ms, 1000) * 1_000_000),
@@ -280,7 +258,7 @@ pub const TcpServer = struct {
     error_disconnects: u64 = 0,
     poll_cycles: u64 = 0,
 
-    // Output drain stats (debug/telemetry)
+    // Output drain stats
     output_drain_calls: u64 = 0,
     output_messages_drained: u64 = 0,
 
@@ -313,6 +291,7 @@ pub const TcpServer = struct {
 
         var poller = try Poller.init();
         errdefer poller.deinit();
+
         try poller.addRead(listen_fd);
 
         self.listen_fd = listen_fd;
@@ -326,7 +305,6 @@ pub const TcpServer = struct {
     }
 
     pub fn stop(self: *Self) void {
-        // Disconnect clients
         var iter = self.clients.getActive();
         while (iter.next()) |client| {
             self.disconnectClientInternal(client, false);
@@ -336,6 +314,7 @@ pub const TcpServer = struct {
             poller.deinit();
             self.poller = null;
         }
+
         if (self.listen_fd) |fd| {
             posix.close(fd);
             self.listen_fd = null;
@@ -352,24 +331,25 @@ pub const TcpServer = struct {
         return self.listen_fd != null and self.poller != null;
     }
 
-    /// Main poll function - processes output queues FIRST (like C server),
-    /// then waits for events.
+    /// Main poll function - C-style: process outputs FIRST, then wait for events.
     pub fn poll(self: *Self, timeout_ms: i32) !usize {
         var poller = self.poller orelse return error.NotStarted;
         const listen_fd = self.listen_fd orelse return error.NotStarted;
 
         // ================================================================
         // CRITICAL: Process output queues FIRST, before epoll/kqueue wait
+        // This matches C server's tcp_listener.c pattern exactly.
         // ================================================================
-        const has_output_work = self.processOutputQueues();
+        const output_work_done = self.processOutputQueues();
 
-        // If we have output work pending, don't block on input.
-        const effective_timeout = if (has_output_work) 0 else timeout_ms;
+        // If we did output work, don't block - there may be more.
+        const effective_timeout = if (output_work_done > 0) 0 else timeout_ms;
 
         var results: [MAX_EVENTS]PollResult = undefined;
         const events = try poller.wait(&results, effective_timeout);
 
         var processed: usize = 0;
+
         for (events) |ev| {
             if (ev.fd == listen_fd) {
                 self.acceptConnections();
@@ -388,89 +368,97 @@ pub const TcpServer = struct {
         return processed;
     }
 
-    /// Pump one client's output queue + socket until we would-block or run out of work.
-    /// Returns true if we suspect there's still more work pending after this call.
-    fn pumpClientOutput(self: *Self, client: *TcpClient) bool {
-        var iters: u32 = 0;
-        var more_work: bool = false;
-
-        while (iters < MAX_PUMP_ITERS_PER_CLIENT) : (iters += 1) {
-            // 1) Flush pending send buffer first.
-            if (client.hasPendingSend()) {
-                client.flushSend() catch |err| {
-                    if (err == error.WouldBlock) {
-                        // Need writable notification to continue.
-                        self.updateClientPoller(client, true) catch {};
-                        return true;
-                    }
-                    self.error_disconnects += 1;
-                    self.disconnectClient(client);
-                    return false;
-                };
-
-                if (client.hasPendingSend()) {
-                    // Partial send -> stay on EPOLLOUT
-                    self.updateClientPoller(client, true) catch {};
-                    return true;
-                }
-
-                // Pending cleared, continue pumping.
-                continue;
-            }
-
-            // 2) No pending bytes; if output queue has messages, pull one into send buffer.
-            if (client.hasOutputQueueMessages()) {
-                const drained: u32 = client.drainOutputQueueOne();
-                if (drained == 0) return false;
-
-                self.output_messages_drained += 1;
-
-                // If queue still has messages, keep loop hot.
-                if (client.hasOutputQueueMessages()) more_work = true;
-
-                // Now loop back; flushSend will run next iteration.
-                continue;
-            }
-
-            // 3) No pending bytes and no queued messages.
-            // Disable EPOLLOUT; we only care about reads until output appears again.
-            self.updateClientPoller(client, false) catch {};
-            return false;
-        }
-
-        // Hit pump cap; there was probably a lot of work.
-        return more_work or client.hasOutputQueueMessages() or client.hasPendingSend();
-    }
-
-    /// Process all client output queues - matches C server's process_output_queues()
+    /// Process ALL client output queues - matches C server's process_output_queues()
     ///
-    /// Returns true if any client likely has output work pending after this cycle.
-    fn processOutputQueues(self: *Self) bool {
+    /// C pattern: For each active client without pending write:
+    ///   1. Dequeue ONE message from output queue
+    ///   2. Format it
+    ///   3. Try immediate write
+    ///   4. If blocked, enable EPOLLOUT
+    ///
+    /// Zig optimization: Batch dequeue multiple messages before attempting send,
+    /// but still process all clients in a single sweep.
+    ///
+    /// Returns total messages drained this cycle.
+    fn processOutputQueues(self: *Self) u64 {
+        const start_time = std.time.microTimestamp();
+        defer {
+            const elapsed = std.time.microTimestamp() - start_time;
+            if (elapsed > 1000) {  // > 1ms
+                std.log.warn("processOutputQueues took {}us", .{elapsed});
+            }
+        }
         self.output_drain_calls += 1;
 
-        var has_more_work: bool = false;
-
+        var total_drained: u64 = 0;
         var iter = self.clients.getActive();
+
         while (iter.next()) |client| {
             if (client.state != .connected) continue;
 
-            if (self.pumpClientOutput(client)) {
-                has_more_work = true;
+            // Skip if client already has pending send data (matches C: has_pending_write check)
+            if (client.hasPendingSend()) {
+                // Try to flush existing data
+                client.flushSend() catch |err| {
+                    if (err == error.WouldBlock) {
+                        self.updateClientPoller(client, true) catch {};
+                        continue;
+                    }
+                    self.error_disconnects += 1;
+                    self.disconnectClient(client);
+                    continue;
+                };
+
+                // If still has pending after flush, skip this client this cycle
+                if (client.hasPendingSend()) {
+                    self.updateClientPoller(client, true) catch {};
+                    continue;
+                }
+            }
+
+            // No pending send - drain from output queue
+            if (!client.hasOutputQueueMessages()) continue;
+
+            // Batch drain: pull multiple messages into send buffer
+            const drained = client.drainOutputQueueBatch(tcp_client.OUTPUT_DRAIN_BATCH_SIZE);
+            if (drained == 0) continue;
+
+            total_drained += drained;
+
+            // Try immediate send (matches C: try immediate write)
+            client.flushSend() catch |err| {
+                if (err == error.WouldBlock) {
+                    self.updateClientPoller(client, true) catch {};
+                    continue;
+                }
+                self.error_disconnects += 1;
+                self.disconnectClient(client);
+                continue;
+            };
+
+            // If partial send, enable EPOLLOUT
+            if (client.hasPendingSend()) {
+                self.updateClientPoller(client, true) catch {};
+            } else {
+                // Fully sent - disable EPOLLOUT
+                self.updateClientPoller(client, false) catch {};
             }
         }
 
+        self.output_messages_drained += total_drained;
+
         // Sparse telemetry
-        if (self.output_messages_drained > 0 and (self.output_messages_drained % 10000) == 0) {
-            std.log.warn("TcpServer: drained {} messages (ts={})", .{
+        if (self.output_drain_calls % 5000 == 0 and total_drained > 0) {
+            std.log.warn("processOutputQueues: call {} drained_total={}", .{
+                self.output_drain_calls,
                 self.output_messages_drained,
-                std.time.milliTimestamp(),
             });
         }
 
-        return has_more_work;
+        return total_drained;
     }
 
-    /// Legacy method - kept for older call sites.
+    /// Legacy method for older call sites.
     pub fn drainAllClientOutputQueues(self: *Self) void {
         _ = self.processOutputQueues();
     }
@@ -487,8 +475,8 @@ pub const TcpServer = struct {
 
     fn acceptConnections(self: *Self) void {
         const listen_fd = self.listen_fd orelse return;
-        var accepted: u32 = 0;
 
+        var accepted: u32 = 0;
         while (accepted < MAX_ACCEPTS_PER_POLL) : (accepted += 1) {
             self.acceptOne(listen_fd) catch |err| {
                 if (err == error.WouldBlock) break;
@@ -542,7 +530,7 @@ pub const TcpServer = struct {
 
         std.log.info("Client {} connected (fd={}, active={})", .{ client_id, client_fd, self.clients.active_count });
 
-        // Invoke connect callback to register with OutputRouter and get per-client output queue
+        // Register with OutputRouter and get per-client output queue
         if (self.on_connect) |cb| {
             if (cb(client_id, client_fd, self.callback_ctx)) |output_queue| {
                 client_slot.setOutputQueue(output_queue);
@@ -568,8 +556,18 @@ pub const TcpServer = struct {
         }
 
         if (events.writable) {
-            // On writable, just pump again. This is the cleanest ET pattern.
-            _ = self.pumpClientOutput(client);
+            // Writable event - flush pending data
+            client.flushSend() catch |err| {
+                if (err == error.WouldBlock) return;
+                self.error_disconnects += 1;
+                self.disconnectClient(client);
+                return;
+            };
+
+            // If fully flushed, disable EPOLLOUT
+            if (!client.hasPendingSend()) {
+                self.updateClientPoller(client, false) catch {};
+            }
         }
     }
 
@@ -606,7 +604,6 @@ pub const TcpServer = struct {
 
         while (frames_processed < max_frames) : (frames_processed += 1) {
             const frame_result = client.extractFrame();
-
             switch (frame_result) {
                 .frame => |payload| {
                     if (client.protocol == .unknown) client.protocol = codec.detectProtocol(payload);
@@ -630,6 +627,7 @@ pub const TcpServer = struct {
     fn processRawMessagesChunk(self: *Self, client: *TcpClient, max_bytes: u32) u32 {
         var processed: u32 = 0;
         const data = client.getReceivedData();
+
         if (data.len == 0) return 0;
 
         const max_process = @min(@as(u32, @intCast(data.len)), max_bytes);
@@ -645,7 +643,6 @@ pub const TcpServer = struct {
             const result = codec.Codec.decodeInput(remaining) catch |err| {
                 if (err == codec.CodecError.IncompleteMessage) break;
                 self.decode_errors += 1;
-
                 if (client.recordDecodeError()) {
                     self.error_disconnects += 1;
                     self.disconnectClient(client);
@@ -671,12 +668,13 @@ pub const TcpServer = struct {
             _ = client.recordDecodeError();
             return;
         };
+
         client.resetErrors();
         if (self.on_message) |cb| cb(client.client_id, &result.message, self.callback_ctx);
     }
 
     // ========================================================================
-    // Direct Send Operations (bypassing OutputRouter)
+    // Direct Send Operations
     // ========================================================================
 
     pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
@@ -687,8 +685,13 @@ pub const TcpServer = struct {
 
         client.recordMessageSent();
 
-        // Immediately pump (try to send now), and if it blocks, enable EPOLLOUT.
-        _ = self.pumpClientOutput(client);
+        // Try immediate send
+        client.flushSend() catch |err| {
+            if (err == error.WouldBlock) {
+                self.updateClientPoller(client, true) catch {};
+            }
+        };
+
         return true;
     }
 
@@ -703,10 +706,15 @@ pub const TcpServer = struct {
             if (!ok) continue;
 
             client.recordMessageSent();
-            _ = self.pumpClientOutput(client);
+
+            client.flushSend() catch |err| {
+                if (err == error.WouldBlock) {
+                    self.updateClientPoller(client, true) catch {};
+                }
+            };
+
             sent_count += 1;
         }
-
         return sent_count;
     }
 
@@ -740,25 +748,20 @@ pub const TcpServer = struct {
         try poller.updateClient(client.fd, want_write);
     }
 
-    /// Enable write notifications for a client by ID.
-    /// Note: this does not wake epoll_wait; it only changes interest.
     pub fn enableWriteForClient(self: *Self, client_id: config.ClientId) void {
         if (self.clients.findById(client_id)) |client| {
             self.updateClientPoller(client, true) catch {};
         }
     }
 
-    /// Allocate a unique client ID in range [1, MAX_CLIENT_ID_VALUE].
     fn allocateClientId(self: *Self) config.ClientId {
         var attempts: u32 = 0;
         const max_attempts = MAX_CLIENTS + 10;
 
         while (attempts < max_attempts) : (attempts += 1) {
             const id = self.next_client_id;
-
             self.next_client_id += 1;
             if (self.next_client_id > MAX_CLIENT_ID_VALUE) self.next_client_id = 1;
-
             if (self.clients.findById(id) == null) return id;
         }
 
@@ -789,4 +792,3 @@ pub const TcpServer = struct {
         return self.clients.active_count;
     }
 };
-

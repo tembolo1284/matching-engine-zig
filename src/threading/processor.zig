@@ -318,6 +318,12 @@ pub const Processor = struct {
 
     fn handleMessage(self: *Self, input: *const ProcessorInput) void {
         std.debug.assert(input.client_id != 0 or input.message.msg_type == .flush);
+        if (self.messages_processed % 5000 == 0) {
+            std.log.warn("Processor {}: processed {} messages at ts={}", .{
+                @intFromEnum(self.id), self.messages_processed, std.time.milliTimestamp()
+            });
+        }
+
         const start_time: i128 = if (TRACK_LATENCY) std.time.nanoTimestamp() else 0;
         self.output_buffer.clear();
         self.engine.processMessage(&input.message, input.client_id, self.output_buffer);

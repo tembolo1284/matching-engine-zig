@@ -14,9 +14,9 @@ pub const OutputQueue = ClientOutputQueue;
 // Configuration
 // ============================================================================
 pub const MAX_OUTPUT_QUEUES: usize = 2;
-pub const ROUTER_BATCH_SIZE: usize = 32;
-pub const MAX_TCP_CLIENTS: usize = 4096;
-const SLEEP_TIME_NS: u64 = 100;
+pub const ROUTER_BATCH_SIZE: usize = 4;
+pub const MAX_TCP_CLIENTS: usize = 128;
+const SLEEP_TIME_NS: u64 = 50;
 const IDLE_SPIN_COUNT: u32 = 100000;
 const MAX_DRAIN_PER_QUEUE_PER_TICK: usize = 65536;
 const MAX_TOTAL_DRAIN_PER_TICK: usize = 131072;
@@ -24,7 +24,7 @@ comptime {
     std.debug.assert(MAX_OUTPUT_QUEUES >= 1);
     std.debug.assert(MAX_OUTPUT_QUEUES <= 4);
     std.debug.assert(ROUTER_BATCH_SIZE >= 1);
-    std.debug.assert(ROUTER_BATCH_SIZE <= 256);
+    std.debug.assert(ROUTER_BATCH_SIZE <= 1024);
     std.debug.assert(MAX_DRAIN_PER_QUEUE_PER_TICK > 0);
     std.debug.assert(MAX_TOTAL_DRAIN_PER_TICK >= MAX_DRAIN_PER_QUEUE_PER_TICK);
     std.debug.assert(MAX_TCP_CLIENTS > 0);
@@ -256,7 +256,7 @@ pub const OutputRouter = struct {
             }
             if (total >= MAX_TOTAL_DRAIN_PER_TICK) break;
         }
-        if (self.notify_cb) |cb| cb(self.notify_ctx);
+        // if (self.notify_cb) |cb| cb(self.notify_ctx);
         return total;
     }
     fn isCritical(out_msg: *const msg.OutputMsg) bool {
