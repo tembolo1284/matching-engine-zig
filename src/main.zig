@@ -200,28 +200,36 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: *const Config) !void 
 
     processor.state = .running;
 
-    // Simple round-robin: poll -> process -> poll -> process
     while (!shutdown_requested.load(.acquire)) {
-        // 1. Handle network I/O (receive + send)
+        // Process network I/O
         _ = server.poll() catch |err| {
             std.debug.print("Server error: {any}\n", .{err});
         };
 
-        // 2. Process a batch of messages  
+        // Process messages
         _ = processor.processBatch(input_queue, output_queue);
 
-        // 3. Handle network I/O again to send responses quickly
-        _ = server.poll() catch {};
-        
-        // 4. Process another batch
-        _ = processor.processBatch(input_queue, output_queue);
+        // If we have pending output, keep polling to send it
+        while (!output_queue.isEmpty()) {
+            _ = server.poll() catch {};
+            if (shutdown_requested.load(.acquire)) break;
+        }
     }
 
     std.debug.print("Shutting down...\n", .{});
 
-    for (0..100) |_| {
+    // Aggressive drain on shutdown - process everything remaining
+    var drain_iterations: u32 = 0;
+    const max_drain = 10000;
+    while (drain_iterations < max_drain) {
+        const processed = processor.processBatch(input_queue, output_queue);
         _ = server.poll() catch {};
-        _ = processor.processBatch(input_queue, output_queue);
+        
+        // Keep going while there's work to do
+        if (processed == 0 and output_queue.isEmpty() and input_queue.isEmpty()) {
+            break;
+        }
+        drain_iterations += 1;
     }
 
     server.stop();
