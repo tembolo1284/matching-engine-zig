@@ -181,7 +181,7 @@ pub const TcpServer = struct {
                 }
             };
 
-            std.debug.print("DEBUG: Accepted connection from client\n", .{});
+            // std.debug.print("DEBUG: Accepted connection from client\n", .{});
 
             const slot_idx = self.findFreeSlot() orelse {
                 accept_result.stream.close();
@@ -297,27 +297,24 @@ pub const TcpServer = struct {
         var messages_received: u32 = 0;
         const received = conn.tryReceive() catch false;
 
-        if (received) {
-            std.debug.print("DEBUG: Received data from client {d}, parser buffer len={d}\n", .{ conn.client_id, conn.parser.buffer.len });
-
-            // Show first bytes
-            const data = conn.parser.buffer.slice();
-            if (data.len > 0) {
-                std.debug.print("DEBUG: First bytes: ", .{});
-                for (data[0..@min(data.len, 16)]) |b| {
-                    std.debug.print("{x:0>2} ", .{b});
-                }
-                std.debug.print("\n", .{});
-
-                // Check protocol detection
-                const protocol = framing.detectProtocol(data);
-                std.debug.print("DEBUG: Detected protocol: {s}\n", .{protocol.toString()});
-            }
-        }
+        // Uncomment for debugging:
+        // if (received) {
+        //     std.debug.print("DEBUG: Received data from client {d}, parser buffer len={d}\n", .{ conn.client_id, conn.parser.buffer.len });
+        //     const data = conn.parser.buffer.slice();
+        //     if (data.len > 0) {
+        //         std.debug.print("DEBUG: First bytes: ", .{});
+        //         for (data[0..@min(data.len, 16)]) |b| {
+        //             std.debug.print("{x:0>2} ", .{b});
+        //         }
+        //         std.debug.print("\n", .{});
+        //         const protocol = framing.detectProtocol(data);
+        //         std.debug.print("DEBUG: Detected protocol: {s}\n", .{protocol.toString()});
+        //     }
+        // }
 
         if (received) {
             while (conn.nextMessage()) |message| {
-                std.debug.print("DEBUG: Parsed message type: {any}\n", .{message.type});
+                // std.debug.print("DEBUG: Parsed message type: {any}\n", .{message.type});
                 self.stats.messages_received += 1;
                 messages_received += 1;
                 if (self.input_queue) |queue| {
