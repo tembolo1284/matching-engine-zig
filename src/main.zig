@@ -189,7 +189,6 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: *const Config) !void 
 
     const processor = try allocator.create(Processor);
     defer allocator.destroy(processor);
-    // Use initInPlace to avoid stack overflow
     processor.initInPlace();
 
     server.setQueues(input_queue, output_queue);
@@ -201,16 +200,26 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: *const Config) !void 
 
     processor.state = .running;
 
+    // Simple round-robin: poll -> process -> poll -> process
     while (!shutdown_requested.load(.acquire)) {
+        // 1. Handle network I/O (receive + send)
         _ = server.poll() catch |err| {
             std.debug.print("Server error: {any}\n", .{err});
         };
+
+        // 2. Process a batch of messages  
+        _ = processor.processBatch(input_queue, output_queue);
+
+        // 3. Handle network I/O again to send responses quickly
+        _ = server.poll() catch {};
+        
+        // 4. Process another batch
         _ = processor.processBatch(input_queue, output_queue);
     }
 
     std.debug.print("Shutting down...\n", .{});
 
-    for (0..10) |_| {
+    for (0..100) |_| {
         _ = server.poll() catch {};
         _ = processor.processBatch(input_queue, output_queue);
     }

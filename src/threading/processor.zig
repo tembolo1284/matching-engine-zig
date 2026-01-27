@@ -12,7 +12,7 @@ const OutputEnvelope = SpscQueue.OutputEnvelope;
 const InputEnvelopeQueue = SpscQueue.InputEnvelopeQueue;
 const OutputEnvelopeQueue = SpscQueue.OutputEnvelopeQueue;
 
-pub const BATCH_SIZE: u32 = 32;
+pub const BATCH_SIZE: u32 = 16;
 pub const MAX_LOOP_ITERATIONS: u32 = 1_000_000;
 pub const SPIN_COUNT: u32 = 1000;
 
