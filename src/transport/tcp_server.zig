@@ -13,7 +13,7 @@ const InputEnvelopeQueue = SpscQueue.InputEnvelopeQueue;
 const OutputEnvelopeQueue = SpscQueue.OutputEnvelopeQueue;
 
 pub const MAX_CLIENTS: u32 = 256;
-pub const POLL_TIMEOUT_MS: i32 = 1;  // 1ms for responsiveness
+pub const POLL_TIMEOUT_MS: i32 = 1;
 pub const MAX_POLL_EVENTS: usize = 256;
 pub const ACCEPT_BATCH_SIZE: u32 = 8;
 
@@ -367,6 +367,21 @@ pub const TcpServer = struct {
     pub fn disconnectClient(self: *Self, client_id: u32) void {
         if (self.getClient(client_id)) |conn| {
             conn.state = .disconnecting;
+        }
+    }
+
+    /// Force flush all client send buffers
+    pub fn flushAllClients(self: *Self) void {
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    var attempts: u32 = 0;
+                    while (conn.hasPendingData() and attempts < 100) : (attempts += 1) {
+                        const sent = conn.trySend() catch break;
+                        if (sent == 0) break;
+                    }
+                }
+            }
         }
     }
 };

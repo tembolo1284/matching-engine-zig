@@ -209,27 +209,33 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: *const Config) !void 
         // Process messages
         _ = processor.processBatch(input_queue, output_queue);
 
-        // If we have pending output, keep polling to send it
-        while (!output_queue.isEmpty()) {
+        // Aggressively drain output queue
+        var drain_count: u32 = 0;
+        while (!output_queue.isEmpty() and drain_count < 1000) : (drain_count += 1) {
             _ = server.poll() catch {};
-            if (shutdown_requested.load(.acquire)) break;
         }
     }
 
     std.debug.print("Shutting down...\n", .{});
 
-    // Aggressive drain on shutdown - process everything remaining
+    // Final drain - keep going until everything is sent
     var drain_iterations: u32 = 0;
-    const max_drain = 10000;
-    while (drain_iterations < max_drain) {
-        const processed = processor.processBatch(input_queue, output_queue);
+    while (drain_iterations < 100000) : (drain_iterations += 1) {
+        _ = processor.processBatch(input_queue, output_queue);
         _ = server.poll() catch {};
-        
-        // Keep going while there's work to do
-        if (processed == 0 and output_queue.isEmpty() and input_queue.isEmpty()) {
+
+        // Force flush all client send buffers
+        server.flushAllClients();
+
+        if (output_queue.isEmpty() and input_queue.isEmpty()) {
+            // Give a few more iterations to ensure send buffers are flushed
+            var flush_count: u32 = 0;
+            while (flush_count < 100) : (flush_count += 1) {
+                _ = server.poll() catch {};
+                server.flushAllClients();
+            }
             break;
         }
-        drain_iterations += 1;
     }
 
     server.stop();
@@ -255,7 +261,6 @@ fn runThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
 
     const processor_thread = try allocator.create(ProcessorThread);
     defer allocator.destroy(processor_thread);
-    // Use initInPlace to avoid stack overflow
     processor_thread.initInPlace(input_queue, output_queue);
 
     const address = try std.net.Address.parseIp4(config.tcp_addr, config.tcp_port);
@@ -269,14 +274,24 @@ fn runThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
         _ = server.poll() catch |err| {
             std.debug.print("Server error: {any}\n", .{err});
         };
+
+        // Aggressively drain output queue
+        var drain_count: u32 = 0;
+        while (!output_queue.isEmpty() and drain_count < 1000) : (drain_count += 1) {
+            _ = server.poll() catch {};
+        }
     }
 
     std.debug.print("Shutting down...\n", .{});
 
     processor_thread.stop();
 
-    for (0..10) |_| {
+    // Final drain
+    var drain_iterations: u32 = 0;
+    while (drain_iterations < 10000) : (drain_iterations += 1) {
         _ = server.poll() catch {};
+        server.flushAllClients();
+        if (output_queue.isEmpty()) break;
     }
 
     server.stop();
