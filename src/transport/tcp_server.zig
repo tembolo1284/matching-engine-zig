@@ -1,794 +1,420 @@
-//! TCP server with cross-platform I/O multiplexing (epoll on Linux, kqueue on Darwin/BSD).
-//!
-//! Optimized output processing pattern matching C server's tcp_listener.c:
-//! - Process ALL client output queues BEFORE epoll_wait
-//! - Batch drain from output queues (not one-at-a-time)
-//! - Immediate send attempt after staging data
-//! - Only enable EPOLLOUT if send would block
-//!
-//! Data flow:
-//!   OutputRouter → Client.output_queue → processOutputQueues() → socket
-//!
+//! TCP Server - Multi-Client TCP Listener
 const std = @import("std");
-const builtin = @import("builtin");
+const net = std.net;
 const posix = std.posix;
-
+const TcpConnection = @import("tcp_connection.zig").TcpConnection;
+const ConnectionState = @import("tcp_connection.zig").ConnectionState;
+const framing = @import("framing.zig");
 const msg = @import("../protocol/message_types.zig");
-const codec = @import("../protocol/codec.zig");
-const config = @import("config.zig");
-const net_utils = @import("net_utils.zig");
-const tcp_client = @import("tcp_client.zig");
-const output_router = @import("../threading/output_router.zig");
+const SpscQueue = @import("../threading/spsc_queue.zig");
+const InputEnvelope = SpscQueue.InputEnvelope;
+const OutputEnvelope = SpscQueue.OutputEnvelope;
+const InputEnvelopeQueue = SpscQueue.InputEnvelopeQueue;
+const OutputEnvelopeQueue = SpscQueue.OutputEnvelopeQueue;
 
-pub const TcpClient = tcp_client.TcpClient;
-pub const ClientState = tcp_client.ClientState;
-pub const ClientStats = tcp_client.ClientStats;
+pub const MAX_CLIENTS: u32 = 256;
+pub const POLL_TIMEOUT_MS: i32 = 10;
+pub const MAX_POLL_EVENTS: usize = 64;
+pub const ACCEPT_BATCH_SIZE: u32 = 8;
 
-const is_linux = builtin.os.tag == .linux;
-const is_darwin = builtin.os.tag.isDarwin();
-const is_bsd = builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .netbsd;
-
-const linux = if (is_linux) std.os.linux else struct {};
-const c = std.c;
-
-const EVFILT_READ: i16 = if (is_darwin or is_bsd) c.EVFILT_READ else 0;
-const EVFILT_WRITE: i16 = if (is_darwin or is_bsd) c.EVFILT_WRITE else 0;
-const EV_ADD: u16 = if (is_darwin or is_bsd) c.EV_ADD else 0;
-const EV_DELETE: u16 = if (is_darwin or is_bsd) c.EV_DELETE else 0;
-const EV_CLEAR: u16 = if (is_darwin or is_bsd) c.EV_CLEAR else 0;
-const EV_EOF: u16 = if (is_darwin or is_bsd) c.EV_EOF else 0;
-const EV_ERROR: u16 = if (is_darwin or is_bsd) c.EV_ERROR else 0;
-
-const EventType = struct {
-    readable: bool = false,
-    writable: bool = false,
-    error_or_hup: bool = false,
+pub const ServerState = enum {
+    stopped,
+    starting,
+    running,
+    stopping,
 };
-
-const PollResult = struct {
-    fd: posix.fd_t,
-    events: EventType,
-};
-
-/// Maximum concurrent TCP clients.
-pub const MAX_CLIENTS: u32 = 64;
-const MAX_EVENTS: u32 = 64;
-const LISTEN_BACKLOG: u31 = 128;
-const IDLE_CHECK_INTERVAL: u32 = 100;
-const MAX_ACCEPTS_PER_POLL: u32 = 16;
-const MAX_FRAMES_PER_CHUNK: u32 = 16;
-const MAX_FRAMES_PER_READ_EVENT: u32 = 8192;
-const MAX_RAW_BYTES_PER_CHUNK: u32 = 16_384;
-const MAX_RAW_BYTES_PER_READ_EVENT: u32 = 1024 * 1024;
-const SOCKET_BUFFER_SIZE: u32 = 2 * 1024 * 1024;
-
-/// Maximum client ID value.
-const MAX_CLIENT_ID_VALUE: config.ClientId = @intCast(output_router.MAX_TCP_CLIENTS - 1);
-
-comptime {
-    std.debug.assert(MAX_CLIENTS > 0);
-    std.debug.assert(MAX_EVENTS > 0);
-    std.debug.assert(MAX_ACCEPTS_PER_POLL > 0);
-    std.debug.assert(MAX_FRAMES_PER_CHUNK > 0);
-    std.debug.assert(MAX_FRAMES_PER_READ_EVENT >= MAX_FRAMES_PER_CHUNK);
-    std.debug.assert(SOCKET_BUFFER_SIZE >= 64 * 1024);
-    std.debug.assert(MAX_CLIENTS <= output_router.MAX_TCP_CLIENTS);
-    std.debug.assert(MAX_CLIENT_ID_VALUE > 0);
-    std.debug.assert(MAX_CLIENT_ID_VALUE < output_router.MAX_TCP_CLIENTS);
-}
-
-pub const MessageCallback = *const fn (client_id: config.ClientId, message: *const msg.InputMsg, ctx: ?*anyopaque) void;
-pub const DisconnectCallback = *const fn (client_id: config.ClientId, ctx: ?*anyopaque) void;
-pub const ConnectCallback = *const fn (client_id: config.ClientId, fd: posix.fd_t, ctx: ?*anyopaque) ?*tcp_client.OutputQueue;
 
 pub const ServerStats = struct {
-    current_clients: u32,
-    total_connections: u64,
-    total_disconnections: u64,
-    total_messages_in: u64,
-    total_messages_out: u64,
-    total_bytes_in: u64,
-    total_bytes_out: u64,
+    connections_accepted: u64,
+    connections_closed: u64,
+    messages_received: u64,
+    messages_sent: u64,
+    bytes_received: u64,
+    bytes_sent: u64,
     accept_errors: u64,
-    decode_errors: u64,
-    idle_timeouts: u64,
-    error_disconnects: u64,
+    current_clients: u32,
+
+    pub fn init() ServerStats {
+        return ServerStats{
+            .connections_accepted = 0,
+            .connections_closed = 0,
+            .messages_received = 0,
+            .messages_sent = 0,
+            .bytes_received = 0,
+            .bytes_sent = 0,
+            .accept_errors = 0,
+            .current_clients = 0,
+        };
+    }
 };
 
-const Poller = struct {
-    fd: posix.fd_t,
+const ClientSlot = struct {
+    connection: ?TcpConnection,
+    active: bool,
 
-    const Self = @This();
-
-    pub fn init() !Self {
-        if (is_linux) {
-            const fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
-            return .{ .fd = fd };
-        } else if (is_darwin or is_bsd) {
-            const fd = try posix.kqueue();
-            return .{ .fd = fd };
-        } else {
-            @compileError("Unsupported platform for event polling");
-        }
-    }
-
-    pub fn deinit(self: *Self) void {
-        posix.close(self.fd);
-    }
-
-    pub fn addRead(self: *Self, fd: posix.fd_t) !void {
-        if (is_linux) {
-            var ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = fd } };
-            try epollCtl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev);
-        } else {
-            var changelist = [_]posix.Kevent{makeKEvent(fd, EVFILT_READ, EV_ADD, 0)};
-            _ = try posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null);
-        }
-    }
-
-    pub fn addClient(self: *Self, fd: posix.fd_t) !void {
-        if (is_linux) {
-            var ev = linux.epoll_event{
-                .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP,
-                .data = .{ .fd = fd },
-            };
-            try epollCtl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev);
-        } else {
-            var changelist = [_]posix.Kevent{makeKEvent(fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0)};
-            _ = try posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null);
-        }
-    }
-
-    pub fn updateClient(self: *Self, fd: posix.fd_t, want_write: bool) !void {
-        if (is_linux) {
-            var events: u32 = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP;
-            if (want_write) events |= linux.EPOLL.OUT;
-            var ev = linux.epoll_event{ .events = events, .data = .{ .fd = fd } };
-            try epollCtl(self.fd, linux.EPOLL.CTL_MOD, fd, &ev);
-        } else {
-            if (want_write) {
-                var changelist = [_]posix.Kevent{makeKEvent(fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0)};
-                _ = try posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null);
-            } else {
-                var changelist = [_]posix.Kevent{makeKEvent(fd, EVFILT_WRITE, EV_DELETE, 0)};
-                _ = posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null) catch {};
-            }
-        }
-    }
-
-    pub fn remove(self: *Self, fd: posix.fd_t) void {
-        if (is_linux) {
-            epollCtl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
-        } else {
-            var changelist = [_]posix.Kevent{
-                makeKEvent(fd, EVFILT_READ, EV_DELETE, 0),
-                makeKEvent(fd, EVFILT_WRITE, EV_DELETE, 0),
-            };
-            _ = posix.kevent(self.fd, &changelist, &[_]posix.Kevent{}, null) catch {};
-        }
-    }
-
-    pub fn wait(self: *Self, results: []PollResult, timeout_ms: i32) ![]PollResult {
-        if (is_linux) {
-            var events: [MAX_EVENTS]linux.epoll_event = undefined;
-            const n: usize = posix.epoll_wait(self.fd, &events, timeout_ms);
-            const count = @min(n, results.len);
-
-            for (0..count) |i| {
-                results[i] = .{
-                    .fd = events[i].data.fd,
-                    .events = .{
-                        .readable = (events[i].events & linux.EPOLL.IN) != 0,
-                        .writable = (events[i].events & linux.EPOLL.OUT) != 0,
-                        .error_or_hup = (events[i].events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0,
-                    },
-                };
-            }
-            return results[0..count];
-        } else {
-            var events: [MAX_EVENTS]posix.Kevent = undefined;
-            var timeout_val: posix.timespec = .{
-                .tv_sec = @intCast(@divTrunc(timeout_ms, 1000)),
-                .tv_nsec = @intCast(@mod(timeout_ms, 1000) * 1_000_000),
-            };
-            const timeout_ptr: ?*const posix.timespec = if (timeout_ms < 0) null else &timeout_val;
-
-            var n: usize = 0;
-            while (true) {
-                n = posix.kevent(self.fd, &[_]posix.Kevent{}, &events, timeout_ptr) catch |err| {
-                    if (err == error.Interrupted) continue;
-                    return err;
-                };
-                break;
-            }
-
-            const count = @min(n, results.len);
-            for (0..count) |i| {
-                const ev = &events[i];
-                const fd: posix.fd_t = @intCast(ev.ident);
-                results[i] = .{
-                    .fd = fd,
-                    .events = .{
-                        .readable = ev.filter == EVFILT_READ,
-                        .writable = ev.filter == EVFILT_WRITE,
-                        .error_or_hup = (ev.flags & EV_EOF) != 0 or (ev.flags & EV_ERROR) != 0,
-                    },
-                };
-            }
-            return results[0..count];
-        }
-    }
-
-    fn epollCtl(epfd: posix.fd_t, op: u32, fd: posix.fd_t, event: ?*linux.epoll_event) !void {
-        const rc = linux.epoll_ctl(epfd, op, fd, event);
-        if (rc != 0) return error.EpollCtlFailed;
-    }
-
-    fn makeKEvent(ident: posix.fd_t, filter: i16, flags: u16, fflags: u32) posix.Kevent {
-        return .{
-            .ident = @intCast(ident),
-            .filter = filter,
-            .flags = flags,
-            .fflags = fflags,
-            .data = 0,
-            .udata = 0,
+    pub fn init() ClientSlot {
+        return ClientSlot{
+            .connection = null,
+            .active = false,
         };
+    }
+
+    pub fn isActive(self: *const ClientSlot) bool {
+        return self.active and self.connection != null;
     }
 };
 
 pub const TcpServer = struct {
-    listen_fd: ?posix.fd_t = null,
-    poller: ?Poller = null,
-    clients: tcp_client.ClientPool(MAX_CLIENTS) = .{},
-    next_client_id: config.ClientId = 1,
-
-    on_message: ?MessageCallback = null,
-    on_disconnect: ?DisconnectCallback = null,
-    on_connect: ?ConnectCallback = null,
-    callback_ctx: ?*anyopaque = null,
-
-    use_framing: bool = true,
-    idle_timeout_secs: i64 = 300,
-
-    total_connections: u64 = 0,
-    total_disconnections: u64 = 0,
-    accept_errors: u64 = 0,
-    decode_errors: u64 = 0,
-    idle_timeouts: u64 = 0,
-    error_disconnects: u64 = 0,
-    poll_cycles: u64 = 0,
-
-    // Output drain stats
-    output_drain_calls: u64 = 0,
-    output_messages_drained: u64 = 0,
-
-    allocator: std.mem.Allocator,
+    listener: ?net.Server,
+    clients: [MAX_CLIENTS]ClientSlot,
+    next_client_id: u32,
+    state: ServerState,
+    stats: ServerStats,
+    poll_fds: [MAX_CLIENTS + 1]posix.pollfd,
+    poll_fd_count: usize,
+    input_queue: ?*InputEnvelopeQueue,
+    output_queue: ?*OutputEnvelopeQueue,
+    input_sequence: u64,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{ .allocator = allocator };
+    /// Initialize server in-place (avoids stack allocation of large struct)
+    pub fn initInPlace(self: *Self) void {
+        self.listener = null;
+        self.next_client_id = 1;
+        self.state = .stopped;
+        self.stats = ServerStats.init();
+        self.poll_fd_count = 0;
+        self.input_queue = null;
+        self.output_queue = null;
+        self.input_sequence = 0;
+
+        for (&self.clients) |*slot| {
+            slot.* = ClientSlot.init();
+        }
+
+        for (&self.poll_fds) |*pfd| {
+            pfd.fd = -1;
+            pfd.events = 0;
+            pfd.revents = 0;
+        }
     }
 
-    pub fn deinit(self: *Self) void {
-        self.stop();
+    /// Legacy init - WARNING: creates large struct on stack
+    pub fn init() Self {
+        var self: Self = undefined;
+        self.initInPlace();
+        return self;
     }
 
-    pub fn start(self: *Self, address: []const u8, port: u16) !void {
-        const listen_fd = try posix.socket(
-            posix.AF.INET,
-            posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-            0,
+    pub fn start(self: *Self, address: net.Address) !void {
+        std.debug.assert(self.state == .stopped);
+        self.state = .starting;
+        self.listener = try address.listen(.{
+            .reuse_address = true,
+        });
+        const flags = try posix.fcntl(self.listener.?.stream.handle, posix.F.GETFL, 0);
+        _ = try posix.fcntl(
+            self.listener.?.stream.handle,
+            posix.F.SETFL,
+            flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
         );
-        errdefer posix.close(listen_fd);
-
-        try net_utils.setReuseAddr(listen_fd);
-
-        const addr = try net_utils.parseSockAddr(address, port);
-        const addr_len: posix.socklen_t = @intCast(@sizeOf(@TypeOf(addr)));
-        try posix.bind(listen_fd, @ptrCast(&addr), addr_len);
-        try posix.listen(listen_fd, LISTEN_BACKLOG);
-
-        var poller = try Poller.init();
-        errdefer poller.deinit();
-
-        try poller.addRead(listen_fd);
-
-        self.listen_fd = listen_fd;
-        self.poller = poller;
-
-        const platform = if (is_linux) "epoll" else if (is_darwin) "kqueue" else "poll";
-        std.log.info(
-            "TCP server listening on {s}:{} (framing={}, max_clients={}, backend={s}, idle_timeout={}s, max_client_id={})",
-            .{ address, port, self.use_framing, MAX_CLIENTS, platform, self.idle_timeout_secs, MAX_CLIENT_ID_VALUE },
-        );
+        self.state = .running;
     }
 
     pub fn stop(self: *Self) void {
-        var iter = self.clients.getActive();
-        while (iter.next()) |client| {
-            self.disconnectClientInternal(client, false);
-        }
-
-        if (self.poller) |*poller| {
-            poller.deinit();
-            self.poller = null;
-        }
-
-        if (self.listen_fd) |fd| {
-            posix.close(fd);
-            self.listen_fd = null;
-        }
-
-        std.log.info("TCP server stopped (total connections: {})", .{self.total_connections});
-        std.log.info("TCP server drain stats: calls={}, messages_drained={}", .{
-            self.output_drain_calls,
-            self.output_messages_drained,
-        });
-    }
-
-    pub fn isRunning(self: *const Self) bool {
-        return self.listen_fd != null and self.poller != null;
-    }
-
-    /// Main poll function - C-style: process outputs FIRST, then wait for events.
-    pub fn poll(self: *Self, timeout_ms: i32) !usize {
-        var poller = self.poller orelse return error.NotStarted;
-        const listen_fd = self.listen_fd orelse return error.NotStarted;
-
-        // ================================================================
-        // CRITICAL: Process output queues FIRST, before epoll/kqueue wait
-        // This matches C server's tcp_listener.c pattern exactly.
-        // ================================================================
-        const output_work_done = self.processOutputQueues();
-
-        // If we did output work, don't block - there may be more.
-        const effective_timeout = if (output_work_done > 0) 0 else timeout_ms;
-
-        var results: [MAX_EVENTS]PollResult = undefined;
-        const events = try poller.wait(&results, effective_timeout);
-
-        var processed: usize = 0;
-
-        for (events) |ev| {
-            if (ev.fd == listen_fd) {
-                self.acceptConnections();
-                processed += 1;
-            } else if (self.clients.findByFd(ev.fd)) |client| {
-                self.handleClientEvent(client, ev.events);
-                processed += 1;
+        if (self.state != .running) return;
+        self.state = .stopping;
+        for (&self.clients) |*slot| {
+            if (slot.connection) |*conn| {
+                conn.close();
+                slot.active = false;
+                slot.connection = null;
             }
         }
-
-        self.poll_cycles += 1;
-        if (self.idle_timeout_secs > 0 and self.poll_cycles % IDLE_CHECK_INTERVAL == 0) {
-            self.checkIdleClients();
+        if (self.listener) |*listener| {
+            listener.deinit();
+            self.listener = null;
         }
-
-        return processed;
+        self.state = .stopped;
     }
 
-    /// Process ALL client output queues - matches C server's process_output_queues()
-    ///
-    /// C pattern: For each active client without pending write:
-    ///   1. Dequeue ONE message from output queue
-    ///   2. Format it
-    ///   3. Try immediate write
-    ///   4. If blocked, enable EPOLLOUT
-    ///
-    /// Zig optimization: Batch dequeue multiple messages before attempting send,
-    /// but still process all clients in a single sweep.
-    ///
-    /// Returns total messages drained this cycle.
-    fn processOutputQueues(self: *Self) u64 {
-        const start_time = std.time.microTimestamp();
-        defer {
-            const elapsed = std.time.microTimestamp() - start_time;
-            if (elapsed > 1000) {  // > 1ms
-                std.log.warn("processOutputQueues took {}us", .{elapsed});
-            }
-        }
-        self.output_drain_calls += 1;
+    pub fn setQueues(self: *Self, input: *InputEnvelopeQueue, output: *OutputEnvelopeQueue) void {
+        self.input_queue = input;
+        self.output_queue = output;
+    }
 
-        var total_drained: u64 = 0;
-        var iter = self.clients.getActive();
-
-        while (iter.next()) |client| {
-            if (client.state != .connected) continue;
-
-            // Skip if client already has pending send data (matches C: has_pending_write check)
-            if (client.hasPendingSend()) {
-                // Try to flush existing data
-                client.flushSend() catch |err| {
-                    if (err == error.WouldBlock) {
-                        self.updateClientPoller(client, true) catch {};
-                        continue;
-                    }
-                    self.error_disconnects += 1;
-                    self.disconnectClient(client);
-                    continue;
-                };
-
-                // If still has pending after flush, skip this client this cycle
-                if (client.hasPendingSend()) {
-                    self.updateClientPoller(client, true) catch {};
-                    continue;
-                }
-            }
-
-            // No pending send - drain from output queue
-            if (!client.hasOutputQueueMessages()) continue;
-
-            // Batch drain: pull multiple messages into send buffer
-            const drained = client.drainOutputQueueBatch(tcp_client.OUTPUT_DRAIN_BATCH_SIZE);
-            if (drained == 0) continue;
-
-            total_drained += drained;
-
-            // Try immediate send (matches C: try immediate write)
-            client.flushSend() catch |err| {
-                if (err == error.WouldBlock) {
-                    self.updateClientPoller(client, true) catch {};
-                    continue;
-                }
-                self.error_disconnects += 1;
-                self.disconnectClient(client);
-                continue;
+    pub fn poll(self: *Self) !u32 {
+        if (self.state != .running) return 0;
+        var events_processed: u32 = 0;
+        events_processed += try self.acceptConnections();
+        events_processed += self.processOutputQueue();
+        self.buildPollFds();
+        if (self.poll_fd_count > 0) {
+            const ready = posix.poll(self.poll_fds[0..self.poll_fd_count], POLL_TIMEOUT_MS) catch {
+                return events_processed;
             };
-
-            // If partial send, enable EPOLLOUT
-            if (client.hasPendingSend()) {
-                self.updateClientPoller(client, true) catch {};
-            } else {
-                // Fully sent - disable EPOLLOUT
-                self.updateClientPoller(client, false) catch {};
+            if (ready > 0) {
+                events_processed += try self.handlePollEvents();
             }
         }
-
-        self.output_messages_drained += total_drained;
-
-        // Sparse telemetry
-        if (self.output_drain_calls % 5000 == 0 and total_drained > 0) {
-            std.log.warn("processOutputQueues: call {} drained_total={}", .{
-                self.output_drain_calls,
-                self.output_messages_drained,
-            });
-        }
-
-        return total_drained;
+        self.cleanupDisconnected();
+        return events_processed;
     }
 
-    /// Legacy method for older call sites.
-    pub fn drainAllClientOutputQueues(self: *Self) void {
-        _ = self.processOutputQueues();
-    }
-
-    fn checkIdleClients(self: *Self) void {
-        var iter = self.clients.getActive();
-        while (iter.next()) |client| {
-            if (client.getIdleDuration() > self.idle_timeout_secs) {
-                self.idle_timeouts += 1;
-                self.disconnectClient(client);
-            }
+    pub fn run(self: *Self) !void {
+        while (self.state == .running) {
+            _ = try self.poll();
         }
     }
 
-    fn acceptConnections(self: *Self) void {
-        const listen_fd = self.listen_fd orelse return;
-
+    fn acceptConnections(self: *Self) !u32 {
         var accepted: u32 = 0;
-        while (accepted < MAX_ACCEPTS_PER_POLL) : (accepted += 1) {
-            self.acceptOne(listen_fd) catch |err| {
-                if (err == error.WouldBlock) break;
-                self.accept_errors += 1;
-                if (err != error.SystemResources and err != error.ProcessFdQuotaExceeded) break;
-            };
-        }
-    }
-
-    fn acceptOne(self: *Self, listen_fd: posix.fd_t) !void {
-        var poller = self.poller orelse return error.NotStarted;
-
-        var client_addr: posix.sockaddr.in = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(@TypeOf(client_addr));
-
-        const client_fd = try posix.accept(
-            listen_fd,
-            @ptrCast(&client_addr),
-            &addr_len,
-            posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-        );
-        errdefer posix.close(client_fd);
-
-        // Socket buffer sizing (best-effort)
-        const sock_buf_size: u32 = SOCKET_BUFFER_SIZE;
-        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(sock_buf_size)) catch {};
-        posix.setsockopt(client_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(sock_buf_size)) catch {};
-
-        const client_slot = self.clients.allocate() orelse {
-            posix.close(client_fd);
-            return;
-        };
-
-        const client_id = self.allocateClientId();
-
-        client_slot.* = TcpClient.init(self.allocator, client_fd, client_id) catch {
-            posix.close(client_fd);
-            return;
-        };
-
-        self.total_connections += 1;
-        self.clients.active_count += 1;
-
-        net_utils.setLowLatencyOptions(client_fd);
-
-        poller.addClient(client_fd) catch {
-            client_slot.reset();
-            self.clients.active_count -= 1;
-            return;
-        };
-
-        std.log.info("Client {} connected (fd={}, active={})", .{ client_id, client_fd, self.clients.active_count });
-
-        // Register with OutputRouter and get per-client output queue
-        if (self.on_connect) |cb| {
-            if (cb(client_id, client_fd, self.callback_ctx)) |output_queue| {
-                client_slot.setOutputQueue(output_queue);
-                std.log.debug("Client {} output_queue SET", .{client_id});
-            } else {
-                std.log.warn("Client {} output_queue NOT SET (callback returned null)", .{client_id});
-            }
-        } else {
-            std.log.warn("Client {} - no on_connect callback!", .{client_id});
-        }
-    }
-
-    fn handleClientEvent(self: *Self, client: *TcpClient, events: EventType) void {
-        if (events.error_or_hup) {
-            self.disconnectClient(client);
-            return;
-        }
-
-        if (events.readable) {
-            self.handleClientRead(client) catch |err| {
-                if (err != error.WouldBlock) self.disconnectClient(client);
-            };
-        }
-
-        if (events.writable) {
-            // Writable event - flush pending data
-            client.flushSend() catch |err| {
-                if (err == error.WouldBlock) return;
-                self.error_disconnects += 1;
-                self.disconnectClient(client);
-                return;
-            };
-
-            // If fully flushed, disable EPOLLOUT
-            if (!client.hasPendingSend()) {
-                self.updateClientPoller(client, false) catch {};
-            }
-        }
-    }
-
-    fn handleClientRead(self: *Self, client: *TcpClient) !void {
-        // Drain socket (ET requirement)
-        while (true) {
-            _ = client.receive() catch |err| {
-                if (err == error.WouldBlock) break;
-                if (err == error.BufferFull) break;
-                return err;
-            };
-        }
-
-        // Drain user buffer (ET requirement)
-        if (self.use_framing) {
-            var total: u32 = 0;
-            while (total < MAX_FRAMES_PER_READ_EVENT) {
-                const n = self.processFramedMessagesChunk(client, MAX_FRAMES_PER_CHUNK);
-                if (n == 0) break;
-                total += n;
-            }
-        } else {
-            var total_bytes: u32 = 0;
-            while (total_bytes < MAX_RAW_BYTES_PER_READ_EVENT) {
-                const n = self.processRawMessagesChunk(client, MAX_RAW_BYTES_PER_CHUNK);
-                if (n == 0) break;
-                total_bytes += n;
-            }
-        }
-    }
-
-    fn processFramedMessagesChunk(self: *Self, client: *TcpClient, max_frames: u32) u32 {
-        var frames_processed: u32 = 0;
-
-        while (frames_processed < max_frames) : (frames_processed += 1) {
-            const frame_result = client.extractFrame();
-            switch (frame_result) {
-                .frame => |payload| {
-                    if (client.protocol == .unknown) client.protocol = codec.detectProtocol(payload);
-                    self.decodeAndDispatch(client, payload);
-                    client.consumeFrame(payload.len);
-                },
-                .incomplete, .empty => return frames_processed,
-                .oversized => {
-                    if (client.recordDecodeError()) {
-                        self.error_disconnects += 1;
-                        self.disconnectClient(client);
-                        return frames_processed;
-                    }
-                    continue;
-                },
-            }
-        }
-        return frames_processed;
-    }
-
-    fn processRawMessagesChunk(self: *Self, client: *TcpClient, max_bytes: u32) u32 {
-        var processed: u32 = 0;
-        const data = client.getReceivedData();
-
-        if (data.len == 0) return 0;
-
-        const max_process = @min(@as(u32, @intCast(data.len)), max_bytes);
-
-        while (processed < max_process) {
-            const remaining = data[processed..];
-
-            if (client.protocol == .unknown) {
-                client.protocol = codec.detectProtocol(remaining);
-                if (client.protocol == .unknown and remaining.len < 8) break;
-            }
-
-            const result = codec.Codec.decodeInput(remaining) catch |err| {
-                if (err == codec.CodecError.IncompleteMessage) break;
-                self.decode_errors += 1;
-                if (client.recordDecodeError()) {
-                    self.error_disconnects += 1;
-                    self.disconnectClient(client);
-                    return processed;
+        while (accepted < ACCEPT_BATCH_SIZE) {
+            const accept_result = self.listener.?.accept() catch |err| {
+                switch (err) {
+                    error.WouldBlock => break,
+                    else => {
+                        self.stats.accept_errors += 1;
+                        break;
+                    },
                 }
-                processed += 1;
-                continue;
             };
 
-            client.resetErrors();
-            if (self.on_message) |cb| cb(client.client_id, &result.message, self.callback_ctx);
-            client.stats.messages_received += 1;
-            processed += @intCast(result.bytes_consumed);
-        }
+            std.debug.print("DEBUG: Accepted connection from client\n", .{});
 
-        if (processed > 0) client.consumeBytes(processed);
+            const slot_idx = self.findFreeSlot() orelse {
+                accept_result.stream.close();
+                break;
+            };
+            const client_id = self.next_client_id;
+            self.next_client_id += 1;
+            var conn = TcpConnection.init(client_id, accept_result.stream, accept_result.address);
+            conn.setNonBlocking(true) catch {};
+            conn.setNoDelay(true) catch {};
+            self.clients[slot_idx].connection = conn;
+            self.clients[slot_idx].active = true;
+            self.stats.connections_accepted += 1;
+            self.stats.current_clients += 1;
+            accepted += 1;
+        }
+        return accepted;
+    }
+
+    fn processOutputQueue(self: *Self) u32 {
+        const output_queue = self.output_queue orelse return 0;
+        var processed: u32 = 0;
+        while (processed < MAX_POLL_EVENTS) {
+            const envelope = output_queue.pop() orelse break;
+            if (envelope.client_id == 0) {
+                self.broadcastMessage(&envelope.message);
+            } else {
+                self.sendToClient(envelope.client_id, &envelope.message);
+            }
+            processed += 1;
+            self.stats.messages_sent += 1;
+        }
         return processed;
     }
 
-    fn decodeAndDispatch(self: *Self, client: *TcpClient, payload: []const u8) void {
-        const result = codec.Codec.decodeInput(payload) catch {
-            self.decode_errors += 1;
-            _ = client.recordDecodeError();
-            return;
-        };
-
-        client.resetErrors();
-        if (self.on_message) |cb| cb(client.client_id, &result.message, self.callback_ctx);
-    }
-
-    // ========================================================================
-    // Direct Send Operations
-    // ========================================================================
-
-    pub fn send(self: *Self, client_id: config.ClientId, data: []const u8) bool {
-        const client = self.clients.findById(client_id) orelse return false;
-
-        const ok = if (self.use_framing) client.queueFramedSend(data) else client.queueRawSend(data);
-        if (!ok) return false;
-
-        client.recordMessageSent();
-
-        // Try immediate send
-        client.flushSend() catch |err| {
-            if (err == error.WouldBlock) {
-                self.updateClientPoller(client, true) catch {};
-            }
-        };
-
-        return true;
-    }
-
-    pub fn broadcast(self: *Self, data: []const u8) u32 {
-        var sent_count: u32 = 0;
-        var iter = self.clients.getActive();
-
-        while (iter.next()) |client| {
-            if (client.state != .connected) continue;
-
-            const ok = if (self.use_framing) client.queueFramedSend(data) else client.queueRawSend(data);
-            if (!ok) continue;
-
-            client.recordMessageSent();
-
-            client.flushSend() catch |err| {
-                if (err == error.WouldBlock) {
-                    self.updateClientPoller(client, true) catch {};
+    fn broadcastMessage(self: *Self, message: *const msg.OutputMsg) void {
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    _ = conn.queueMessage(message);
                 }
+            }
+        }
+    }
+
+    fn sendToClient(self: *Self, client_id: u32, message: *const msg.OutputMsg) void {
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    if (conn.client_id == client_id) {
+                        _ = conn.queueMessage(message);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn buildPollFds(self: *Self) void {
+        self.poll_fd_count = 0;
+        if (self.listener) |listener| {
+            self.poll_fds[self.poll_fd_count] = .{
+                .fd = listener.stream.handle,
+                .events = posix.POLL.IN,
+                .revents = 0,
             };
-
-            sent_count += 1;
+            self.poll_fd_count += 1;
         }
-        return sent_count;
-    }
-
-    // ========================================================================
-    // Client Management
-    // ========================================================================
-
-    pub fn disconnectClient(self: *Self, client: *TcpClient) void {
-        self.disconnectClientInternal(client, true);
-    }
-
-    fn disconnectClientInternal(self: *Self, client: *TcpClient, invoke_callback: bool) void {
-        if (client.state == .disconnected) return;
-
-        const client_id = client.client_id;
-        const fd = client.fd;
-
-        if (self.poller) |*poller| poller.remove(fd);
-
-        client.reset();
-        self.clients.active_count -= 1;
-        self.total_disconnections += 1;
-
-        if (invoke_callback) {
-            if (self.on_disconnect) |cb| cb(client_id, self.callback_ctx);
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    var events: i16 = posix.POLL.IN;
+                    if (conn.hasPendingData()) {
+                        events |= posix.POLL.OUT;
+                    }
+                    self.poll_fds[self.poll_fd_count] = .{
+                        .fd = conn.getFd(),
+                        .events = events,
+                        .revents = 0,
+                    };
+                    self.poll_fd_count += 1;
+                }
+            }
         }
     }
 
-    pub fn updateClientPoller(self: *Self, client: *TcpClient, want_write: bool) !void {
-        var poller = self.poller orelse return error.NotStarted;
-        try poller.updateClient(client.fd, want_write);
+    fn handlePollEvents(self: *Self) !u32 {
+        var events_handled: u32 = 0;
+        var fd_idx: usize = 1;
+        for (&self.clients) |*slot| {
+            if (!slot.isActive()) continue;
+            if (fd_idx >= self.poll_fd_count) break;
+            const pfd = &self.poll_fds[fd_idx];
+            fd_idx += 1;
+            if (pfd.revents == 0) continue;
+            if (slot.connection) |*conn| {
+                if (pfd.revents & posix.POLL.IN != 0) {
+                    events_handled += try self.handleClientRead(conn);
+                }
+                if (pfd.revents & posix.POLL.OUT != 0) {
+                    _ = conn.trySend() catch {};
+                    events_handled += 1;
+                }
+                if (pfd.revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
+                    conn.state = .disconnecting;
+                }
+            }
+        }
+        return events_handled;
     }
 
-    pub fn enableWriteForClient(self: *Self, client_id: config.ClientId) void {
-        if (self.clients.findById(client_id)) |client| {
-            self.updateClientPoller(client, true) catch {};
+    fn handleClientRead(self: *Self, conn: *TcpConnection) !u32 {
+        var messages_received: u32 = 0;
+        const received = conn.tryReceive() catch false;
+
+        if (received) {
+            std.debug.print("DEBUG: Received data from client {d}, parser buffer len={d}\n", .{ conn.client_id, conn.parser.buffer.len });
+
+            // Show first bytes
+            const data = conn.parser.buffer.slice();
+            if (data.len > 0) {
+                std.debug.print("DEBUG: First bytes: ", .{});
+                for (data[0..@min(data.len, 16)]) |b| {
+                    std.debug.print("{x:0>2} ", .{b});
+                }
+                std.debug.print("\n", .{});
+
+                // Check protocol detection
+                const protocol = framing.detectProtocol(data);
+                std.debug.print("DEBUG: Detected protocol: {s}\n", .{protocol.toString()});
+            }
+        }
+
+        if (received) {
+            while (conn.nextMessage()) |message| {
+                std.debug.print("DEBUG: Parsed message type: {any}\n", .{message.type});
+                self.stats.messages_received += 1;
+                messages_received += 1;
+                if (self.input_queue) |queue| {
+                    const envelope = InputEnvelope{
+                        .message = message,
+                        .client_id = conn.client_id,
+                        ._pad = undefined,
+                    };
+                    _ = queue.push(envelope);
+                    self.input_sequence += 1;
+                }
+            }
+        }
+        self.stats.bytes_received += conn.stats.bytes_received;
+        return messages_received;
+    }
+
+    fn cleanupDisconnected(self: *Self) void {
+        for (&self.clients) |*slot| {
+            if (slot.connection) |*conn| {
+                if (conn.state == .disconnecting or conn.state == .disconnected) {
+                    conn.close();
+                    slot.active = false;
+                    slot.connection = null;
+                    self.stats.connections_closed += 1;
+                    self.stats.current_clients -= 1;
+                }
+            }
         }
     }
 
-    fn allocateClientId(self: *Self) config.ClientId {
-        var attempts: u32 = 0;
-        const max_attempts = MAX_CLIENTS + 10;
-
-        while (attempts < max_attempts) : (attempts += 1) {
-            const id = self.next_client_id;
-            self.next_client_id += 1;
-            if (self.next_client_id > MAX_CLIENT_ID_VALUE) self.next_client_id = 1;
-            if (self.clients.findById(id) == null) return id;
+    fn findFreeSlot(self: *Self) ?usize {
+        for (&self.clients, 0..) |*slot, idx| {
+            if (!slot.active) {
+                return idx;
+            }
         }
-
-        const id = self.next_client_id;
-        self.next_client_id += 1;
-        if (self.next_client_id > MAX_CLIENT_ID_VALUE) self.next_client_id = 1;
-        return id;
+        return null;
     }
 
     pub fn getStats(self: *const Self) ServerStats {
-        const agg = self.clients.getAggregateStats();
-        return .{
-            .current_clients = self.clients.active_count,
-            .total_connections = self.total_connections,
-            .total_disconnections = self.total_disconnections,
-            .total_messages_in = agg.total_messages_in,
-            .total_messages_out = agg.total_messages_out,
-            .total_bytes_in = agg.total_bytes_in,
-            .total_bytes_out = agg.total_bytes_out,
-            .accept_errors = self.accept_errors,
-            .decode_errors = self.decode_errors,
-            .idle_timeouts = self.idle_timeouts,
-            .error_disconnects = self.error_disconnects,
-        };
+        return self.stats;
     }
 
     pub fn getClientCount(self: *const Self) u32 {
-        return self.clients.active_count;
+        return self.stats.current_clients;
+    }
+
+    pub fn isRunning(self: *const Self) bool {
+        return self.state == .running;
+    }
+
+    pub fn getClient(self: *Self, client_id: u32) ?*TcpConnection {
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    if (conn.client_id == client_id) {
+                        return conn;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn disconnectClient(self: *Self, client_id: u32) void {
+        if (self.getClient(client_id)) |conn| {
+            conn.state = .disconnecting;
+        }
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+test "server init" {
+    var server: TcpServer = undefined;
+    server.initInPlace();
+    try std.testing.expectEqual(ServerState.stopped, server.state);
+    try std.testing.expectEqual(@as(u32, 0), server.stats.current_clients);
+}
+
+test "server stats init" {
+    const stats = ServerStats.init();
+    try std.testing.expectEqual(@as(u64, 0), stats.connections_accepted);
+    try std.testing.expectEqual(@as(u64, 0), stats.messages_sent);
+}
+
+test "client slot" {
+    var slot = ClientSlot.init();
+    try std.testing.expect(!slot.isActive());
+}
+
+test "find free slot" {
+    var server: TcpServer = undefined;
+    server.initInPlace();
+    const slot = server.findFreeSlot();
+    try std.testing.expect(slot != null);
+    try std.testing.expectEqual(@as(usize, 0), slot.?);
+}

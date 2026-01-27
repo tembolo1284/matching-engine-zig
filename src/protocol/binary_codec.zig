@@ -1,654 +1,494 @@
-//! Binary protocol codec - matches C specification exactly.
+//! Binary Protocol Codec
 //!
-//! Wire format:
-//! ```
-//!   Byte 0:     Magic (0x4D = 'M')
-//!   Byte 1:     Message type (ASCII char)
-//!   Byte 2+:    Payload (type-specific, network byte order)
-//! ```
+//! Wire-format encoding/decoding for high-performance binary messaging.
+//! All multi-byte integers are in network byte order (big-endian).
 //!
-//! All multi-byte integers are BIG-ENDIAN (network byte order).
-//! Structs are packed (no padding between fields).
-//!
-//! Message sizes (including 2-byte header):
-//! - New Order:   27 bytes
-//! - Cancel:      10 bytes (no symbol - looked up from order tracking)
-//! - Flush:        2 bytes
-//! - Ack:         18 bytes
-//! - Cancel Ack:  18 bytes
-//! - Trade:       34 bytes
-//! - Top of Book: 20 bytes
-//! - Reject:      19 bytes
-//!
-//! Security:
-//! - All enum values are validated before use (no @enumFromInt on untrusted data)
-//! - All buffer accesses are bounds-checked
-//! - Invalid messages return errors, never UB
-//!
-//! NASA Power of Ten Compliance:
-//! - Rule 5: Assertions validate inputs in encode functions
-//! - Rule 7: All buffer bounds are checked before access
+//! Since Zig 0.15 doesn't allow arrays in packed structs, we use
+//! manual byte-level encoding/decoding for exact wire format control.
+
 const std = @import("std");
 const msg = @import("message_types.zig");
-const codec = @import("codec.zig");
+
 // ============================================================================
 // Protocol Constants
 // ============================================================================
-/// Magic byte identifying binary protocol.
-pub const MAGIC: u8 = 0x4D; // 'M'
-/// Header size (magic + type).
-pub const HEADER_SIZE: usize = 2;
-// === Message Type Bytes ===
-pub const MSG_NEW_ORDER: u8 = 'N'; // 0x4E
-pub const MSG_CANCEL: u8 = 'C'; // 0x43
-pub const MSG_FLUSH: u8 = 'F'; // 0x46
-pub const MSG_ACK: u8 = 'A'; // 0x41
-pub const MSG_CANCEL_ACK: u8 = 'X'; // 0x58
-pub const MSG_TRADE: u8 = 'T'; // 0x54
-pub const MSG_TOP_OF_BOOK: u8 = 'B'; // 0x42
-pub const MSG_REJECT: u8 = 'R'; // 0x52
-// === Wire Sizes (total including header) ===
-/// New Order: magic(1) + type(1) + user_id(4) + symbol(8) + price(4) + qty(4) + side(1) + order_id(4) = 27
-pub const NEW_ORDER_WIRE_SIZE: usize = 27;
-/// Cancel: magic(1) + type(1) + user_id(4) + order_id(4) = 10 (NO symbol - looked up server-side)
-pub const CANCEL_WIRE_SIZE: usize = 10;
-/// Flush: magic(1) + type(1) = 2
-pub const FLUSH_WIRE_SIZE: usize = 2;
-/// Ack: magic(1) + type(1) + symbol(8) + user_id(4) + order_id(4) = 18
-pub const ACK_WIRE_SIZE: usize = 18;
-/// Cancel Ack: same as Ack = 18
-pub const CANCEL_ACK_WIRE_SIZE: usize = 18;
-/// Trade: magic(1) + type(1) + symbol(8) + buy_uid(4) + buy_oid(4) + sell_uid(4) + sell_oid(4) + price(4) + qty(4) = 34
-pub const TRADE_WIRE_SIZE: usize = 34;
-/// Top of Book: magic(1) + type(1) + symbol(8) + side(1) + price(4) + qty(4) + pad(1) = 20
-pub const TOP_OF_BOOK_WIRE_SIZE: usize = 20;
-/// Reject: magic(1) + type(1) + symbol(8) + user_id(4) + order_id(4) + reason(1) = 19
-pub const REJECT_WIRE_SIZE: usize = 19;
-// Compile-time validation
-comptime {
-    std.debug.assert(NEW_ORDER_WIRE_SIZE == HEADER_SIZE + 4 + msg.MAX_SYMBOL_LENGTH + 4 + 4 + 1 + 4);
-    std.debug.assert(CANCEL_WIRE_SIZE == HEADER_SIZE + 4 + 4); // No symbol in cancel
-    std.debug.assert(FLUSH_WIRE_SIZE == HEADER_SIZE);
-    std.debug.assert(ACK_WIRE_SIZE == HEADER_SIZE + msg.MAX_SYMBOL_LENGTH + 4 + 4);
-    std.debug.assert(TRADE_WIRE_SIZE == HEADER_SIZE + msg.MAX_SYMBOL_LENGTH + 4 + 4 + 4 + 4 + 4 + 4);
+
+pub const BINARY_MAGIC: u8 = 0x4D;
+
+pub const MSG_NEW_ORDER: u8 = 'N';
+pub const MSG_CANCEL: u8 = 'C';
+pub const MSG_FLUSH: u8 = 'F';
+
+pub const MSG_ACK: u8 = 'A';
+pub const MSG_CANCEL_ACK: u8 = 'X';
+pub const MSG_TRADE: u8 = 'T';
+pub const MSG_TOP_OF_BOOK: u8 = 'B';
+
+pub const BINARY_SYMBOL_LEN: usize = 8;
+
+// ============================================================================
+// Wire Format Sizes
+// ============================================================================
+
+pub const SIZE_NEW_ORDER: usize = 27;
+pub const SIZE_CANCEL: usize = 10;
+pub const SIZE_FLUSH: usize = 2;
+pub const SIZE_ACK: usize = 18;
+pub const SIZE_CANCEL_ACK: usize = 18;
+pub const SIZE_TRADE: usize = 34;
+pub const SIZE_TOP_OF_BOOK: usize = 19;
+
+// ============================================================================
+// Codec Errors
+// ============================================================================
+
+pub const CodecError = error{
+    BufferTooSmall,
+    InvalidMagic,
+    InvalidMessageType,
+    InvalidSide,
+    InvalidData,
+};
+
+// ============================================================================
+// Decode Result
+// ============================================================================
+
+pub const DecodeResult = struct {
+    message: msg.InputMsg,
+    bytes_consumed: usize,
+};
+
+// ============================================================================
+// Detection and Validation
+// ============================================================================
+
+pub fn isBinaryMessage(data: []const u8) bool {
+    if (data.len < 2) return false;
+    return data[0] == BINARY_MAGIC;
 }
-// ============================================================================
-// Safe Enum Parsing (Security Critical)
-// ============================================================================
-/// Parse Side from wire byte. Returns null if invalid.
-/// SECURITY: Never use @enumFromInt on untrusted input!
-fn parseSide(byte: u8) ?msg.Side {
-    return switch (byte) {
-        @intFromEnum(msg.Side.buy) => .buy,
-        @intFromEnum(msg.Side.sell) => .sell,
-        else => null,
+
+pub fn messageSize(msg_type: u8) usize {
+    return switch (msg_type) {
+        MSG_NEW_ORDER => SIZE_NEW_ORDER,
+        MSG_CANCEL => SIZE_CANCEL,
+        MSG_FLUSH => SIZE_FLUSH,
+        MSG_ACK => SIZE_ACK,
+        MSG_CANCEL_ACK => SIZE_CANCEL_ACK,
+        MSG_TRADE => SIZE_TRADE,
+        MSG_TOP_OF_BOOK => SIZE_TOP_OF_BOOK,
+        else => 0,
     };
 }
-/// Parse RejectReason from wire byte. Returns null if invalid.
-/// SECURITY: Never use @enumFromInt on untrusted input!
-fn parseRejectReason(byte: u8) ?msg.RejectReason {
-    return switch (byte) {
-        @intFromEnum(msg.RejectReason.unknown_symbol) => .unknown_symbol,
-        @intFromEnum(msg.RejectReason.invalid_quantity) => .invalid_quantity,
-        @intFromEnum(msg.RejectReason.invalid_price) => .invalid_price,
-        @intFromEnum(msg.RejectReason.order_not_found) => .order_not_found,
-        @intFromEnum(msg.RejectReason.duplicate_order_id) => .duplicate_order_id,
-        @intFromEnum(msg.RejectReason.pool_exhausted) => .pool_exhausted,
-        @intFromEnum(msg.RejectReason.unauthorized) => .unauthorized,
-        @intFromEnum(msg.RejectReason.throttled) => .throttled,
-        @intFromEnum(msg.RejectReason.book_full) => .book_full,
-        @intFromEnum(msg.RejectReason.invalid_order_id) => .invalid_order_id,
-        else => null,
+
+pub fn validate(data: []const u8) bool {
+    if (data.len < 2) return false;
+    if (data[0] != BINARY_MAGIC) return false;
+
+    const expected = messageSize(data[1]);
+    return expected > 0 and data.len >= expected;
+}
+
+// ============================================================================
+// Input Decoding
+// ============================================================================
+
+pub fn decodeInput(data: []const u8) CodecError!DecodeResult {
+    std.debug.assert(data.len >= 2);
+
+    if (data[0] != BINARY_MAGIC) {
+        return CodecError.InvalidMagic;
+    }
+
+    const msg_type = data[1];
+
+    return switch (msg_type) {
+        MSG_NEW_ORDER => decodeNewOrder(data),
+        MSG_CANCEL => decodeCancel(data),
+        MSG_FLUSH => decodeFlush(data),
+        else => CodecError.InvalidMessageType,
     };
 }
-// ============================================================================
-// Input Message Encoding
-// ============================================================================
-/// Encode input message to binary format.
-pub fn encode(message: *const msg.InputMsg, buf: []u8) codec.CodecError!usize {
-    return switch (message.msg_type) {
-        .new_order => encodeNewOrder(&message.data.new_order, buf),
-        .cancel => encodeCancel(&message.data.cancel, buf),
-        .flush => encodeFlush(buf),
+
+fn decodeNewOrder(data: []const u8) CodecError!DecodeResult {
+    if (data.len < SIZE_NEW_ORDER) {
+        return CodecError.BufferTooSmall;
+    }
+
+    // Wire format (27 bytes):
+    //   0:  magic
+    //   1:  msg_type 'N'
+    //   2-5:  user_id (big-endian)
+    //   6-13: symbol (8 bytes)
+    //   14-17: price (big-endian)
+    //   18-21: quantity (big-endian)
+    //   22: side 'B'/'S'
+    //   23-26: user_order_id (big-endian)
+
+    const side_byte = data[22];
+    if (side_byte != 'B' and side_byte != 'S') {
+        return CodecError.InvalidSide;
+    }
+
+    var result: msg.InputMsg = undefined;
+    @memset(std.mem.asBytes(&result), 0);
+
+    result.type = .new_order;
+    result.data.new_order.user_id = std.mem.readInt(u32, data[2..6], .big);
+    result.data.new_order.user_order_id = std.mem.readInt(u32, data[23..27], .big);
+    result.data.new_order.price = std.mem.readInt(u32, data[14..18], .big);
+    result.data.new_order.quantity = std.mem.readInt(u32, data[18..22], .big);
+    result.data.new_order.side = if (side_byte == 'B') .buy else .sell;
+
+    @memcpy(result.data.new_order.symbol[0..BINARY_SYMBOL_LEN], data[6..14]);
+    @memset(result.data.new_order.symbol[BINARY_SYMBOL_LEN..], 0);
+
+    std.debug.assert(result.type == .new_order);
+
+    return DecodeResult{
+        .message = result,
+        .bytes_consumed = SIZE_NEW_ORDER,
     };
 }
-fn encodeNewOrder(order: *const msg.NewOrderMsg, buf: []u8) codec.CodecError!usize {
-    // P10 Rule 5: Validate inputs
-    std.debug.assert(order.quantity > 0);
-    std.debug.assert(!msg.symbolIsEmpty(&order.symbol));
-    // P10 Rule 7: Check buffer bounds
-    if (buf.len < NEW_ORDER_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    var pos: usize = 0;
-    // Header
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_NEW_ORDER;
-    pos += 1;
-    // user_id (network byte order)
-    writeU32Big(buf[pos..][0..4], order.user_id);
-    pos += 4;
-    // symbol (8 bytes, null-padded)
-    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &order.symbol);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    // price
-    writeU32Big(buf[pos..][0..4], order.price);
-    pos += 4;
-    // quantity
-    writeU32Big(buf[pos..][0..4], order.quantity);
-    pos += 4;
-    // side
-    buf[pos] = @intFromEnum(order.side);
-    pos += 1;
-    // user_order_id
-    writeU32Big(buf[pos..][0..4], order.user_order_id);
-    pos += 4;
-    // P10 Rule 5: Verify output
-    std.debug.assert(pos == NEW_ORDER_WIRE_SIZE);
-    std.debug.assert(buf[0] == MAGIC);
-    return pos;
+
+fn decodeCancel(data: []const u8) CodecError!DecodeResult {
+    if (data.len < SIZE_CANCEL) {
+        return CodecError.BufferTooSmall;
+    }
+
+    // Wire format (10 bytes):
+    //   0: magic
+    //   1: msg_type 'C'
+    //   2-5: user_id (big-endian)
+    //   6-9: user_order_id (big-endian)
+
+    var result: msg.InputMsg = undefined;
+    @memset(std.mem.asBytes(&result), 0);
+
+    result.type = .cancel;
+    result.data.cancel.user_id = std.mem.readInt(u32, data[2..6], .big);
+    result.data.cancel.user_order_id = std.mem.readInt(u32, data[6..10], .big);
+
+    std.debug.assert(result.type == .cancel);
+
+    return DecodeResult{
+        .message = result,
+        .bytes_consumed = SIZE_CANCEL,
+    };
 }
-fn encodeCancel(cancel: *const msg.CancelMsg, buf: []u8) codec.CodecError!usize {
-    // P10 Rule 5: Validate inputs (user_id or order_id should be set)
-    std.debug.assert(cancel.user_id > 0 or cancel.user_order_id > 0);
-    // P10 Rule 7: Check buffer bounds
-    if (buf.len < CANCEL_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
 
-    var pos: usize = 0;
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_CANCEL;
-    pos += 1;
+fn decodeFlush(data: []const u8) CodecError!DecodeResult {
+    if (data.len < SIZE_FLUSH) {
+        return CodecError.BufferTooSmall;
+    }
 
-    // Wire format: user_id(4) + user_order_id(4) - NO symbol
-    // Symbol is looked up from order tracking map on server side
-    writeU32Big(buf[pos..][0..4], cancel.user_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], cancel.user_order_id);
-    pos += 4;
+    // Wire format (2 bytes):
+    //   0: magic
+    //   1: msg_type 'F'
 
-    std.debug.assert(pos == CANCEL_WIRE_SIZE);
-    return pos;
+    var result: msg.InputMsg = undefined;
+    @memset(std.mem.asBytes(&result), 0);
+
+    result.type = .flush;
+
+    std.debug.assert(result.type == .flush);
+
+    return DecodeResult{
+        .message = result,
+        .bytes_consumed = SIZE_FLUSH,
+    };
 }
-fn encodeFlush(buf: []u8) codec.CodecError!usize {
-    if (buf.len < FLUSH_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    buf[0] = MAGIC;
+
+// ============================================================================
+// Output Encoding
+// ============================================================================
+
+pub fn encodeOutput(output: *const msg.OutputMsg, buf: []u8) CodecError!usize {
+    std.debug.assert(buf.len >= SIZE_TRADE); // Largest message
+
+    return switch (output.type) {
+        .ack => encodeAck(&output.data.ack, buf),
+        .cancel_ack => encodeCancelAck(&output.data.cancel_ack, buf),
+        .trade => encodeTrade(&output.data.trade, buf),
+        .top_of_book => encodeTopOfBook(&output.data.top_of_book, buf),
+    };
+}
+
+fn encodeAck(ack: *const msg.AckMsg, buf: []u8) CodecError!usize {
+    if (buf.len < SIZE_ACK) {
+        return CodecError.BufferTooSmall;
+    }
+
+    // Wire format (18 bytes):
+    //   0: magic
+    //   1: msg_type 'A'
+    //   2-9: symbol (8 bytes)
+    //   10-13: user_id (big-endian)
+    //   14-17: user_order_id (big-endian)
+
+    buf[0] = BINARY_MAGIC;
+    buf[1] = MSG_ACK;
+    @memcpy(buf[2..10], ack.symbol[0..BINARY_SYMBOL_LEN]);
+    std.mem.writeInt(u32, buf[10..14], ack.user_id, .big);
+    std.mem.writeInt(u32, buf[14..18], ack.user_order_id, .big);
+
+    return SIZE_ACK;
+}
+
+fn encodeCancelAck(cancel_ack: *const msg.CancelAckMsg, buf: []u8) CodecError!usize {
+    if (buf.len < SIZE_CANCEL_ACK) {
+        return CodecError.BufferTooSmall;
+    }
+
+    // Wire format (18 bytes):
+    //   0: magic
+    //   1: msg_type 'X'
+    //   2-9: symbol (8 bytes)
+    //   10-13: user_id (big-endian)
+    //   14-17: user_order_id (big-endian)
+
+    buf[0] = BINARY_MAGIC;
+    buf[1] = MSG_CANCEL_ACK;
+    @memcpy(buf[2..10], cancel_ack.symbol[0..BINARY_SYMBOL_LEN]);
+    std.mem.writeInt(u32, buf[10..14], cancel_ack.user_id, .big);
+    std.mem.writeInt(u32, buf[14..18], cancel_ack.user_order_id, .big);
+
+    return SIZE_CANCEL_ACK;
+}
+
+fn encodeTrade(trade: *const msg.TradeMsg, buf: []u8) CodecError!usize {
+    if (buf.len < SIZE_TRADE) {
+        return CodecError.BufferTooSmall;
+    }
+
+    // Wire format (34 bytes):
+    //   0: magic
+    //   1: msg_type 'T'
+    //   2-9: symbol (8 bytes)
+    //   10-13: user_id_buy (big-endian)
+    //   14-17: user_order_id_buy (big-endian)
+    //   18-21: user_id_sell (big-endian)
+    //   22-25: user_order_id_sell (big-endian)
+    //   26-29: price (big-endian)
+    //   30-33: quantity (big-endian)
+
+    buf[0] = BINARY_MAGIC;
+    buf[1] = MSG_TRADE;
+    @memcpy(buf[2..10], trade.symbol[0..BINARY_SYMBOL_LEN]);
+    std.mem.writeInt(u32, buf[10..14], trade.user_id_buy, .big);
+    std.mem.writeInt(u32, buf[14..18], trade.user_order_id_buy, .big);
+    std.mem.writeInt(u32, buf[18..22], trade.user_id_sell, .big);
+    std.mem.writeInt(u32, buf[22..26], trade.user_order_id_sell, .big);
+    std.mem.writeInt(u32, buf[26..30], trade.price, .big);
+    std.mem.writeInt(u32, buf[30..34], trade.quantity, .big);
+
+    return SIZE_TRADE;
+}
+
+fn encodeTopOfBook(tob: *const msg.TopOfBookMsg, buf: []u8) CodecError!usize {
+    if (buf.len < SIZE_TOP_OF_BOOK) {
+        return CodecError.BufferTooSmall;
+    }
+
+    // Wire format (19 bytes):
+    //   0: magic
+    //   1: msg_type 'B'
+    //   2-9: symbol (8 bytes)
+    //   10: side 'B'/'S'
+    //   11-14: price (big-endian)
+    //   15-18: quantity (big-endian)
+
+    buf[0] = BINARY_MAGIC;
+    buf[1] = MSG_TOP_OF_BOOK;
+    @memcpy(buf[2..10], tob.symbol[0..BINARY_SYMBOL_LEN]);
+    buf[10] = @intFromEnum(tob.side);
+    std.mem.writeInt(u32, buf[11..15], tob.price, .big);
+    std.mem.writeInt(u32, buf[15..19], tob.total_quantity, .big);
+
+    return SIZE_TOP_OF_BOOK;
+}
+
+// ============================================================================
+// Input Encoding (for clients/testing)
+// ============================================================================
+
+pub fn encodeNewOrder(
+    user_id: u32,
+    user_order_id: u32,
+    symbol: []const u8,
+    price: u32,
+    quantity: u32,
+    side: msg.Side,
+    buf: []u8,
+) CodecError!usize {
+    if (buf.len < SIZE_NEW_ORDER) {
+        return CodecError.BufferTooSmall;
+    }
+
+    std.debug.assert(symbol.len > 0);
+
+    buf[0] = BINARY_MAGIC;
+    buf[1] = MSG_NEW_ORDER;
+    std.mem.writeInt(u32, buf[2..6], user_id, .big);
+
+    // Symbol: copy and zero-pad
+    @memset(buf[6..14], 0);
+    const copy_len = @min(symbol.len, BINARY_SYMBOL_LEN);
+    @memcpy(buf[6..][0..copy_len], symbol[0..copy_len]);
+
+    std.mem.writeInt(u32, buf[14..18], price, .big);
+    std.mem.writeInt(u32, buf[18..22], quantity, .big);
+    buf[22] = @intFromEnum(side);
+    std.mem.writeInt(u32, buf[23..27], user_order_id, .big);
+
+    return SIZE_NEW_ORDER;
+}
+
+pub fn encodeCancel(
+    user_id: u32,
+    user_order_id: u32,
+    buf: []u8,
+) CodecError!usize {
+    if (buf.len < SIZE_CANCEL) {
+        return CodecError.BufferTooSmall;
+    }
+
+    buf[0] = BINARY_MAGIC;
+    buf[1] = MSG_CANCEL;
+    std.mem.writeInt(u32, buf[2..6], user_id, .big);
+    std.mem.writeInt(u32, buf[6..10], user_order_id, .big);
+
+    return SIZE_CANCEL;
+}
+
+pub fn encodeFlush(buf: []u8) CodecError!usize {
+    if (buf.len < SIZE_FLUSH) {
+        return CodecError.BufferTooSmall;
+    }
+
+    buf[0] = BINARY_MAGIC;
     buf[1] = MSG_FLUSH;
-    return FLUSH_WIRE_SIZE;
-}
-// ============================================================================
-// Input Message Decoding
-// ============================================================================
-/// Decode input message from binary format.
-pub fn decode(data: []const u8) codec.CodecError!codec.DecodeResult {
-    // P10 Rule 7: Check minimum size
-    if (data.len < HEADER_SIZE) return codec.CodecError.IncompleteMessage;
-    if (data[0] != MAGIC) return codec.CodecError.InvalidMagic;
-    const msg_type = data[1];
-    return switch (msg_type) {
-        MSG_NEW_ORDER => {
-            if (data.len < NEW_ORDER_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            const message = decodeNewOrder(data) orelse return codec.CodecError.InvalidField;
-            return .{
-                .message = message,
-                .bytes_consumed = NEW_ORDER_WIRE_SIZE,
-            };
-        },
-        MSG_CANCEL => {
-            if (data.len < CANCEL_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            return .{
-                .message = decodeCancel(data),
-                .bytes_consumed = CANCEL_WIRE_SIZE,
-            };
-        },
-        MSG_FLUSH => {
-            return .{
-                .message = .{
-                    .msg_type = .flush,
-                    .data = .{ .flush = .{} },
-                },
-                .bytes_consumed = FLUSH_WIRE_SIZE,
-            };
-        },
-        else => codec.CodecError.UnknownMessageType,
-    };
-}
-fn decodeNewOrder(data: []const u8) ?msg.InputMsg {
-    // P10 Rule 5: Verify preconditions
-    std.debug.assert(data.len >= NEW_ORDER_WIRE_SIZE);
-    std.debug.assert(data[0] == MAGIC and data[1] == MSG_NEW_ORDER);
-    var pos: usize = HEADER_SIZE;
-    const user_id = readU32Big(data[pos..][0..4]);
-    pos += 4;
-    var symbol: msg.Symbol = undefined;
-    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    const price = readU32Big(data[pos..][0..4]);
-    pos += 4;
-    const quantity = readU32Big(data[pos..][0..4]);
-    pos += 4;
-    // SECURITY: Validate side before use
-    const side = parseSide(data[pos]) orelse return null;
-    pos += 1;
-    const user_order_id = readU32Big(data[pos..][0..4]);
-    // P10 Rule 5: Verify we consumed expected bytes
-    std.debug.assert(pos + 4 == NEW_ORDER_WIRE_SIZE);
-    return .{
-        .msg_type = .new_order,
-        .data = .{ .new_order = .{
-            .user_id = user_id,
-            .user_order_id = user_order_id,
-            .price = price,
-            .quantity = quantity,
-            .side = side,
-            .symbol = symbol,
-        } },
-    };
-}
-fn decodeCancel(data: []const u8) msg.InputMsg {
-    std.debug.assert(data.len >= CANCEL_WIRE_SIZE);
-    std.debug.assert(data[0] == MAGIC and data[1] == MSG_CANCEL);
 
-    var pos: usize = HEADER_SIZE;
+    return SIZE_FLUSH;
+}
 
-    // Wire format: user_id(4) + user_order_id(4) - NO symbol
-    // Symbol is looked up from order tracking map on server side
-    const user_id = readU32Big(data[pos..][0..4]);
-    pos += 4;
-    const user_order_id = readU32Big(data[pos..][0..4]);
-    pos += 4;
-
-    std.debug.assert(pos == CANCEL_WIRE_SIZE);
-
-    return .{
-        .msg_type = .cancel,
-        .data = .{ .cancel = .{
-            .user_id = user_id,
-            .user_order_id = user_order_id,
-            .symbol = msg.EMPTY_SYMBOL, // Symbol looked up server-side
-        } },
-    };
-}
-// ============================================================================
-// Output Message Encoding
-// ============================================================================
-/// Encode output message to binary format.
-pub fn encodeOutput(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    return switch (message.msg_type) {
-        .ack => encodeAck(message, buf),
-        .trade => encodeTrade(message, buf),
-        .top_of_book => encodeTopOfBook(message, buf),
-        .cancel_ack => encodeCancelAck(message, buf),
-        .reject => encodeReject(message, buf),
-    };
-}
-fn encodeAck(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    if (buf.len < ACK_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    var pos: usize = 0;
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_ACK;
-    pos += 1;
-    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &message.symbol);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    writeU32Big(buf[pos..][0..4], message.data.ack.user_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], message.data.ack.user_order_id);
-    pos += 4;
-    std.debug.assert(pos == ACK_WIRE_SIZE);
-    return pos;
-}
-fn encodeTrade(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    // P10 Rule 5: Validate trade data
-    std.debug.assert(message.data.trade.quantity > 0);
-    std.debug.assert(message.data.trade.price > 0);
-    if (buf.len < TRADE_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    const t = &message.data.trade;
-    var pos: usize = 0;
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_TRADE;
-    pos += 1;
-    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &message.symbol);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    writeU32Big(buf[pos..][0..4], t.buy_user_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], t.buy_order_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], t.sell_user_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], t.sell_order_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], t.price);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], t.quantity);
-    pos += 4;
-    std.debug.assert(pos == TRADE_WIRE_SIZE);
-    return pos;
-}
-fn encodeTopOfBook(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    if (buf.len < TOP_OF_BOOK_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    const tob = &message.data.top_of_book;
-    var pos: usize = 0;
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_TOP_OF_BOOK;
-    pos += 1;
-    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &message.symbol);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    buf[pos] = @intFromEnum(tob.side);
-    pos += 1;
-    writeU32Big(buf[pos..][0..4], tob.price);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], tob.quantity);
-    pos += 4;
-    // Padding byte for alignment - explicitly zero
-    buf[pos] = 0;
-    pos += 1;
-    std.debug.assert(pos == TOP_OF_BOOK_WIRE_SIZE);
-    return pos;
-}
-fn encodeCancelAck(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    if (buf.len < CANCEL_ACK_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    var pos: usize = 0;
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_CANCEL_ACK;
-    pos += 1;
-    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &message.symbol);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    writeU32Big(buf[pos..][0..4], message.data.cancel_ack.user_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], message.data.cancel_ack.user_order_id);
-    pos += 4;
-    std.debug.assert(pos == CANCEL_ACK_WIRE_SIZE);
-    return pos;
-}
-fn encodeReject(message: *const msg.OutputMsg, buf: []u8) codec.CodecError!usize {
-    if (buf.len < REJECT_WIRE_SIZE) return codec.CodecError.BufferTooSmall;
-    var pos: usize = 0;
-    buf[pos] = MAGIC;
-    pos += 1;
-    buf[pos] = MSG_REJECT;
-    pos += 1;
-    @memcpy(buf[pos..][0..msg.MAX_SYMBOL_LENGTH], &message.symbol);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    writeU32Big(buf[pos..][0..4], message.data.reject.user_id);
-    pos += 4;
-    writeU32Big(buf[pos..][0..4], message.data.reject.user_order_id);
-    pos += 4;
-    buf[pos] = @intFromEnum(message.data.reject.reason);
-    pos += 1;
-    std.debug.assert(pos == REJECT_WIRE_SIZE);
-    return pos;
-}
-// ============================================================================
-// Output Message Decoding
-// ============================================================================
-/// Decode output message from binary format.
-pub fn decodeOutput(data: []const u8) codec.CodecError!codec.OutputDecodeResult {
-    if (data.len < HEADER_SIZE) return codec.CodecError.IncompleteMessage;
-    if (data[0] != MAGIC) return codec.CodecError.InvalidMagic;
-    const msg_type = data[1];
-    return switch (msg_type) {
-        MSG_ACK => {
-            if (data.len < ACK_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            return .{
-                .message = decodeAckMsg(data),
-                .bytes_consumed = ACK_WIRE_SIZE,
-            };
-        },
-        MSG_TRADE => {
-            if (data.len < TRADE_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            return .{
-                .message = decodeTradeMsg(data),
-                .bytes_consumed = TRADE_WIRE_SIZE,
-            };
-        },
-        MSG_TOP_OF_BOOK => {
-            if (data.len < TOP_OF_BOOK_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            const message = decodeTopOfBookMsg(data) orelse return codec.CodecError.InvalidField;
-            return .{
-                .message = message,
-                .bytes_consumed = TOP_OF_BOOK_WIRE_SIZE,
-            };
-        },
-        MSG_CANCEL_ACK => {
-            if (data.len < CANCEL_ACK_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            return .{
-                .message = decodeCancelAckMsg(data),
-                .bytes_consumed = CANCEL_ACK_WIRE_SIZE,
-            };
-        },
-        MSG_REJECT => {
-            if (data.len < REJECT_WIRE_SIZE) return codec.CodecError.IncompleteMessage;
-            const message = decodeRejectMsg(data) orelse return codec.CodecError.InvalidField;
-            return .{
-                .message = message,
-                .bytes_consumed = REJECT_WIRE_SIZE,
-            };
-        },
-        else => codec.CodecError.UnknownMessageType,
-    };
-}
-fn decodeAckMsg(data: []const u8) msg.OutputMsg {
-    std.debug.assert(data.len >= ACK_WIRE_SIZE);
-    var pos: usize = HEADER_SIZE;
-    var symbol: msg.Symbol = undefined;
-    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    return msg.OutputMsg.makeAck(
-        readU32Big(data[pos..][0..4]),
-        readU32Big(data[pos + 4 ..][0..4]),
-        symbol,
-        0,
-    );
-}
-fn decodeTradeMsg(data: []const u8) msg.OutputMsg {
-    std.debug.assert(data.len >= TRADE_WIRE_SIZE);
-    var pos: usize = HEADER_SIZE;
-    var symbol: msg.Symbol = undefined;
-    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    const buy_user_id = readU32Big(data[pos..][0..4]);
-    const buy_order_id = readU32Big(data[pos + 4 ..][0..4]);
-    const sell_user_id = readU32Big(data[pos + 8 ..][0..4]);
-    const sell_order_id = readU32Big(data[pos + 12 ..][0..4]);
-    const price = readU32Big(data[pos + 16 ..][0..4]);
-    const quantity = readU32Big(data[pos + 20 ..][0..4]);
-    // For decoded trades, we can't assert price/qty > 0 as wire data might be invalid
-    // The caller should validate if needed
-    return msg.OutputMsg.makeTrade(
-        buy_user_id,
-        buy_order_id,
-        sell_user_id,
-        sell_order_id,
-        price,
-        quantity,
-        symbol,
-        0,
-    );
-}
-fn decodeTopOfBookMsg(data: []const u8) ?msg.OutputMsg {
-    std.debug.assert(data.len >= TOP_OF_BOOK_WIRE_SIZE);
-    var pos: usize = HEADER_SIZE;
-    var symbol: msg.Symbol = undefined;
-    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    // SECURITY: Validate side before use
-    const side = parseSide(data[pos]) orelse return null;
-    pos += 1;
-    return msg.OutputMsg.makeTopOfBook(
-        symbol,
-        side,
-        readU32Big(data[pos..][0..4]),
-        readU32Big(data[pos + 4 ..][0..4]),
-        0,
-    );
-}
-fn decodeCancelAckMsg(data: []const u8) msg.OutputMsg {
-    std.debug.assert(data.len >= CANCEL_ACK_WIRE_SIZE);
-    var pos: usize = HEADER_SIZE;
-    var symbol: msg.Symbol = undefined;
-    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    return msg.OutputMsg.makeCancelAck(
-        readU32Big(data[pos..][0..4]),
-        readU32Big(data[pos + 4 ..][0..4]),
-        symbol,
-        0,
-    );
-}
-fn decodeRejectMsg(data: []const u8) ?msg.OutputMsg {
-    std.debug.assert(data.len >= REJECT_WIRE_SIZE);
-    var pos: usize = HEADER_SIZE;
-    var symbol: msg.Symbol = undefined;
-    @memcpy(&symbol, data[pos..][0..msg.MAX_SYMBOL_LENGTH]);
-    pos += msg.MAX_SYMBOL_LENGTH;
-    // SECURITY: Validate reject reason before use
-    const reason = parseRejectReason(data[pos + 8]) orelse return null;
-    return msg.OutputMsg.makeReject(
-        readU32Big(data[pos..][0..4]),
-        readU32Big(data[pos + 4 ..][0..4]),
-        reason,
-        symbol,
-        0,
-    );
-}
-// ============================================================================
-// Network Byte Order Helpers
-// ============================================================================
-inline fn readU32Big(bytes: *const [4]u8) u32 {
-    return std.mem.readInt(u32, bytes, .big);
-}
-inline fn writeU32Big(bytes: *[4]u8, value: u32) void {
-    std.mem.writeInt(u32, bytes, value, .big);
-}
 // ============================================================================
 // Tests
 // ============================================================================
-test "binary roundtrip - new order" {
-    const order = msg.NewOrderMsg{
-        .user_id = 42,
-        .user_order_id = 100,
-        .price = 5000,
-        .quantity = 100,
-        .side = .buy,
-        .symbol = msg.makeSymbol("IBM"),
-    };
-    const input = msg.InputMsg{
-        .msg_type = .new_order,
-        .data = .{ .new_order = order },
-    };
-    var buf: [256]u8 = undefined;
-    const encoded_len = try encode(&input, &buf);
-    try std.testing.expectEqual(NEW_ORDER_WIRE_SIZE, encoded_len);
-    try std.testing.expectEqual(MAGIC, buf[0]);
+
+test "wire format sizes" {
+    try std.testing.expectEqual(@as(usize, 27), SIZE_NEW_ORDER);
+    try std.testing.expectEqual(@as(usize, 10), SIZE_CANCEL);
+    try std.testing.expectEqual(@as(usize, 2), SIZE_FLUSH);
+    try std.testing.expectEqual(@as(usize, 18), SIZE_ACK);
+    try std.testing.expectEqual(@as(usize, 18), SIZE_CANCEL_ACK);
+    try std.testing.expectEqual(@as(usize, 34), SIZE_TRADE);
+    try std.testing.expectEqual(@as(usize, 19), SIZE_TOP_OF_BOOK);
+}
+
+test "is binary message" {
+    const valid = [_]u8{ BINARY_MAGIC, MSG_NEW_ORDER, 0, 0 };
+    try std.testing.expect(isBinaryMessage(&valid));
+
+    const invalid = [_]u8{ 0x00, MSG_NEW_ORDER, 0, 0 };
+    try std.testing.expect(!isBinaryMessage(&invalid));
+
+    const too_short = [_]u8{BINARY_MAGIC};
+    try std.testing.expect(!isBinaryMessage(&too_short));
+}
+
+test "encode and decode new order" {
+    var buf: [64]u8 = undefined;
+
+    const encoded_len = try encodeNewOrder(1, 100, "IBM", 150, 1000, .buy, &buf);
+
+    try std.testing.expectEqual(@as(usize, 27), encoded_len);
+    try std.testing.expectEqual(BINARY_MAGIC, buf[0]);
     try std.testing.expectEqual(MSG_NEW_ORDER, buf[1]);
-    const result = try decode(&buf);
-    try std.testing.expectEqual(msg.InputMsgType.new_order, result.message.msg_type);
-    try std.testing.expectEqual(@as(u32, 42), result.message.data.new_order.user_id);
-    try std.testing.expectEqual(@as(u32, 5000), result.message.data.new_order.price);
-    try std.testing.expectEqual(@as(u32, 100), result.message.data.new_order.quantity);
+
+    const result = try decodeInput(buf[0..encoded_len]);
+
+    try std.testing.expectEqual(msg.InputMsgType.new_order, result.message.type);
+    try std.testing.expectEqual(@as(u32, 1), result.message.data.new_order.user_id);
+    try std.testing.expectEqual(@as(u32, 100), result.message.data.new_order.user_order_id);
+    try std.testing.expectEqual(@as(u32, 150), result.message.data.new_order.price);
+    try std.testing.expectEqual(@as(u32, 1000), result.message.data.new_order.quantity);
     try std.testing.expectEqual(msg.Side.buy, result.message.data.new_order.side);
+    try std.testing.expectEqualStrings("IBM", msg.symbolSlice(&result.message.data.new_order.symbol));
 }
-test "binary roundtrip - cancel" {
-    const input = msg.InputMsg.cancel(42, msg.makeSymbol("IBM"), 100);
-    var buf: [256]u8 = undefined;
-    const encoded_len = try encode(&input, &buf);
-    try std.testing.expectEqual(CANCEL_WIRE_SIZE, encoded_len);
-    const result = try decode(&buf);
-    try std.testing.expectEqual(msg.InputMsgType.cancel, result.message.msg_type);
-    try std.testing.expectEqual(@as(u32, 42), result.message.data.cancel.user_id);
+
+test "encode and decode cancel" {
+    var buf: [64]u8 = undefined;
+
+    const encoded_len = try encodeCancel(1, 100, &buf);
+
+    try std.testing.expectEqual(@as(usize, 10), encoded_len);
+
+    const result = try decodeInput(buf[0..encoded_len]);
+
+    try std.testing.expectEqual(msg.InputMsgType.cancel, result.message.type);
+    try std.testing.expectEqual(@as(u32, 1), result.message.data.cancel.user_id);
     try std.testing.expectEqual(@as(u32, 100), result.message.data.cancel.user_order_id);
-    // Note: Symbol is not transmitted on wire - set to EMPTY_SYMBOL on decode
-    try std.testing.expect(msg.symbolIsEmpty(&result.message.data.cancel.symbol));
 }
-test "binary roundtrip - trade" {
-    const trade = msg.OutputMsg.makeTrade(1, 100, 2, 200, 5000, 50, msg.makeSymbol("IBM"), 42);
-    var buf: [256]u8 = undefined;
+
+test "encode and decode flush" {
+    var buf: [64]u8 = undefined;
+
+    const encoded_len = try encodeFlush(&buf);
+
+    try std.testing.expectEqual(@as(usize, 2), encoded_len);
+
+    const result = try decodeInput(buf[0..encoded_len]);
+
+    try std.testing.expectEqual(msg.InputMsgType.flush, result.message.type);
+}
+
+test "encode output ack" {
+    var buf: [64]u8 = undefined;
+
+    const ack = msg.makeAckMsg("AAPL", 1, 100);
+    const encoded_len = try encodeOutput(&ack, &buf);
+
+    try std.testing.expectEqual(@as(usize, 18), encoded_len);
+    try std.testing.expectEqual(BINARY_MAGIC, buf[0]);
+    try std.testing.expectEqual(MSG_ACK, buf[1]);
+}
+
+test "encode output trade" {
+    var buf: [64]u8 = undefined;
+
+    const trade = msg.makeTradeMsg("IBM", 1, 100, 2, 200, 150, 500);
     const encoded_len = try encodeOutput(&trade, &buf);
-    try std.testing.expectEqual(TRADE_WIRE_SIZE, encoded_len);
-    const result = try decodeOutput(&buf);
-    try std.testing.expectEqual(msg.OutputMsgType.trade, result.message.msg_type);
-    try std.testing.expectEqual(@as(u32, 1), result.message.data.trade.buy_user_id);
-    try std.testing.expectEqual(@as(u32, 5000), result.message.data.trade.price);
+
+    try std.testing.expectEqual(@as(usize, 34), encoded_len);
+    try std.testing.expectEqual(BINARY_MAGIC, buf[0]);
+    try std.testing.expectEqual(MSG_TRADE, buf[1]);
 }
-test "binary roundtrip - reject" {
-    const reject = msg.OutputMsg.makeReject(42, 100, .invalid_price, msg.makeSymbol("AAPL"), 5);
-    var buf: [256]u8 = undefined;
-    const encoded_len = try encodeOutput(&reject, &buf);
-    try std.testing.expectEqual(REJECT_WIRE_SIZE, encoded_len);
-    const result = try decodeOutput(&buf);
-    try std.testing.expectEqual(msg.OutputMsgType.reject, result.message.msg_type);
-    try std.testing.expectEqual(msg.RejectReason.invalid_price, result.message.data.reject.reason);
+
+test "invalid magic returns error" {
+    const invalid = [_]u8{ 0x00, MSG_NEW_ORDER } ++ [_]u8{0} ** 25;
+    const result = decodeInput(&invalid);
+    try std.testing.expectError(CodecError.InvalidMagic, result);
 }
-test "binary network byte order" {
-    var buf: [4]u8 = undefined;
-    writeU32Big(&buf, 0x12345678);
-    try std.testing.expectEqual(@as(u8, 0x12), buf[0]);
-    try std.testing.expectEqual(@as(u8, 0x34), buf[1]);
-    try std.testing.expectEqual(@as(u8, 0x56), buf[2]);
-    try std.testing.expectEqual(@as(u8, 0x78), buf[3]);
+
+test "invalid message type returns error" {
+    const invalid = [_]u8{ BINARY_MAGIC, 0xFF } ++ [_]u8{0} ** 25;
+    const result = decodeInput(&invalid);
+    try std.testing.expectError(CodecError.InvalidMessageType, result);
 }
-test "binary incomplete message" {
-    const partial = [_]u8{ MAGIC, MSG_NEW_ORDER, 0x00, 0x00 };
-    try std.testing.expectError(codec.CodecError.IncompleteMessage, decode(&partial));
+
+test "buffer too small returns error" {
+    const short = [_]u8{ BINARY_MAGIC, MSG_NEW_ORDER };
+    const result = decodeInput(&short);
+    try std.testing.expectError(CodecError.BufferTooSmall, result);
 }
-test "binary invalid magic" {
-    const invalid = [_]u8{ 0xFF, MSG_NEW_ORDER };
-    try std.testing.expectError(codec.CodecError.InvalidMagic, decode(&invalid));
-}
-test "binary unknown message type" {
-    const unknown = [_]u8{ MAGIC, 0xFF };
-    try std.testing.expectError(codec.CodecError.UnknownMessageType, decode(&unknown));
-}
-test "binary invalid side byte" {
-    // Construct a message with invalid side byte
-    var buf: [NEW_ORDER_WIRE_SIZE]u8 = undefined;
-    buf[0] = MAGIC;
-    buf[1] = MSG_NEW_ORDER;
-    // Fill rest with zeros (user_id, symbol, price, qty)
-    @memset(buf[2..], 0);
-    // Set side byte to invalid value (position is 2+4+8+4+4 = 22)
-    buf[22] = 0xFF; // Invalid side
-    try std.testing.expectError(codec.CodecError.InvalidField, decode(&buf));
-}
-test "binary invalid reject reason" {
-    var buf: [REJECT_WIRE_SIZE]u8 = undefined;
-    buf[0] = MAGIC;
-    buf[1] = MSG_REJECT;
-    @memset(buf[2..], 0);
-    // Reason byte is at position 2+8+4+4 = 18
-    buf[18] = 0xFF; // Invalid reason
-    try std.testing.expectError(codec.CodecError.InvalidField, decodeOutput(&buf));
-}
-test "parseSide validation" {
-    try std.testing.expectEqual(msg.Side.buy, parseSide('B').?);
-    try std.testing.expectEqual(msg.Side.sell, parseSide('S').?);
-    try std.testing.expect(parseSide('X') == null);
-    try std.testing.expect(parseSide(0) == null);
-    try std.testing.expect(parseSide(255) == null);
-}
-test "parseRejectReason validation" {
-    try std.testing.expectEqual(msg.RejectReason.unknown_symbol, parseRejectReason(1).?);
-    try std.testing.expectEqual(msg.RejectReason.invalid_order_id, parseRejectReason(10).?);
-    try std.testing.expect(parseRejectReason(0) == null);
-    try std.testing.expect(parseRejectReason(11) == null);
-    try std.testing.expect(parseRejectReason(255) == null);
-}
-test "buffer too small" {
-    const order = msg.NewOrderMsg{
-        .user_id = 1,
-        .user_order_id = 100,
-        .price = 5000,
-        .quantity = 100,
-        .side = .buy,
-        .symbol = msg.makeSymbol("IBM"),
-    };
-    const input = msg.InputMsg{
-        .msg_type = .new_order,
-        .data = .{ .new_order = order },
-    };
-    var tiny_buf: [10]u8 = undefined;
-    try std.testing.expectError(codec.CodecError.BufferTooSmall, encode(&input, &tiny_buf));
+
+test "message size lookup" {
+    try std.testing.expectEqual(@as(usize, 27), messageSize(MSG_NEW_ORDER));
+    try std.testing.expectEqual(@as(usize, 10), messageSize(MSG_CANCEL));
+    try std.testing.expectEqual(@as(usize, 2), messageSize(MSG_FLUSH));
+    try std.testing.expectEqual(@as(usize, 18), messageSize(MSG_ACK));
+    try std.testing.expectEqual(@as(usize, 34), messageSize(MSG_TRADE));
+    try std.testing.expectEqual(@as(usize, 19), messageSize(MSG_TOP_OF_BOOK));
+    try std.testing.expectEqual(@as(usize, 0), messageSize(0xFF));
 }

@@ -1,712 +1,697 @@
-//! Multi-symbol matching engine orchestrator.
+//! MatchingEngine - Multi-Symbol Order Book Orchestrator
 //!
-//! Design principles:
-//! - Open-addressing hash tables for O(1) symbol/order lookup
-//! - Power-of-2 sizes with bitmask for fast modulo
-//! - Bounded probe length prevents worst-case O(n) lookups
-//! - Generation counter for O(1) bulk invalidation
-//! - No dynamic allocation in hot path
+//! Design principles (Power of Ten + cache optimization):
+//! - Open-addressing hash tables (no pointer chasing)
+//! - Power-of-2 table sizes for fast masking
+//! - Tombstone-based deletion
+//! - No dynamic allocation after init (Rule 3)
 //!
-//! Memory model:
-//! - Engine struct uses pointers to heap-allocated OrderBooks
-//! - Each OrderBook is ~7.5MB, allocated individually
-//! - Order tracking map: ~48MB (2M entries × 24 bytes)
-//! - No stack temporaries for large structs
-//!
-//! Generation-based invalidation:
-//! - Order tracking uses generation counters for O(1) bulk clear on flush
-//! - Generation 0 is reserved as "inactive" sentinel
-//! - On wraparound (after ~4 billion flushes), generation skips 0→1
-//! - Theoretical edge case: if generation wraps to match an old entry's
-//!   generation, that entry would appear active. This requires ~4 billion
-//!   flushes without that slot being reused, which is practically impossible.
-//!
-//! Thread Safety:
-//! - NOT thread-safe. Use from a single thread only.
+//! TCP multi-client support:
+//! - Tracks client_id with each order for ownership
+//! - Supports cancelling all orders for a disconnected client
 
 const std = @import("std");
-const msg = @import("../protocol/message_types.zig");
 const OrderBook = @import("order_book.zig").OrderBook;
-const OutputBuffer = @import("order_book.zig").OutputBuffer;
-const OrderMap = @import("order_map.zig").OrderMap;
-const MemoryPools = @import("memory_pool.zig").MemoryPools;
-const config = @import("../transport/config.zig");
+const makeOrderKey = @import("order_book.zig").makeOrderKey;
+const OutputBuffer = @import("output_buffer.zig").OutputBuffer;
+const msg = @import("../protocol/message_types.zig");
 
 // ============================================================================
-// Configuration
+// Configuration Constants
 // ============================================================================
 
-/// Symbol hash table size - must be power of 2.
+pub const MAX_SYMBOLS: u32 = 64;
+
+/// Symbol map size - power of 2 for fast masking
 pub const SYMBOL_MAP_SIZE: u32 = 512;
-pub const SYMBOL_MAP_MASK: u32 = SYMBOL_MAP_SIZE - 1;
+const SYMBOL_MAP_MASK: u32 = SYMBOL_MAP_SIZE - 1;
 
-/// Order tracking table size - must be power of 2.
-/// 2M entries × 24 bytes = ~48MB.
-/// Sized for high-volume scenarios with many concurrent orders.
-pub const ORDER_SYMBOL_MAP_SIZE: u32 = 2 * 1024 * 1024; // 2M entries
-pub const ORDER_SYMBOL_MAP_MASK: u32 = ORDER_SYMBOL_MAP_SIZE - 1;
+/// Order-symbol map size - power of 2 for fast masking
+pub const ORDER_SYMBOL_MAP_SIZE: u32 = 8192;
+const ORDER_SYMBOL_MAP_MASK: u32 = ORDER_SYMBOL_MAP_SIZE - 1;
 
-/// Maximum probe length before giving up on insert/find.
-pub const MAX_PROBE_LENGTH: u32 = 256;
+/// Maximum probe lengths (Rule 2)
+pub const MAX_SYMBOL_PROBE_LENGTH: u32 = 64;
+pub const MAX_ORDER_SYMBOL_PROBE_LENGTH: u32 = 128;
 
-/// Load factor percentage that triggers a warning.
-const LOAD_FACTOR_WARNING: u32 = 75;
+/// Sentinel values
+pub const ORDER_KEY_EMPTY: u64 = 0;
+pub const ORDER_KEY_TOMBSTONE: u64 = std.math.maxInt(u64);
+
+// Compile-time verification
+comptime {
+    std.debug.assert((SYMBOL_MAP_SIZE & (SYMBOL_MAP_SIZE - 1)) == 0);
+    std.debug.assert((ORDER_SYMBOL_MAP_SIZE & (ORDER_SYMBOL_MAP_SIZE - 1)) == 0);
+}
 
 // ============================================================================
-// Hash Table Entry Types
+// Symbol Map - Open-Addressing Hash Table
 // ============================================================================
 
-/// Slot in the symbol → book hash table.
-const SymbolSlot = struct {
+const SymbolMapSlot = struct {
     symbol: msg.Symbol,
-    book_index: u16,
-    active: bool,
-    _padding: [5]u8,
+    book_index: i32,
 
-    comptime {
-        std.debug.assert(@sizeOf(SymbolSlot) == 16);
+    pub fn isEmpty(self: *const SymbolMapSlot) bool {
+        return self.symbol[0] == 0;
     }
 };
 
-/// Slot in the order → symbol tracking hash table.
-/// Uses generation counter for O(1) bulk invalidation.
-const OrderSymbolSlot = struct {
-    key: u64,
-    symbol: msg.Symbol,
-    generation: u32,
-    _padding: [4]u8,
-
-    comptime {
-        std.debug.assert(@sizeOf(OrderSymbolSlot) == 24);
-    }
-
-    /// Check if this slot is active in the current generation.
-    /// Generation 0 is reserved as "inactive" sentinel.
-    fn isActive(self: *const OrderSymbolSlot, current_gen: u32) bool {
-        return self.generation == current_gen and self.generation != 0;
-    }
-};
-
-// ============================================================================
-// Matching Engine
-// ============================================================================
-
-pub const MatchingEngine = struct {
-    // === Order Books (pointers to heap-allocated books) ===
-    // Using pointers avoids 7.5MB stack temporaries when creating books
-    books: [SYMBOL_MAP_SIZE]?*OrderBook,
-    num_books: u32,
-
-    // === Symbol Hash Table ===
-    symbol_map: [SYMBOL_MAP_SIZE]SymbolSlot,
-
-    // === Order Tracking Hash Table ===
-    order_symbol_map: [ORDER_SYMBOL_MAP_SIZE]OrderSymbolSlot,
-    order_map_generation: u32,
-    order_map_count: u32,
-
-    // === Memory ===
-    pools: *MemoryPools,
-    allocator: std.mem.Allocator,
-
-    // === Statistics ===
-    total_orders: u64,
-    total_cancels: u64,
-    total_rejects: u64,
-    probe_total: u64,
-    probe_count: u64,
-    max_probe_length: u32,
+const SymbolMap = struct {
+    slots: [SYMBOL_MAP_SIZE]SymbolMapSlot,
+    count: u32,
 
     const Self = @This();
 
-    // ========================================================================
-    // Initialization
-    // ========================================================================
-
-    /// Initialize engine in-place. MUST be called on heap-allocated memory!
-    pub fn initInPlace(self: *Self, pools: *MemoryPools) void {
-        std.debug.assert(pools.order_pool.capacity > 0);
-
-        self.pools = pools;
-        self.allocator = pools.order_pool.allocator;
-        self.num_books = 0;
-        self.order_map_generation = 1; // Start at 1; 0 is "inactive" sentinel
-        self.order_map_count = 0;
-        self.total_orders = 0;
-        self.total_cancels = 0;
-        self.total_rejects = 0;
-        self.probe_total = 0;
-        self.probe_count = 0;
-        self.max_probe_length = 0;
-
-        // Initialize books array (all null pointers)
-        for (&self.books) |*book| {
-            book.* = null;
-        }
-
-        // Initialize symbol map (all inactive)
-        for (&self.symbol_map) |*slot| {
-            slot.active = false;
-            slot.symbol = msg.EMPTY_SYMBOL;
-            slot.book_index = 0;
-            slot._padding = undefined;
-        }
-
-        // Initialize order map (generation 0 means inactive)
-        for (&self.order_symbol_map) |*slot| {
-            slot.generation = 0;
-            slot.key = 0;
-            slot.symbol = msg.EMPTY_SYMBOL;
-            slot._padding = undefined;
-        }
-
-        std.debug.assert(self.isValid());
-    }
-
-    /// Legacy init for compatibility.
-    pub fn init(pools: *MemoryPools) Self {
-        var engine: Self = undefined;
-        engine.initInPlace(pools);
-        return engine;
-    }
-
-    /// Cleanup - release all heap-allocated OrderBooks.
-    pub fn deinit(self: *Self) void {
-        for (&self.books) |*book_ptr| {
-            if (book_ptr.*) |book| {
-                self.allocator.destroy(book);
-                book_ptr.* = null;
-            }
-        }
-    }
-
-    fn isValid(self: *const Self) bool {
-        if (self.num_books > SYMBOL_MAP_SIZE) return false;
-        if (self.order_map_count > ORDER_SYMBOL_MAP_SIZE) return false;
-        if (self.order_map_generation == 0) return false;
-        return true;
-    }
-
-    // ========================================================================
-    // Message Processing
-    // ========================================================================
-
-    pub fn processMessage(
-        self: *Self,
-        message: *const msg.InputMsg,
-        client_id: config.ClientId,
-        output: *OutputBuffer,
-    ) void {
-        std.debug.assert(self.isValid());
-
-        switch (message.msg_type) {
-            .new_order => self.handleNewOrder(&message.data.new_order, client_id, output),
-            .cancel => self.handleCancel(&message.data.cancel, client_id, output),
-            .flush => self.handleFlush(output, client_id),
-        }
-
-        std.debug.assert(self.isValid());
-    }
-
-    // ========================================================================
-    // Order Handling
-    // ========================================================================
-
-    fn handleNewOrder(
-        self: *Self,
-        order: *const msg.NewOrderMsg,
-        client_id: config.ClientId,
-        output: *OutputBuffer,
-    ) void {
-        self.total_orders += 1;
-
-        // Validate quantity - send reject on zero
-        if (order.quantity == 0) {
-            self.total_rejects += 1;
-            output.addChecked(msg.OutputMsg.makeReject(
-                order.user_id,
-                order.user_order_id,
-                .invalid_quantity,
-                order.symbol,
-                client_id,
-            ));
-            return;
-        }
-
-        // Validate order ID is not a reserved sentinel value
-        if (!OrderMap.isValidKey(order.user_id, order.user_order_id)) {
-            self.total_rejects += 1;
-            output.addChecked(msg.OutputMsg.makeReject(
-                order.user_id,
-                order.user_order_id,
-                .invalid_order_id,
-                order.symbol,
-                client_id,
-            ));
-            return;
-        }
-
-        const book = self.findOrCreateBook(order.symbol) orelse {
-            self.total_rejects += 1;
-            output.addChecked(msg.OutputMsg.makeReject(
-                order.user_id,
-                order.user_order_id,
-                .unknown_symbol,
-                order.symbol,
-                client_id,
-            ));
-            return;
+    pub fn init() Self {
+        var self = Self{
+            .slots = undefined,
+            .count = 0,
         };
-
-        const key = makeOrderKey(order.user_id, order.user_order_id);
-        const tracked = self.trackOrderSymbol(key, order.symbol);
-        if (!tracked) {
-            std.log.warn("Order tracking table full, cancel routing degraded", .{});
+        for (&self.slots) |*slot| {
+            @memset(&slot.symbol, 0);
+            slot.book_index = -1;
         }
-
-        book.addOrder(order, client_id, output);
+        return self;
     }
 
-    fn handleCancel(
-        self: *Self,
-        cancel: *const msg.CancelMsg,
-        client_id: config.ClientId,
-        output: *OutputBuffer,
-    ) void {
-        self.total_cancels += 1;
-
-        // Validate order ID
-        if (!OrderMap.isValidKey(cancel.user_id, cancel.user_order_id)) {
-            self.total_rejects += 1;
-            output.addChecked(msg.OutputMsg.makeReject(
-                cancel.user_id,
-                cancel.user_order_id,
-                .invalid_order_id,
-                cancel.symbol,
-                client_id,
-            ));
-            return;
+    pub fn initInPlace(self: *Self) void {
+        self.count = 0;
+        for (&self.slots) |*slot| {
+            @memset(&slot.symbol, 0);
+            slot.book_index = -1;
         }
-
-        const key = makeOrderKey(cancel.user_id, cancel.user_order_id);
-
-        // Try to find symbol from tracking table, fall back to message symbol
-        const symbol = self.lookupOrderSymbol(key) orelse cancel.symbol;
-
-        if (msg.symbolIsEmpty(&symbol)) {
-            self.total_rejects += 1;
-            output.addChecked(msg.OutputMsg.makeReject(
-                cancel.user_id,
-                cancel.user_order_id,
-                .order_not_found,
-                symbol,
-                client_id,
-            ));
-            return;
-        }
-
-        if (self.findBook(symbol)) |book| {
-            book.cancelOrder(cancel.user_id, cancel.user_order_id, client_id, output);
-        } else {
-            self.total_rejects += 1;
-            output.addChecked(msg.OutputMsg.makeReject(
-                cancel.user_id,
-                cancel.user_order_id,
-                .order_not_found,
-                symbol,
-                client_id,
-            ));
-        }
-
-        self.removeOrderSymbol(key);
     }
 
-    fn handleFlush(self: *Self, output: *OutputBuffer, client_id: u32) void {
-        for (self.books) |maybe_book| {
-            if (maybe_book) |book| {
-                book.flush(output, client_id);
+    pub fn find(self: *Self, symbol: []const u8) ?*SymbolMapSlot {
+        std.debug.assert(symbol.len > 0);
+
+        const hash = hashSymbol(symbol);
+
+        var i: u32 = 0;
+        while (i < MAX_SYMBOL_PROBE_LENGTH) : (i += 1) {
+            const idx = (hash + i) & SYMBOL_MAP_MASK;
+            const slot = &self.slots[idx];
+
+            if (symbolEqual(&slot.symbol, symbol)) {
+                return slot;
             }
-        }
 
-        // Bulk invalidate all order tracking entries via generation bump
-        self.order_map_generation +%= 1;
-        if (self.order_map_generation == 0) {
-            // Skip 0 since it's the "inactive" sentinel
-            self.order_map_generation = 1;
-        }
-        self.order_map_count = 0;
-    }
-
-    // ========================================================================
-    // Client Disconnect Handling
-    // ========================================================================
-
-    pub fn cancelClientOrders(self: *Self, client_id: config.ClientId, output: *OutputBuffer) usize {
-        std.debug.assert(client_id > 0);
-
-        var cancelled: usize = 0;
-        for (self.books) |maybe_book| {
-            if (maybe_book) |book| {
-                cancelled += book.cancelClientOrders(client_id, output);
-            }
-        }
-        return cancelled;
-    }
-
-    // ========================================================================
-    // Symbol Hash Table Operations
-    // ========================================================================
-
-    fn findOrCreateBook(self: *Self, symbol: msg.Symbol) ?*OrderBook {
-        std.debug.assert(!msg.symbolIsEmpty(&symbol));
-
-        if (self.findBook(symbol)) |book| {
-            return book;
-        }
-
-        const idx = hashSymbol(symbol);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot_idx = (idx + probe) & SYMBOL_MAP_MASK;
-
-            if (!self.symbol_map[slot_idx].active) {
-                // Allocate or reuse OrderBook
-                if (self.books[slot_idx] == null) {
-                    const book = self.allocator.create(OrderBook) catch {
-                        std.log.err("Failed to allocate OrderBook", .{});
-                        return null;
-                    };
-                    book.initInPlace(symbol, self.pools);
-                    self.books[slot_idx] = book;
-                } else {
-                    // Reuse existing book - use reset() to properly release any
-                    // existing orders before reinitializing for new symbol
-                    self.books[slot_idx].?.reset(symbol);
-                }
-
-                self.symbol_map[slot_idx] = .{
-                    .symbol = symbol,
-                    .book_index = @intCast(slot_idx),
-                    .active = true,
-                    ._padding = undefined,
-                };
-
-                self.num_books += 1;
-                self.recordProbe(probe);
-                self.checkSymbolMapLoad();
-
-                return self.books[slot_idx];
-            }
-        }
-
-        std.log.err("Symbol map probe limit exceeded for symbol", .{});
-        return null;
-    }
-
-    fn findBook(self: *Self, symbol: msg.Symbol) ?*OrderBook {
-        std.debug.assert(!msg.symbolIsEmpty(&symbol));
-
-        const idx = hashSymbol(symbol);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot_idx = (idx + probe) & SYMBOL_MAP_MASK;
-            const slot = &self.symbol_map[slot_idx];
-
-            if (!slot.active) {
-                self.recordProbe(probe);
+            if (slot.isEmpty()) {
                 return null;
             }
-
-            if (msg.symbolEqual(&slot.symbol, &symbol)) {
-                self.recordProbe(probe);
-                return self.books[slot.book_index];
-            }
         }
 
-        self.recordProbe(MAX_PROBE_LENGTH);
         return null;
     }
 
-    fn checkSymbolMapLoad(self: *Self) void {
-        const load_pct = (self.num_books * 100) / SYMBOL_MAP_SIZE;
-        if (load_pct > LOAD_FACTOR_WARNING) {
-            std.log.warn("Symbol map load factor: {d}% ({d}/{d})", .{
-                load_pct,
-                self.num_books,
-                SYMBOL_MAP_SIZE,
-            });
+    pub fn insert(self: *Self, symbol: []const u8, book_index: i32) ?*SymbolMapSlot {
+        std.debug.assert(symbol.len > 0);
+        std.debug.assert(symbol[0] != 0);
+
+        const hash = hashSymbol(symbol);
+
+        var i: u32 = 0;
+        while (i < MAX_SYMBOL_PROBE_LENGTH) : (i += 1) {
+            const idx = (hash + i) & SYMBOL_MAP_MASK;
+            const slot = &self.slots[idx];
+
+            if (slot.isEmpty()) {
+                msg.copySymbol(&slot.symbol, symbol);
+                slot.book_index = book_index;
+                self.count += 1;
+                return slot;
+            }
+
+            if (symbolEqual(&slot.symbol, symbol)) {
+                slot.book_index = book_index;
+                return slot;
+            }
+        }
+
+        return null;
+    }
+};
+
+// ============================================================================
+// Order-Symbol Map - For Cancel Lookups
+// ============================================================================
+
+const OrderSymbolSlot = struct {
+    order_key: u64,
+    symbol: msg.Symbol,
+};
+
+const OrderSymbolMap = struct {
+    slots: [ORDER_SYMBOL_MAP_SIZE]OrderSymbolSlot,
+    count: u32,
+    tombstone_count: u32,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        var self = Self{
+            .slots = undefined,
+            .count = 0,
+            .tombstone_count = 0,
+        };
+        for (&self.slots) |*slot| {
+            slot.order_key = ORDER_KEY_EMPTY;
+            @memset(&slot.symbol, 0);
+        }
+        return self;
+    }
+
+    pub fn initInPlace(self: *Self) void {
+        self.count = 0;
+        self.tombstone_count = 0;
+        for (&self.slots) |*slot| {
+            slot.order_key = ORDER_KEY_EMPTY;
+            @memset(&slot.symbol, 0);
         }
     }
 
-    // ========================================================================
-    // Order Tracking Hash Table Operations
-    // ========================================================================
+    pub fn insert(self: *Self, order_key: u64, symbol: []const u8) bool {
+        std.debug.assert(order_key != ORDER_KEY_EMPTY);
+        std.debug.assert(order_key != ORDER_KEY_TOMBSTONE);
+        std.debug.assert(symbol.len > 0);
 
-    fn trackOrderSymbol(self: *Self, key: u64, symbol: msg.Symbol) bool {
-        std.debug.assert(key != 0);
-        std.debug.assert(!msg.symbolIsEmpty(&symbol));
+        const hash = hashOrderKey(order_key);
 
-        const idx = hashOrderKey(key);
-        var probe: u32 = 0;
+        var i: u32 = 0;
+        while (i < MAX_ORDER_SYMBOL_PROBE_LENGTH) : (i += 1) {
+            const idx = (hash + i) & ORDER_SYMBOL_MAP_MASK;
+            const slot = &self.slots[idx];
 
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot_idx = (idx + probe) & ORDER_SYMBOL_MAP_MASK;
-            const slot = &self.order_symbol_map[slot_idx];
-
-            if (!slot.isActive(self.order_map_generation) or slot.key == key) {
-                const was_new = !slot.isActive(self.order_map_generation);
-                slot.* = .{
-                    .key = key,
-                    .symbol = symbol,
-                    .generation = self.order_map_generation,
-                    ._padding = undefined,
-                };
-
-                if (was_new) {
-                    self.order_map_count += 1;
-                    self.checkOrderMapLoad();
+            if (slot.order_key == ORDER_KEY_EMPTY or slot.order_key == ORDER_KEY_TOMBSTONE) {
+                if (slot.order_key == ORDER_KEY_TOMBSTONE) {
+                    self.tombstone_count -= 1;
                 }
+                slot.order_key = order_key;
+                msg.copySymbol(&slot.symbol, symbol);
+                self.count += 1;
+                return true;
+            }
 
-                self.recordProbe(probe);
+            if (slot.order_key == order_key) {
+                msg.copySymbol(&slot.symbol, symbol);
                 return true;
             }
         }
 
-        self.recordProbe(MAX_PROBE_LENGTH);
         return false;
     }
 
-    fn lookupOrderSymbol(self: *Self, key: u64) ?msg.Symbol {
-        std.debug.assert(key != 0);
+    pub fn find(self: *Self, order_key: u64) ?*OrderSymbolSlot {
+        if (order_key == ORDER_KEY_EMPTY or order_key == ORDER_KEY_TOMBSTONE) {
+            return null;
+        }
 
-        const idx = hashOrderKey(key);
-        var probe: u32 = 0;
+        const hash = hashOrderKey(order_key);
 
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot_idx = (idx + probe) & ORDER_SYMBOL_MAP_MASK;
-            const slot = &self.order_symbol_map[slot_idx];
+        var i: u32 = 0;
+        while (i < MAX_ORDER_SYMBOL_PROBE_LENGTH) : (i += 1) {
+            const idx = (hash + i) & ORDER_SYMBOL_MAP_MASK;
+            const slot = &self.slots[idx];
 
-            if (!slot.isActive(self.order_map_generation)) {
-                self.recordProbe(probe);
-                return null;
+            if (slot.order_key == order_key) {
+                return slot;
             }
 
-            if (slot.key == key) {
-                self.recordProbe(probe);
-                return slot.symbol;
+            if (slot.order_key == ORDER_KEY_EMPTY) {
+                return null;
             }
         }
 
-        self.recordProbe(MAX_PROBE_LENGTH);
         return null;
     }
 
-    fn removeOrderSymbol(self: *Self, key: u64) void {
-        std.debug.assert(key != 0);
-
-        const idx = hashOrderKey(key);
-        var probe: u32 = 0;
-
-        while (probe < MAX_PROBE_LENGTH) : (probe += 1) {
-            const slot_idx = (idx + probe) & ORDER_SYMBOL_MAP_MASK;
-            const slot = &self.order_symbol_map[slot_idx];
-
-            if (!slot.isActive(self.order_map_generation)) {
-                return;
-            }
-
-            if (slot.key == key) {
-                slot.generation = 0; // Mark inactive
-                std.debug.assert(self.order_map_count > 0);
-                self.order_map_count -= 1;
-                return;
-            }
+    pub fn remove(self: *Self, order_key: u64) bool {
+        if (self.find(order_key)) |slot| {
+            slot.order_key = ORDER_KEY_TOMBSTONE;
+            self.count -= 1;
+            self.tombstone_count += 1;
+            return true;
         }
+        return false;
     }
 
-    fn checkOrderMapLoad(self: *Self) void {
-        const load_pct = (self.order_map_count * 100) / ORDER_SYMBOL_MAP_SIZE;
-        if (load_pct > LOAD_FACTOR_WARNING) {
-            std.log.warn("Order tracking map load factor: {d}% ({d}/{d})", .{
-                load_pct,
-                self.order_map_count,
-                ORDER_SYMBOL_MAP_SIZE,
-            });
+    pub fn clear(self: *Self) void {
+        for (&self.slots) |*slot| {
+            slot.order_key = ORDER_KEY_EMPTY;
         }
-    }
-
-    // ========================================================================
-    // Statistics
-    // ========================================================================
-
-    fn recordProbe(self: *Self, probe_length: u32) void {
-        self.probe_total += probe_length;
-        self.probe_count += 1;
-        self.max_probe_length = @max(self.max_probe_length, probe_length);
-    }
-
-    /// Get engine statistics.
-    ///
-    /// Note: Trade statistics are tracked per-OrderBook. Use `getAggregateStats()`
-    /// for totals across all books, or access individual books for per-symbol stats.
-    pub fn getStats(self: *const Self) EngineStats {
-        const avg_probe = if (self.probe_count > 0)
-            @as(f32, @floatFromInt(self.probe_total)) / @as(f32, @floatFromInt(self.probe_count))
-        else
-            0.0;
-
-        return .{
-            .total_orders = self.total_orders,
-            .total_cancels = self.total_cancels,
-            .total_rejects = self.total_rejects,
-            .num_books = self.num_books,
-            .order_map_count = self.order_map_count,
-            .order_map_generation = self.order_map_generation,
-            .avg_probe_length = avg_probe,
-            .max_probe_length = self.max_probe_length,
-        };
-    }
-
-    /// Get aggregate statistics including trade counts from all order books.
-    pub fn getAggregateStats(self: *const Self) AggregateStats {
-        var total_trades: u64 = 0;
-        var total_fills: u64 = 0;
-        var volume_traded: u64 = 0;
-        var current_orders: u32 = 0;
-
-        for (self.books) |maybe_book| {
-            if (maybe_book) |book| {
-                const book_stats = book.getStats();
-                total_trades += book_stats.total_trades;
-                total_fills += book_stats.total_fills;
-                volume_traded += book_stats.volume_traded;
-                current_orders += book_stats.current_orders;
-            }
-        }
-
-        return .{
-            .total_orders = self.total_orders,
-            .total_cancels = self.total_cancels,
-            .total_rejects = self.total_rejects,
-            .total_trades = total_trades,
-            .total_fills = total_fills,
-            .volume_traded = volume_traded,
-            .num_books = self.num_books,
-            .current_orders = current_orders,
-            .order_map_count = self.order_map_count,
-        };
+        self.count = 0;
+        self.tombstone_count = 0;
+        std.debug.assert(self.count == 0);
     }
 };
 
-/// Engine-level statistics (does not include per-book trade stats).
-pub const EngineStats = struct {
-    total_orders: u64,
-    total_cancels: u64,
-    total_rejects: u64,
-    num_books: u32,
-    order_map_count: u32,
-    order_map_generation: u32,
-    avg_probe_length: f32,
-    max_probe_length: u32,
-};
+// ============================================================================
+// Matching Engine Structure
+// ============================================================================
 
-/// Aggregate statistics including all order books.
-pub const AggregateStats = struct {
-    total_orders: u64,
-    total_cancels: u64,
-    total_rejects: u64,
-    total_trades: u64,
-    total_fills: u64,
-    volume_traded: u64,
+pub const MatchingEngine = struct {
+    symbol_map: SymbolMap,
+    order_to_symbol: OrderSymbolMap,
+    books: [MAX_SYMBOLS]OrderBook,
     num_books: u32,
-    current_orders: u32,
-    order_map_count: u32,
+    flush_in_progress: bool,
+    flush_book_index: u32,
+
+    const Self = @This();
+
+    /// Initialize matching engine (WARNING: creates large struct on stack)
+    pub fn init() Self {
+        var self: Self = undefined;
+        self.initInPlace();
+        return self;
+    }
+
+    /// Initialize matching engine in-place (avoids stack allocation)
+    pub fn initInPlace(self: *Self) void {
+        self.symbol_map.initInPlace();
+        self.order_to_symbol.initInPlace();
+        self.num_books = 0;
+        self.flush_in_progress = false;
+        self.flush_book_index = 0;
+
+        for (&self.books) |*book| {
+            book.* = OrderBook.init("_UNINIT_");
+        }
+
+        std.debug.assert(self.num_books == 0);
+    }
+
+    pub fn processMessage(
+        self: *Self,
+        input: *const msg.InputMsg,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) void {
+        std.debug.assert(msg.InputMsgType.isValid(@intFromEnum(input.type)));
+
+        switch (input.type) {
+            .new_order => self.processNewOrder(&input.data.new_order, client_id, output),
+            .cancel => self.processCancelOrder(&input.data.cancel, output),
+            .flush => self.processFlush(output),
+        }
+    }
+
+    pub fn processNewOrder(
+        self: *Self,
+        order_msg: *const msg.NewOrderMsg,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) void {
+        std.debug.assert(order_msg.quantity > 0);
+
+        const symbol = msg.symbolSlice(&order_msg.symbol);
+
+        const book = self.getOrCreateOrderBook(symbol) orelse {
+            output.addAck(symbol, order_msg.user_id, order_msg.user_order_id);
+            return;
+        };
+
+        const order_key = makeOrderKey(order_msg.user_id, order_msg.user_order_id);
+        _ = self.order_to_symbol.insert(order_key, symbol);
+
+        book.addOrder(order_msg, client_id, output);
+    }
+
+    pub fn processCancelOrder(
+        self: *Self,
+        cancel_msg: *const msg.CancelMsg,
+        output: *OutputBuffer,
+    ) void {
+        const order_key = makeOrderKey(cancel_msg.user_id, cancel_msg.user_order_id);
+
+        const entry = self.order_to_symbol.find(order_key);
+        if (entry == null) {
+            output.addCancelAck("UNKNOWN", cancel_msg.user_id, cancel_msg.user_order_id);
+            return;
+        }
+
+        const symbol = msg.symbolSlice(&entry.?.symbol);
+
+        const book_slot = self.symbol_map.find(symbol);
+        if (book_slot == null) {
+            output.addCancelAck(symbol, cancel_msg.user_id, cancel_msg.user_order_id);
+            _ = self.order_to_symbol.remove(order_key);
+            return;
+        }
+
+        std.debug.assert(book_slot.?.book_index >= 0);
+        const book_index: u32 = @intCast(book_slot.?.book_index);
+        std.debug.assert(book_index < self.num_books);
+
+        self.books[book_index].cancelOrder(
+            cancel_msg.user_id,
+            cancel_msg.user_order_id,
+            output,
+        );
+
+        _ = self.order_to_symbol.remove(order_key);
+    }
+
+    pub fn processFlush(self: *Self, output: *OutputBuffer) void {
+        self.flush_in_progress = true;
+        self.flush_book_index = 0;
+
+        for (self.books[0..self.num_books]) |*book| {
+            _ = book.flush(output);
+        }
+
+        self.order_to_symbol.clear();
+
+        // Check if all books completed flush
+        var all_done = true;
+        for (self.books[0..self.num_books]) |*book| {
+            if (book.flushInProgress()) {
+                all_done = false;
+                break;
+            }
+        }
+
+        if (all_done) {
+            self.flush_in_progress = false;
+        }
+    }
+
+    pub fn continueFlush(self: *Self, output: *OutputBuffer) bool {
+        if (!self.flush_in_progress) return true;
+
+        var all_done = true;
+        for (self.books[0..self.num_books]) |*book| {
+            if (book.flushInProgress()) {
+                const done = book.flush(output);
+                if (!done) {
+                    all_done = false;
+                }
+            }
+        }
+
+        if (all_done) {
+            self.flush_in_progress = false;
+        }
+
+        return all_done;
+    }
+
+    pub fn hasFlushInProgress(self: *Self) bool {
+        return self.flush_in_progress;
+    }
+
+    pub fn cancelClientOrders(
+        self: *Self,
+        client_id: u32,
+        output: *OutputBuffer,
+    ) usize {
+        var total_cancelled: usize = 0;
+        for (self.books[0..self.num_books]) |*book| {
+            total_cancelled += book.cancelClientOrders(client_id, output);
+        }
+        return total_cancelled;
+    }
+
+    pub fn getOrCreateOrderBook(self: *Self, symbol: []const u8) ?*OrderBook {
+        std.debug.assert(symbol.len > 0);
+
+        if (self.symbol_map.find(symbol)) |slot| {
+            std.debug.assert(slot.book_index >= 0);
+            const idx: u32 = @intCast(slot.book_index);
+            std.debug.assert(idx < self.num_books);
+            return &self.books[idx];
+        }
+
+        if (self.num_books >= MAX_SYMBOLS) {
+            return null;
+        }
+
+        const book_index = self.num_books;
+        self.books[book_index] = OrderBook.init(symbol);
+        self.num_books += 1;
+
+        const new_slot = self.symbol_map.insert(symbol, @intCast(book_index));
+        if (new_slot == null) {
+            self.num_books -= 1;
+            return null;
+        }
+
+        return &self.books[book_index];
+    }
+
+    pub fn getOrderBook(self: *Self, symbol: []const u8) ?*OrderBook {
+        if (self.symbol_map.find(symbol)) |slot| {
+            if (slot.book_index >= 0) {
+                const idx: u32 = @intCast(slot.book_index);
+                if (idx < self.num_books) {
+                    return &self.books[idx];
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn generateTopOfBook(self: *Self, symbol: []const u8, output: *OutputBuffer) void {
+        if (self.getOrderBook(symbol)) |book| {
+            book.generateTopOfBook(output);
+        }
+    }
+
+    pub fn generateAllTopOfBook(self: *Self, output: *OutputBuffer) void {
+        for (self.books[0..self.num_books]) |*book| {
+            book.generateTopOfBook(output);
+        }
+    }
+
+    pub fn getNumBooks(self: *const Self) u32 {
+        return self.num_books;
+    }
+
+    pub const Stats = struct {
+        num_books: u32,
+        symbol_map_count: u32,
+        order_symbol_map_count: u32,
+        order_symbol_tombstones: u32,
+    };
+
+    pub fn getStats(self: *const Self) Stats {
+        return Stats{
+            .num_books = self.num_books,
+            .symbol_map_count = self.symbol_map.count,
+            .order_symbol_map_count = self.order_to_symbol.count,
+            .order_symbol_tombstones = self.order_to_symbol.tombstone_count,
+        };
+    }
 };
 
 // ============================================================================
 // Hash Functions
 // ============================================================================
 
-/// FNV-1a hash for symbol lookup.
-fn hashSymbol(symbol: msg.Symbol) u32 {
-    var hash: u32 = 2166136261; // FNV offset basis
+fn hashSymbol(symbol: []const u8) u32 {
+    var hash: u32 = 2166136261;
     for (symbol) |byte| {
         if (byte == 0) break;
         hash ^= byte;
-        hash *%= 16777619; // FNV prime
+        hash *%= 16777619;
     }
     return hash & SYMBOL_MAP_MASK;
 }
 
-/// Fibonacci hash for order key lookup.
 fn hashOrderKey(key: u64) u32 {
     const GOLDEN_RATIO: u64 = 0x9E3779B97F4A7C15;
     var k = key;
     k ^= k >> 33;
     k *%= GOLDEN_RATIO;
     k ^= k >> 29;
-    return @intCast(k & ORDER_SYMBOL_MAP_MASK);
+    return @truncate(k & ORDER_SYMBOL_MAP_MASK);
 }
 
-/// Create composite key from user_id and order_id.
-fn makeOrderKey(user_id: u32, order_id: u32) u64 {
-    std.debug.assert(user_id > 0 or order_id > 0);
-    return (@as(u64, user_id) << 32) | order_id;
+fn symbolEqual(symbol: *const msg.Symbol, other: []const u8) bool {
+    const sym_slice = msg.symbolSlice(symbol);
+    return std.mem.eql(u8, sym_slice, other);
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-test "hash functions distribute well" {
-    var symbol_buckets: [16]u32 = [_]u32{0} ** 16;
-    const symbols = [_][]const u8{ "AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "TSLA", "JPM" };
-
-    for (symbols) |sym| {
-        var symbol: msg.Symbol = [_]u8{0} ** 8;
-        @memcpy(symbol[0..sym.len], sym);
-        const hash = hashSymbol(symbol);
-        symbol_buckets[hash & 0xF] += 1;
-    }
-
-    for (symbol_buckets) |count| {
-        try std.testing.expect(count < symbols.len);
-    }
+test "matching engine init" {
+    var engine: MatchingEngine = undefined;
+    engine.initInPlace();
+    try std.testing.expectEqual(@as(u32, 0), engine.num_books);
+    try std.testing.expectEqual(@as(u32, 0), engine.symbol_map.count);
 }
 
-test "makeOrderKey uniqueness" {
-    const k1 = makeOrderKey(1, 1);
-    const k2 = makeOrderKey(1, 2);
-    const k3 = makeOrderKey(2, 1);
+test "matching engine create order book" {
+    var engine: MatchingEngine = undefined;
+    engine.initInPlace();
 
-    try std.testing.expect(k1 != k2);
-    try std.testing.expect(k1 != k3);
-    try std.testing.expect(k2 != k3);
+    const book = engine.getOrCreateOrderBook("IBM");
+    try std.testing.expect(book != null);
+    try std.testing.expectEqual(@as(u32, 1), engine.num_books);
+
+    const book2 = engine.getOrCreateOrderBook("IBM");
+    try std.testing.expect(book2 != null);
+    try std.testing.expectEqual(@as(u32, 1), engine.num_books);
+    try std.testing.expectEqual(book, book2);
+
+    const book3 = engine.getOrCreateOrderBook("AAPL");
+    try std.testing.expect(book3 != null);
+    try std.testing.expectEqual(@as(u32, 2), engine.num_books);
+    try std.testing.expect(book != book3);
 }
 
-test "OrderSymbolSlot isActive" {
-    var slot = OrderSymbolSlot{
-        .key = 12345,
-        .symbol = msg.EMPTY_SYMBOL,
-        .generation = 5,
-        ._padding = undefined,
+test "matching engine process new order" {
+    var engine: MatchingEngine = undefined;
+    engine.initInPlace();
+    var output = OutputBuffer.init();
+
+    var order = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .price = 150,
+        .quantity = 1000,
+        .side = .buy,
+        ._pad = .{ 0, 0, 0 },
+        .symbol = undefined,
+    };
+    msg.copySymbol(&order.symbol, "IBM");
+
+    engine.processNewOrder(&order, 0, &output);
+
+    try std.testing.expectEqual(@as(u32, 1), output.len());
+    try std.testing.expectEqual(msg.OutputMsgType.ack, output.get(0).type);
+    try std.testing.expectEqual(@as(u32, 1), engine.num_books);
+    try std.testing.expectEqual(@as(u32, 1), engine.order_to_symbol.count);
+}
+
+test "matching engine cancel order" {
+    var engine: MatchingEngine = undefined;
+    engine.initInPlace();
+    var output = OutputBuffer.init();
+
+    var order = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .price = 150,
+        .quantity = 1000,
+        .side = .buy,
+        ._pad = .{ 0, 0, 0 },
+        .symbol = undefined,
+    };
+    msg.copySymbol(&order.symbol, "IBM");
+    engine.processNewOrder(&order, 0, &output);
+    output.reset();
+
+    var cancel = msg.CancelMsg{
+        .user_id = 1,
+        .user_order_id = 100,
+        .symbol = undefined,
+    };
+    msg.copySymbol(&cancel.symbol, "IBM");
+    engine.processCancelOrder(&cancel, &output);
+
+    try std.testing.expectEqual(@as(u32, 1), output.len());
+    try std.testing.expectEqual(msg.OutputMsgType.cancel_ack, output.get(0).type);
+    try std.testing.expectEqual(@as(u32, 0), engine.order_to_symbol.count);
+}
+
+test "matching engine flush" {
+    var engine: MatchingEngine = undefined;
+    engine.initInPlace();
+    var output = OutputBuffer.init();
+
+    var order1 = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 1,
+        .price = 100,
+        .quantity = 500,
+        .side = .buy,
+        ._pad = .{ 0, 0, 0 },
+        .symbol = undefined,
+    };
+    msg.copySymbol(&order1.symbol, "IBM");
+
+    var order2 = msg.NewOrderMsg{
+        .user_id = 2,
+        .user_order_id = 1,
+        .price = 200,
+        .quantity = 300,
+        .side = .sell,
+        ._pad = .{ 0, 0, 0 },
+        .symbol = undefined,
+    };
+    msg.copySymbol(&order2.symbol, "AAPL");
+
+    engine.processNewOrder(&order1, 0, &output);
+    engine.processNewOrder(&order2, 0, &output);
+    output.reset();
+
+    engine.processFlush(&output);
+
+    try std.testing.expect(output.len() >= 2);
+    try std.testing.expectEqual(@as(u32, 0), engine.order_to_symbol.count);
+}
+
+test "matching engine trade" {
+    var engine: MatchingEngine = undefined;
+    engine.initInPlace();
+    var output = OutputBuffer.init();
+
+    var sell = msg.NewOrderMsg{
+        .user_id = 1,
+        .user_order_id = 1,
+        .price = 100,
+        .quantity = 500,
+        .side = .sell,
+        ._pad = .{ 0, 0, 0 },
+        .symbol = undefined,
+    };
+    msg.copySymbol(&sell.symbol, "IBM");
+    engine.processNewOrder(&sell, 10, &output);
+    output.reset();
+
+    var buy = msg.NewOrderMsg{
+        .user_id = 2,
+        .user_order_id = 1,
+        .price = 100,
+        .quantity = 300,
+        .side = .buy,
+        ._pad = .{ 0, 0, 0 },
+        .symbol = undefined,
+    };
+    msg.copySymbol(&buy.symbol, "IBM");
+    engine.processNewOrder(&buy, 20, &output);
+
+    try std.testing.expectEqual(@as(u32, 2), output.len());
+    try std.testing.expectEqual(msg.OutputMsgType.ack, output.get(0).type);
+    try std.testing.expectEqual(msg.OutputMsgType.trade, output.get(1).type);
+
+    const trade = &output.get(1).data.trade;
+    try std.testing.expectEqual(@as(u32, 2), trade.user_id_buy);
+    try std.testing.expectEqual(@as(u32, 1), trade.user_id_sell);
+    try std.testing.expectEqual(@as(u32, 300), trade.quantity);
+    try std.testing.expectEqual(@as(u32, 100), trade.price);
+}
+
+test "hash symbol distribution" {
+    var buckets: [16]u32 = [_]u32{0} ** 16;
+
+    const symbols = [_][]const u8{
+        "IBM",  "AAPL", "GOOG", "MSFT", "AMZN", "META", "NVDA", "TSLA",
+        "JPM",  "BAC",  "WFC",  "C",    "GS",   "MS",   "BRK",  "UNH",
+        "JNJ",  "PFE",  "MRK",  "ABBV", "LLY",  "TMO",  "ABT",  "DHR",
+        "XOM",  "CVX",  "COP",  "EOG",  "SLB",  "PXD",  "VLO",  "MPC",
     };
 
-    // Active when generation matches
-    try std.testing.expect(slot.isActive(5));
+    for (symbols) |sym| {
+        const hash = hashSymbol(sym);
+        buckets[hash & 0xF] += 1;
+    }
 
-    // Inactive when generation differs
-    try std.testing.expect(!slot.isActive(4));
-    try std.testing.expect(!slot.isActive(6));
-
-    // Generation 0 is always inactive
-    slot.generation = 0;
-    try std.testing.expect(!slot.isActive(0));
-}
-
-test "struct sizes" {
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(SymbolSlot));
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(OrderSymbolSlot));
+    for (buckets) |count| {
+        try std.testing.expect(count <= 8);
+    }
 }
