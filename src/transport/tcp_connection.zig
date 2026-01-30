@@ -327,6 +327,11 @@ pub const TcpConnection = struct {
         return self.parser.hasPendingData();
     }
 
+    /// Get number of bytes pending in send buffer
+    pub fn getPendingBytes(self: *const Self) usize {
+        return self.send_buffer.len;
+    }
+
     /// Get statistics
     pub fn getStats(self: *const Self) ConnectionStats {
         return self.stats;

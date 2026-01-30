@@ -53,11 +53,13 @@ pub const ServerStats = struct {
 const ClientSlot = struct {
     connection: ?TcpConnection,
     active: bool,
+    connect_time_ms: i64,
 
     pub fn init() ClientSlot {
         return ClientSlot{
             .connection = null,
             .active = false,
+            .connect_time_ms = 0,
         };
     }
 
@@ -195,6 +197,19 @@ pub const TcpServer = struct {
         return processed;
     }
 
+    /// Get total pending send bytes across all clients
+    pub fn getPendingSendBytes(self: *Self) usize {
+        var total: usize = 0;
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    total += conn.getPendingBytes();
+                }
+            }
+        }
+        return total;
+    }
+
     /// Check if there are any active clients
     pub fn hasActiveClients(self: *Self) bool {
         return self.stats.current_clients > 0;
@@ -204,6 +219,10 @@ pub const TcpServer = struct {
         while (self.state == .running) {
             _ = try self.poll();
         }
+    }
+
+    fn getCurrentTimeMs() i64 {
+        return std.time.milliTimestamp();
     }
 
     fn acceptConnections(self: *Self) !u32 {
@@ -225,17 +244,21 @@ pub const TcpServer = struct {
             };
             const client_id = self.next_client_id;
             self.next_client_id += 1;
+
             var conn = TcpConnection.init(client_id, accept_result.stream, accept_result.address);
             conn.setNonBlocking(true) catch {};
             conn.setNoDelay(true) catch {};
+
+            const now = getCurrentTimeMs();
             self.clients[slot_idx].connection = conn;
             self.clients[slot_idx].active = true;
+            self.clients[slot_idx].connect_time_ms = now;
             self.stats.connections_accepted += 1;
             self.stats.current_clients += 1;
             accepted += 1;
 
-            // Log connection
-            std.debug.print("[TCP] Client {d} connected\n", .{client_id});
+            // Log connection with timestamp
+            std.debug.print("[TCP] Client {d} connected (time={d}ms)\n", .{ client_id, now });
         }
         return accepted;
     }
@@ -364,18 +387,20 @@ pub const TcpServer = struct {
     }
 
     fn cleanupDisconnected(self: *Self) void {
+        const now = getCurrentTimeMs();
         for (&self.clients) |*slot| {
             if (slot.connection) |*conn| {
                 if (conn.state == .disconnecting or conn.state == .disconnected) {
                     const client_id = conn.client_id;
+                    const duration_ms = now - slot.connect_time_ms;
                     conn.close();
                     slot.active = false;
                     slot.connection = null;
                     self.stats.connections_closed += 1;
                     self.stats.current_clients -= 1;
 
-                    // Log disconnection
-                    std.debug.print("[TCP] Client {d} disconnected\n", .{client_id});
+                    // Log disconnection with duration
+                    std.debug.print("[TCP] Client {d} disconnected (duration={d}ms)\n", .{ client_id, duration_ms });
                 }
             }
         }

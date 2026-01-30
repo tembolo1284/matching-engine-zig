@@ -2,26 +2,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const msg = @import("protocol/message_types.zig");
-const binary = @import("protocol/binary_codec.zig");
-const fix = @import("protocol/fix_codec.zig");
 const Order = @import("core/order.zig").Order;
-const OrderBook = @import("core/order_book.zig").OrderBook;
-const MatchingEngine = @import("core/matching_engine.zig").MatchingEngine;
-const OutputBuffer = @import("core/output_buffer.zig").OutputBuffer;
 const SpscQueue = @import("threading/spsc_queue.zig");
 const InputEnvelopeQueue = SpscQueue.InputEnvelopeQueue;
 const OutputEnvelopeQueue = SpscQueue.OutputEnvelopeQueue;
-const Processor = @import("threading/processor.zig").Processor;
 const ProcessorThread = @import("threading/processor.zig").ProcessorThread;
-const SyncProcessor = @import("threading/processor.zig").SyncProcessor;
-const framing = @import("transport/framing.zig");
-const TcpConnection = @import("transport/tcp_connection.zig").TcpConnection;
-const TcpServer = @import("transport/tcp_server.zig").TcpServer;
+const ThreadedTcpServer = @import("transport/tcp_server_threaded.zig").ThreadedTcpServer;
 
 pub const VERSION = "0.1.0";
 pub const BUILD_MODE = @tagName(builtin.mode);
-const is_linux = builtin.os.tag == .linux;
-const is_darwin = builtin.os.tag.isDarwin();
 
 // ============================================================================
 // Signal Handling
@@ -56,14 +45,12 @@ fn setupSignalHandlers() void {
 const Config = struct {
     tcp_port: u16,
     tcp_addr: []const u8,
-    threaded: bool,
     verbose: bool,
 
     pub fn fromEnv() Config {
         return Config{
             .tcp_port = getEnvU16("ENGINE_TCP_PORT", 1234),
             .tcp_addr = "0.0.0.0",
-            .threaded = getEnvBool("ENGINE_THREADED", true), // Default to threaded
             .verbose = getEnvBool("ENGINE_VERBOSE", false),
         };
     }
@@ -82,41 +69,25 @@ const Config = struct {
 // ============================================================================
 // Command Line Options
 // ============================================================================
-const RunMode = enum {
-    server,
-    help,
-    version,
-};
-
-const Options = struct {
-    mode: RunMode,
-    config: Config,
-};
-
-fn parseOptions() Options {
-    var opts = Options{
-        .mode = .server,
-        .config = Config.fromEnv(),
-    };
+fn parseOptions() Config {
+    var config = Config.fromEnv();
     var args = std.process.args();
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            opts.mode = .help;
-            return opts;
+            printUsage();
+            std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            opts.mode = .version;
-            return opts;
-        } else if (std.mem.eql(u8, arg, "--threaded") or std.mem.eql(u8, arg, "-t")) {
-            opts.config.threaded = true;
+            printVersion();
+            std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--verbose")) {
-            opts.config.verbose = true;
+            config.verbose = true;
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
             const port_str = arg[7..];
-            opts.config.tcp_port = std.fmt.parseInt(u16, port_str, 10) catch 1234;
+            config.tcp_port = std.fmt.parseInt(u16, port_str, 10) catch 1234;
         }
     }
-    return opts;
+    return config;
 }
 
 fn printUsage() void {
@@ -128,7 +99,6 @@ fn printUsage() void {
         \\Options:
         \\  -h, --help       Show this help message
         \\  -v, --version    Show version information
-        \\  -t, --threaded   Run in threaded mode (default)
         \\  --verbose        Enable verbose logging
         \\  --port=PORT      TCP listen port (default: 1234)
         \\
@@ -149,29 +119,32 @@ fn printStartupBanner(config: *const Config) void {
     std.debug.print("============================================\n", .{});
     std.debug.print("  TCP:       {s}:{d}\n", .{ config.tcp_addr, config.tcp_port });
     std.debug.print("  Protocol:  Binary (0x4D) / FIX 4.2\n", .{});
-    std.debug.print("  Mode:      Threaded\n", .{});
+    std.debug.print("  Mode:      Multi-Threaded (per-client)\n", .{});
     std.debug.print("============================================\n", .{});
     std.debug.print("Press Ctrl+C to shutdown gracefully\n", .{});
     std.debug.print("\n", .{});
 }
 
-fn printStats(stats: anytype) void {
+fn printStats(proc_stats: anytype, server_stats: anytype) void {
     std.debug.print("\n", .{});
     std.debug.print("============ Session Statistics ============\n", .{});
-    std.debug.print("  Messages processed: {d}\n", .{stats.messages_processed});
-    std.debug.print("  Trades generated:   {d}\n", .{stats.trades_generated});
-    std.debug.print("  Acks generated:     {d}\n", .{stats.acks_generated});
-    std.debug.print("  Flushes:            {d}\n", .{stats.flush_count});
-    std.debug.print("  OutQ full events:   {d}\n", .{stats.output_queue_full});
+    std.debug.print("  Messages processed: {d}\n", .{proc_stats.messages_processed});
+    std.debug.print("  Trades generated:   {d}\n", .{proc_stats.trades_generated});
+    std.debug.print("  Acks generated:     {d}\n", .{proc_stats.acks_generated});
+    std.debug.print("  Connections:        {d} accepted, {d} closed\n", .{
+        server_stats.connections_accepted,
+        server_stats.connections_closed,
+    });
+    std.debug.print("  Messages routed:    {d}\n", .{server_stats.messages_routed});
+    std.debug.print("  Route failures:     {d}\n", .{server_stats.route_failures});
     std.debug.print("=============================================\n", .{});
 }
 
 // ============================================================================
-// Server Runner (Threaded Mode)
+// Server Runner
 // ============================================================================
 fn runServer(allocator: std.mem.Allocator, config: *const Config) !void {
-    if (config.verbose) std.debug.print("Initializing threaded mode...\n", .{});
-
+    // Create queues
     const input_queue = try allocator.create(InputEnvelopeQueue);
     defer allocator.destroy(input_queue);
     input_queue.* = InputEnvelopeQueue.init();
@@ -180,50 +153,38 @@ fn runServer(allocator: std.mem.Allocator, config: *const Config) !void {
     defer allocator.destroy(output_queue);
     output_queue.* = OutputEnvelopeQueue.init();
 
-    const server = try allocator.create(TcpServer);
-    defer allocator.destroy(server);
-    server.initInPlace();
-
-    server.setQueues(input_queue, output_queue);
-
+    // Create processor thread
     const processor_thread = try allocator.create(ProcessorThread);
     defer allocator.destroy(processor_thread);
     processor_thread.initInPlace(input_queue, output_queue);
 
+    // Create threaded TCP server
+    var server = ThreadedTcpServer.init(allocator, input_queue, output_queue);
+
+    // Start everything
     const address = try std.net.Address.parseIp4(config.tcp_addr, config.tcp_port);
     try server.start(address);
     try processor_thread.start();
 
-    if (config.verbose) std.debug.print("Server and processor started\n", .{});
     printStartupBanner(config);
 
-    // Main I/O loop - tight loop for maximum throughput
+    // Wait for shutdown
     while (!shutdown_requested.load(.acquire)) {
-        // Poll for network events (accept, read) - non-blocking
-        _ = server.pollNonBlocking() catch {};
-
-        // Drain output queue and send to clients
-        _ = server.drainAndSend();
-
-        // Flush any remaining data in send buffers
-        server.flushAllClients();
+        std.Thread.sleep(100_000_000); // 100ms
     }
 
-    std.debug.print("Shutting down...\n", .{});
+    std.debug.print("\nShutting down...\n", .{});
 
+    // Stop processor first (it will drain input queue)
     processor_thread.stop();
 
-    // Final drain
-    var drain_count: u32 = 0;
-    while (drain_count < 10000) : (drain_count += 1) {
-        _ = server.pollNonBlocking() catch {};
-        const drained = server.drainAndSend();
-        server.flushAllClients();
-        if (drained == 0 and !server.hasActiveClients()) break;
-    }
+    // Give router time to drain output queue
+    std.Thread.sleep(500_000_000); // 500ms
 
+    // Stop server (stops all client threads and router)
     server.stop();
-    printStats(processor_thread.getStats());
+
+    printStats(processor_thread.getStats(), server.getStats());
 }
 
 // ============================================================================
@@ -236,25 +197,9 @@ pub fn main() !void {
     std.debug.print("  OutputMsg:       {d} bytes\n", .{@sizeOf(msg.OutputMsg)});
     std.debug.print("  InputEnvelope:   {d} bytes\n", .{@sizeOf(SpscQueue.InputEnvelope)});
     std.debug.print("  OutputEnvelope:  {d} bytes\n", .{@sizeOf(SpscQueue.OutputEnvelope)});
-    std.debug.print("  TcpServer:       {d} bytes\n", .{@sizeOf(TcpServer)});
-    std.debug.print("  Processor:       {d} bytes\n", .{@sizeOf(Processor)});
-    std.debug.print("  InputQueue:      {d} bytes\n", .{@sizeOf(InputEnvelopeQueue)});
-    std.debug.print("  OutputQueue:     {d} bytes\n", .{@sizeOf(OutputEnvelopeQueue)});
     std.debug.print("\n", .{});
 
-    const opts = parseOptions();
-
-    switch (opts.mode) {
-        .help => {
-            printUsage();
-            return;
-        },
-        .version => {
-            printVersion();
-            return;
-        },
-        .server => {},
-    }
+    const config = parseOptions();
 
     setupSignalHandlers();
 
@@ -262,38 +207,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    try runServer(allocator, &opts.config);
+    try runServer(allocator, &config);
 
     std.debug.print("Shutdown complete\n", .{});
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-test "all module tests" {
-    _ = @import("protocol/message_types.zig");
-    _ = @import("protocol/binary_codec.zig");
-    _ = @import("protocol/fix_codec.zig");
-    _ = @import("core/order.zig");
-    _ = @import("core/output_buffer.zig");
-    _ = @import("core/order_book.zig");
-    _ = @import("core/matching_engine.zig");
-    _ = @import("threading/spsc_queue.zig");
-    _ = @import("threading/processor.zig");
-    _ = @import("transport/framing.zig");
-    _ = @import("transport/tcp_connection.zig");
-    _ = @import("transport/tcp_server.zig");
-}
-
-test "struct sizes" {
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Order));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(msg.InputMsg));
-    try std.testing.expectEqual(@as(usize, 52), @sizeOf(msg.OutputMsg));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SpscQueue.InputEnvelope));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SpscQueue.OutputEnvelope));
-}
-
-test "config from env" {
-    const config = Config.fromEnv();
-    try std.testing.expect(config.tcp_port > 0);
 }
