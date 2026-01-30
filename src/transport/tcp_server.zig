@@ -33,6 +33,7 @@ pub const ServerStats = struct {
     bytes_sent: u64,
     accept_errors: u64,
     current_clients: u32,
+    send_buffer_full: u64,
 
     pub fn init() ServerStats {
         return ServerStats{
@@ -44,6 +45,7 @@ pub const ServerStats = struct {
             .bytes_sent = 0,
             .accept_errors = 0,
             .current_clients = 0,
+            .send_buffer_full = 0,
         };
     }
 };
@@ -160,6 +162,44 @@ pub const TcpServer = struct {
         return events_processed;
     }
 
+    /// Non-blocking poll - no timeout, returns immediately
+    pub fn pollNonBlocking(self: *Self) !u32 {
+        if (self.state != .running) return 0;
+        var events_processed: u32 = 0;
+        events_processed += try self.acceptConnections();
+        self.buildPollFds();
+        if (self.poll_fd_count > 0) {
+            const ready = posix.poll(self.poll_fds[0..self.poll_fd_count], 0) catch {
+                return events_processed;
+            };
+            if (ready > 0) {
+                events_processed += try self.handlePollEvents();
+            }
+        }
+        self.cleanupDisconnected();
+        return events_processed;
+    }
+
+    /// Drain output queue and send to clients - returns number processed
+    pub fn drainAndSend(self: *Self) u32 {
+        var processed: u32 = 0;
+        processed += self.processOutputQueue();
+        // Try to send after processing
+        for (&self.clients) |*slot| {
+            if (slot.isActive()) {
+                if (slot.connection) |*conn| {
+                    _ = conn.trySend() catch {};
+                }
+            }
+        }
+        return processed;
+    }
+
+    /// Check if there are any active clients
+    pub fn hasActiveClients(self: *Self) bool {
+        return self.stats.current_clients > 0;
+    }
+
     pub fn run(self: *Self) !void {
         while (self.state == .running) {
             _ = try self.poll();
@@ -193,6 +233,9 @@ pub const TcpServer = struct {
             self.stats.connections_accepted += 1;
             self.stats.current_clients += 1;
             accepted += 1;
+
+            // Log connection
+            std.debug.print("[TCP] Client {d} connected\n", .{client_id});
         }
         return accepted;
     }
@@ -219,7 +262,9 @@ pub const TcpServer = struct {
         for (&self.clients) |*slot| {
             if (slot.isActive()) {
                 if (slot.connection) |*conn| {
-                    _ = conn.queueMessage(message);
+                    if (!conn.queueMessage(message)) {
+                        self.stats.send_buffer_full += 1;
+                    }
                     _ = conn.trySend() catch {};
                 }
             }
@@ -231,7 +276,9 @@ pub const TcpServer = struct {
             if (slot.isActive()) {
                 if (slot.connection) |*conn| {
                     if (conn.client_id == client_id) {
-                        _ = conn.queueMessage(message);
+                        if (!conn.queueMessage(message)) {
+                            self.stats.send_buffer_full += 1;
+                        }
                         _ = conn.trySend() catch {};
                         return;
                     }
@@ -320,11 +367,15 @@ pub const TcpServer = struct {
         for (&self.clients) |*slot| {
             if (slot.connection) |*conn| {
                 if (conn.state == .disconnecting or conn.state == .disconnected) {
+                    const client_id = conn.client_id;
                     conn.close();
                     slot.active = false;
                     slot.connection = null;
                     self.stats.connections_closed += 1;
                     self.stats.current_clients -= 1;
+
+                    // Log disconnection
+                    std.debug.print("[TCP] Client {d} disconnected\n", .{client_id});
                 }
             }
         }

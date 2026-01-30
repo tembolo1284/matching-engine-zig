@@ -21,7 +21,7 @@ const msg = @import("../protocol/message_types.zig");
 // ============================================================================
 
 /// Send buffer size - large enough for thousands of messages
-pub const SEND_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+pub const SEND_BUFFER_SIZE: usize = 65536;
 
 /// Maximum pending sends before we consider connection slow
 pub const MAX_PENDING_SENDS: usize = 10000;

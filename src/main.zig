@@ -63,7 +63,7 @@ const Config = struct {
         return Config{
             .tcp_port = getEnvU16("ENGINE_TCP_PORT", 1234),
             .tcp_addr = "0.0.0.0",
-            .threaded = getEnvBool("ENGINE_THREADED", false),
+            .threaded = getEnvBool("ENGINE_THREADED", true), // Default to threaded
             .verbose = getEnvBool("ENGINE_VERBOSE", false),
         };
     }
@@ -128,7 +128,7 @@ fn printUsage() void {
         \\Options:
         \\  -h, --help       Show this help message
         \\  -v, --version    Show version information
-        \\  -t, --threaded   Run in threaded mode
+        \\  -t, --threaded   Run in threaded mode (default)
         \\  --verbose        Enable verbose logging
         \\  --port=PORT      TCP listen port (default: 1234)
         \\
@@ -149,11 +149,7 @@ fn printStartupBanner(config: *const Config) void {
     std.debug.print("============================================\n", .{});
     std.debug.print("  TCP:       {s}:{d}\n", .{ config.tcp_addr, config.tcp_port });
     std.debug.print("  Protocol:  Binary (0x4D) / FIX 4.2\n", .{});
-    if (config.threaded) {
-        std.debug.print("  Mode:      Threaded\n", .{});
-    } else {
-        std.debug.print("  Mode:      Single-Threaded\n", .{});
-    }
+    std.debug.print("  Mode:      Threaded\n", .{});
     std.debug.print("============================================\n", .{});
     std.debug.print("Press Ctrl+C to shutdown gracefully\n", .{});
     std.debug.print("\n", .{});
@@ -171,59 +167,9 @@ fn printStats(stats: anytype) void {
 }
 
 // ============================================================================
-// Server Runners
+// Server Runner (Threaded Mode)
 // ============================================================================
-fn runSingleThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
-    if (config.verbose) std.debug.print("Initializing single-threaded mode...\n", .{});
-
-    const server = try allocator.create(TcpServer);
-    defer allocator.destroy(server);
-    server.initInPlace();
-
-    const input_queue = try allocator.create(InputEnvelopeQueue);
-    defer allocator.destroy(input_queue);
-    input_queue.* = InputEnvelopeQueue.init();
-
-    const output_queue = try allocator.create(OutputEnvelopeQueue);
-    defer allocator.destroy(output_queue);
-    output_queue.* = OutputEnvelopeQueue.init();
-
-    const processor = try allocator.create(Processor);
-    defer allocator.destroy(processor);
-    processor.initInPlace();
-
-    server.setQueues(input_queue, output_queue);
-    const address = try std.net.Address.parseIp4(config.tcp_addr, config.tcp_port);
-    try server.start(address);
-
-    if (config.verbose) std.debug.print("Server started on port {d}\n", .{config.tcp_port});
-    printStartupBanner(config);
-
-    processor.state = .running;
-
-    while (!shutdown_requested.load(.acquire)) {
-        // Multiple interleaved poll/process cycles for better throughput
-        var i: u32 = 0;
-        while (i < 4) : (i += 1) {
-            _ = server.poll() catch {};
-            _ = processor.processBatch(input_queue, output_queue);
-        }
-        server.flushAllClients();
-    }
-
-    std.debug.print("Shutting down...\n", .{});
-
-    for (0..10000) |_| {
-        _ = server.poll() catch {};
-        _ = processor.processBatch(input_queue, output_queue);
-        server.flushAllClients();
-    }
-
-    server.stop();
-    printStats(processor.getStats());
-}
-
-fn runThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
+fn runServer(allocator: std.mem.Allocator, config: *const Config) !void {
     if (config.verbose) std.debug.print("Initializing threaded mode...\n", .{});
 
     const input_queue = try allocator.create(InputEnvelopeQueue);
@@ -251,10 +197,15 @@ fn runThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
     if (config.verbose) std.debug.print("Server and processor started\n", .{});
     printStartupBanner(config);
 
+    // Main I/O loop - tight loop for maximum throughput
     while (!shutdown_requested.load(.acquire)) {
-        _ = server.poll() catch |err| {
-            std.debug.print("Server error: {any}\n", .{err});
-        };
+        // Poll for network events (accept, read) - non-blocking
+        _ = server.pollNonBlocking() catch {};
+
+        // Drain output queue and send to clients
+        _ = server.drainAndSend();
+
+        // Flush any remaining data in send buffers
         server.flushAllClients();
     }
 
@@ -262,9 +213,13 @@ fn runThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
 
     processor_thread.stop();
 
-    for (0..10000) |_| {
-        _ = server.poll() catch {};
+    // Final drain
+    var drain_count: u32 = 0;
+    while (drain_count < 10000) : (drain_count += 1) {
+        _ = server.pollNonBlocking() catch {};
+        const drained = server.drainAndSend();
         server.flushAllClients();
+        if (drained == 0 and !server.hasActiveClients()) break;
     }
 
     server.stop();
@@ -307,11 +262,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    if (opts.config.threaded) {
-        try runThreaded(allocator, &opts.config);
-    } else {
-        try runSingleThreaded(allocator, &opts.config);
-    }
+    try runServer(allocator, &opts.config);
 
     std.debug.print("Shutdown complete\n", .{});
 }

@@ -1,31 +1,25 @@
 # =============================================================================
 # Zig Matching Engine - Makefile
 # =============================================================================
-
 .PHONY: all build release run test clean help
 .DEFAULT_GOAL := all
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-
 TCP_PORT ?= 1234
 FIX_PORT ?= 1237
-
 DOCKER_IMAGE := zig-matching-engine
 DOCKER_TAG := latest
 DOCKER_CONTAINER := matching-engine
-
 BUILD_DIR := zig-out
 BIN := $(BUILD_DIR)/bin/matching_engine
 BENCH_BIN := $(BUILD_DIR)/bin/benchmark
-
 ZIG_FLAGS := -freference-trace
 
 # -----------------------------------------------------------------------------
 # Build Targets
 # -----------------------------------------------------------------------------
-
 all: build
 
 build:
@@ -44,25 +38,18 @@ check:
 	zig build check $(ZIG_FLAGS)
 
 # -----------------------------------------------------------------------------
-# Run Targets
+# Run Targets (all use threaded mode by default)
 # -----------------------------------------------------------------------------
-
 run: build
-	@exec $(BIN) --port=$(TCP_PORT)
-
-run-release: release
-	@exec $(BIN) --port=$(TCP_PORT)
-
-run-threaded: build
 	@exec $(BIN) --threaded --port=$(TCP_PORT)
 
-run-threaded-release: release
+run-release: release
 	@exec $(BIN) --threaded --port=$(TCP_PORT)
 
 run-verbose: build
-	@exec $(BIN) --verbose --port=$(TCP_PORT)
+	@exec $(BIN) --threaded --verbose --port=$(TCP_PORT)
 
-run-threaded-verbose: build
+run-verbose-release: release
 	@exec $(BIN) --threaded --verbose --port=$(TCP_PORT)
 
 run-help: build
@@ -74,7 +61,6 @@ run-version: build
 # -----------------------------------------------------------------------------
 # Test Targets
 # -----------------------------------------------------------------------------
-
 test:
 	zig build test $(ZIG_FLAGS)
 
@@ -108,7 +94,6 @@ test-transport:
 # -----------------------------------------------------------------------------
 # Benchmarks
 # -----------------------------------------------------------------------------
-
 bench: release
 	zig build bench -Doptimize=ReleaseFast
 	$(BENCH_BIN)
@@ -120,7 +105,6 @@ bench-debug: build
 # -----------------------------------------------------------------------------
 # Docker Targets
 # -----------------------------------------------------------------------------
-
 docker:
 	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
@@ -131,19 +115,14 @@ docker-run: docker
 	docker run -d \
 		--name $(DOCKER_CONTAINER) \
 		-p $(TCP_PORT):$(TCP_PORT) \
-		$(DOCKER_IMAGE):$(DOCKER_TAG)
-	@echo "Container started: $(DOCKER_CONTAINER)"
-
-docker-run-threaded: docker
-	docker run -d \
-		--name $(DOCKER_CONTAINER) \
-		-p $(TCP_PORT):$(TCP_PORT) \
 		-e ENGINE_THREADED=true \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
+	@echo "Container started: $(DOCKER_CONTAINER)"
 
 docker-run-it: docker
 	docker run -it --rm \
 		-p $(TCP_PORT):$(TCP_PORT) \
+		-e ENGINE_THREADED=true \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 
 docker-stop:
@@ -162,7 +141,6 @@ docker-status:
 # -----------------------------------------------------------------------------
 # Clean Targets
 # -----------------------------------------------------------------------------
-
 clean:
 	rm -rf $(BUILD_DIR)/
 	rm -rf .zig-cache/
@@ -174,7 +152,6 @@ clean-all: clean docker-stop
 # -----------------------------------------------------------------------------
 # Development Tools
 # -----------------------------------------------------------------------------
-
 fmt:
 	zig fmt src/
 
@@ -210,7 +187,6 @@ sizes: build
 # -----------------------------------------------------------------------------
 # CI/CD
 # -----------------------------------------------------------------------------
-
 ci: fmt-check test build
 	@echo "✓ CI checks passed"
 
@@ -227,7 +203,6 @@ dist: clean release
 # -----------------------------------------------------------------------------
 # Help
 # -----------------------------------------------------------------------------
-
 help:
 	@echo ""
 	@echo "Zig Matching Engine - Build System"
@@ -241,9 +216,8 @@ help:
 	@echo "  make clean        Clean build artifacts"
 	@echo ""
 	@echo "Run:"
-	@echo "  make run              Single-threaded (port $(TCP_PORT))"
-	@echo "  make run-release      Single-threaded optimized"
-	@echo "  make run-threaded     Separate processor thread"
+	@echo "  make run              Run server (threaded, port $(TCP_PORT))"
+	@echo "  make run-release      Run optimized server"
 	@echo "  make run-verbose      With verbose logging"
 	@echo ""
 	@echo "Test:"
