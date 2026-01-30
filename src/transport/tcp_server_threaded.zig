@@ -58,7 +58,7 @@ pub const ThreadedTcpServer = struct {
         input_queue: *InputEnvelopeQueue,
         output_queue: *OutputEnvelopeQueue,
     ) Self {
-        var self = Self{
+        const self = Self{
             .allocator = allocator,
             .listener = null,
             .clients = [_]?*TcpClient{null} ** MAX_CLIENTS,
