@@ -10,24 +10,21 @@
 //! - No dynamic allocation (Rule 3)
 //! - Bounded operations (Rule 2)
 //! - Clear state management
-
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 const framing = @import("framing.zig");
 const msg = @import("../protocol/message_types.zig");
-const binary = @import("../protocol/binary_codec.zig");
-const fix = @import("../protocol/fix_codec.zig");
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Send buffer size
-pub const SEND_BUFFER_SIZE: usize = 16384;
+/// Send buffer size - large enough for thousands of messages
+pub const SEND_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 
 /// Maximum pending sends before we consider connection slow
-pub const MAX_PENDING_SENDS: usize = 1000;
+pub const MAX_PENDING_SENDS: usize = 10000;
 
 // ============================================================================
 // Connection State
@@ -55,6 +52,7 @@ pub const ConnectionStats = struct {
     messages_sent: u64,
     send_errors: u64,
     recv_errors: u64,
+    send_buffer_full: u64,
     connect_time_ns: i128,
 
     pub fn init() ConnectionStats {
@@ -65,6 +63,7 @@ pub const ConnectionStats = struct {
             .messages_sent = 0,
             .send_errors = 0,
             .recv_errors = 0,
+            .send_buffer_full = 0,
             .connect_time_ns = std.time.nanoTimestamp(),
         };
     }
@@ -114,7 +113,6 @@ const SendBuffer = struct {
 
     pub fn consume(self: *Self, count: usize) void {
         std.debug.assert(count <= self.len);
-
         if (count == self.len) {
             self.len = 0;
         } else if (count > 0) {
@@ -173,7 +171,6 @@ pub const TcpConnection = struct {
     /// Close connection
     pub fn close(self: *Self) void {
         if (self.state == .disconnected) return;
-
         self.state = .disconnecting;
         self.stream.close();
         self.state = .disconnected;
@@ -221,7 +218,6 @@ pub const TcpConnection = struct {
 
         _ = self.parser.feed(recv_buf[0..bytes_read]);
         self.stats.bytes_received += bytes_read;
-
         return true;
     }
 
@@ -245,14 +241,12 @@ pub const TcpConnection = struct {
             // Default to binary if protocol not yet detected
             return self.queueMessageWithProtocol(output, .binary);
         }
-
         return self.queueMessageWithProtocol(output, protocol);
     }
 
     /// Queue message with specific protocol
     pub fn queueMessageWithProtocol(self: *Self, output: *const msg.OutputMsg, protocol: framing.Protocol) bool {
         var encode_buf: [256]u8 = undefined;
-
         const encoded_len = framing.encodeOutput(output, protocol, &encode_buf) catch {
             return false;
         };
@@ -262,18 +256,20 @@ pub const TcpConnection = struct {
             return true;
         }
 
+        // Try to send existing data first to make room
         if (self.send_buffer.available() < encoded_len) {
-            // Try to flush first
             _ = self.trySend() catch {};
+        }
 
-            if (self.send_buffer.available() < encoded_len) {
-                return false; // Still no space
-            }
+        // Try again after potential flush
+        if (self.send_buffer.available() < encoded_len) {
+            self.stats.send_buffer_full += 1;
+            return false; // Still no space
         }
 
         _ = self.send_buffer.append(encode_buf[0..encoded_len]);
         self.pending_sends += 1;
-
+        self.stats.messages_sent += 1;
         return true;
     }
 
@@ -344,12 +340,10 @@ pub const TcpConnection = struct {
     /// Set socket to non-blocking mode
     pub fn setNonBlocking(self: *Self, non_blocking: bool) !void {
         const flags = try posix.fcntl(self.stream.handle, posix.F.GETFL, 0);
-
         const new_flags = if (non_blocking)
             flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
         else
             flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
-
         _ = try posix.fcntl(self.stream.handle, posix.F.SETFL, new_flags);
     }
 
@@ -371,13 +365,11 @@ pub const TcpConnection = struct {
 
 test "send buffer operations" {
     var buf = SendBuffer.init();
-
     try std.testing.expect(buf.isEmpty());
     try std.testing.expectEqual(@as(usize, SEND_BUFFER_SIZE), buf.available());
 
     const data = "Hello World";
     const appended = buf.append(data);
-
     try std.testing.expectEqual(@as(usize, 11), appended);
     try std.testing.expect(!buf.isEmpty());
     try std.testing.expectEqualStrings("Hello World", buf.slice());

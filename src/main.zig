@@ -166,6 +166,7 @@ fn printStats(stats: anytype) void {
     std.debug.print("  Trades generated:   {d}\n", .{stats.trades_generated});
     std.debug.print("  Acks generated:     {d}\n", .{stats.acks_generated});
     std.debug.print("  Flushes:            {d}\n", .{stats.flush_count});
+    std.debug.print("  OutQ full events:   {d}\n", .{stats.output_queue_full});
     std.debug.print("=============================================\n", .{});
 }
 
@@ -201,41 +202,21 @@ fn runSingleThreaded(allocator: std.mem.Allocator, config: *const Config) !void 
     processor.state = .running;
 
     while (!shutdown_requested.load(.acquire)) {
-        // Process network I/O
-        _ = server.poll() catch |err| {
-            std.debug.print("Server error: {any}\n", .{err});
-        };
-
-        // Process messages
-        _ = processor.processBatch(input_queue, output_queue);
-
-        // Aggressively drain output queue
-        var drain_count: u32 = 0;
-        while (!output_queue.isEmpty() and drain_count < 1000) : (drain_count += 1) {
+        // Multiple interleaved poll/process cycles for better throughput
+        var i: u32 = 0;
+        while (i < 4) : (i += 1) {
             _ = server.poll() catch {};
+            _ = processor.processBatch(input_queue, output_queue);
         }
+        server.flushAllClients();
     }
 
     std.debug.print("Shutting down...\n", .{});
 
-    // Final drain - keep going until everything is sent
-    var drain_iterations: u32 = 0;
-    while (drain_iterations < 100000) : (drain_iterations += 1) {
-        _ = processor.processBatch(input_queue, output_queue);
+    for (0..10000) |_| {
         _ = server.poll() catch {};
-
-        // Force flush all client send buffers
+        _ = processor.processBatch(input_queue, output_queue);
         server.flushAllClients();
-
-        if (output_queue.isEmpty() and input_queue.isEmpty()) {
-            // Give a few more iterations to ensure send buffers are flushed
-            var flush_count: u32 = 0;
-            while (flush_count < 100) : (flush_count += 1) {
-                _ = server.poll() catch {};
-                server.flushAllClients();
-            }
-            break;
-        }
     }
 
     server.stop();
@@ -274,24 +255,16 @@ fn runThreaded(allocator: std.mem.Allocator, config: *const Config) !void {
         _ = server.poll() catch |err| {
             std.debug.print("Server error: {any}\n", .{err});
         };
-
-        // Aggressively drain output queue
-        var drain_count: u32 = 0;
-        while (!output_queue.isEmpty() and drain_count < 1000) : (drain_count += 1) {
-            _ = server.poll() catch {};
-        }
+        server.flushAllClients();
     }
 
     std.debug.print("Shutting down...\n", .{});
 
     processor_thread.stop();
 
-    // Final drain
-    var drain_iterations: u32 = 0;
-    while (drain_iterations < 10000) : (drain_iterations += 1) {
+    for (0..10000) |_| {
         _ = server.poll() catch {};
         server.flushAllClients();
-        if (output_queue.isEmpty()) break;
     }
 
     server.stop();

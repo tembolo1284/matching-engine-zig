@@ -78,7 +78,6 @@ pub const TcpServer = struct {
 
     const Self = @This();
 
-    /// Initialize server in-place (avoids stack allocation of large struct)
     pub fn initInPlace(self: *Self) void {
         self.listener = null;
         self.next_client_id = 1;
@@ -100,7 +99,6 @@ pub const TcpServer = struct {
         }
     }
 
-    /// Legacy init - WARNING: creates large struct on stack
     pub fn init() Self {
         var self: Self = undefined;
         self.initInPlace();
@@ -202,7 +200,9 @@ pub const TcpServer = struct {
     fn processOutputQueue(self: *Self) u32 {
         const output_queue = self.output_queue orelse return 0;
         var processed: u32 = 0;
-        while (processed < MAX_POLL_EVENTS) {
+
+        // Drain ALL available messages from output queue
+        while (true) {
             const envelope = output_queue.pop() orelse break;
             if (envelope.client_id == 0) {
                 self.broadcastMessage(&envelope.message);
@@ -370,7 +370,6 @@ pub const TcpServer = struct {
         }
     }
 
-    /// Force flush all client send buffers
     pub fn flushAllClients(self: *Self) void {
         for (&self.clients) |*slot| {
             if (slot.isActive()) {

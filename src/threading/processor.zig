@@ -1,6 +1,11 @@
 //! Order Processor - Main Processing Loop
 //!
 //! Processes input messages through the matching engine and generates output.
+//!
+//! IMPORTANT: Backpressure correctness
+//! - Never drop output messages when OutputEnvelopeQueue is full.
+//! - Keep pending output_buffer + an index so we can resume draining later.
+//! - Do not consume more input while pending outputs remain (prevents overwriting output_buffer).
 
 const std = @import("std");
 const msg = @import("../protocol/message_types.zig");
@@ -12,7 +17,7 @@ const OutputEnvelope = SpscQueue.OutputEnvelope;
 const InputEnvelopeQueue = SpscQueue.InputEnvelopeQueue;
 const OutputEnvelopeQueue = SpscQueue.OutputEnvelopeQueue;
 
-pub const BATCH_SIZE: u32 = 16;
+pub const BATCH_SIZE: u32 = 8;
 pub const MAX_LOOP_ITERATIONS: u32 = 1_000_000;
 pub const SPIN_COUNT: u32 = 1000;
 
@@ -58,6 +63,10 @@ pub const Processor = struct {
     current_client_id: u32,
     flush_in_progress: bool,
 
+    /// Index into output_buffer of next message to enqueue to output_queue.
+    /// This prevents dropping outputs when output_queue is full.
+    output_drain_index: u32,
+
     const Self = @This();
 
     /// Initialize processor in-place (avoids stack allocation of large struct)
@@ -69,6 +78,7 @@ pub const Processor = struct {
         self.sequence = 0;
         self.current_client_id = 0;
         self.flush_in_progress = false;
+        self.output_drain_index = 0;
     }
 
     /// Legacy init - WARNING: creates large struct on stack, may cause stack overflow
@@ -78,11 +88,20 @@ pub const Processor = struct {
         return self;
     }
 
+    fn hasPendingOutputs(self: *const Self) bool {
+        return self.output_drain_index < self.output_buffer.len();
+    }
+
     pub fn processMessage(self: *Self, input: *const msg.InputMsg, client_id: u32) void {
         std.debug.assert(self.state == .running or self.state == .idle);
 
+        // We should never overwrite output_buffer if previous outputs weren't drained.
+        // processBatch() enforces this, but keep this assert to catch regressions.
+        std.debug.assert(!self.hasPendingOutputs());
+
         self.current_client_id = client_id;
         self.output_buffer.reset();
+        self.output_drain_index = 0;
 
         switch (input.type) {
             .new_order => {
@@ -118,7 +137,13 @@ pub const Processor = struct {
     pub fn continueFlush(self: *Self) bool {
         if (!self.flush_in_progress) return true;
 
+        // Do not overwrite output_buffer if we still haven't drained it.
+        // processBatch() enforces this, but keep an assert as a safety net.
+        std.debug.assert(!self.hasPendingOutputs());
+
         self.output_buffer.reset();
+        self.output_drain_index = 0;
+
         const complete = self.engine.continueFlush(&self.output_buffer);
 
         if (complete) {
@@ -132,7 +157,12 @@ pub const Processor = struct {
     pub fn drainOutputToQueue(self: *Self, output_queue: *OutputEnvelopeQueue) u32 {
         var drained: u32 = 0;
 
-        for (self.output_buffer.slice()) |*out_msg| {
+        // Resume draining where we left off.
+        const total = self.output_buffer.len();
+        var i: u32 = self.output_drain_index;
+
+        while (i < total) : (i += 1) {
+            const out_msg = self.output_buffer.get(i);
             const target_client = self.getTargetClientId(out_msg);
 
             const envelope = OutputEnvelope{
@@ -144,12 +174,15 @@ pub const Processor = struct {
             if (output_queue.push(envelope)) {
                 self.sequence += 1;
                 drained += 1;
+                self.output_drain_index = i + 1;
             } else {
                 self.stats.output_queue_full += 1;
-                break;
+                // Backpressure: keep remaining outputs for later
+                return drained;
             }
         }
 
+        // Fully drained, safe to overwrite output_buffer on next message
         return drained;
     }
 
@@ -167,16 +200,39 @@ pub const Processor = struct {
     ) u32 {
         var processed: u32 = 0;
 
-        if (self.flush_in_progress) {
-            _ = self.continueFlush();
+        // 1) If we have pending outputs from a previous message, drain them first.
+        //    If output_queue is full, we do not consume more input.
+        if (self.hasPendingOutputs()) {
             _ = self.drainOutputToQueue(output_queue);
+            if (self.hasPendingOutputs()) {
+                self.stats.empty_polls += 1;
+                return 0;
+            }
         }
 
+        // 2) If a flush is in progress, continue it, then drain outputs.
+        if (self.flush_in_progress) {
+            // Only continue flush when we have no pending outputs.
+            _ = self.continueFlush();
+            _ = self.drainOutputToQueue(output_queue);
+            if (self.hasPendingOutputs()) {
+                self.stats.empty_polls += 1;
+                return 0;
+            }
+        }
+
+        // 3) Normal batch: pop input, process, drain outputs.
         while (processed < BATCH_SIZE) {
             const envelope = input_queue.pop() orelse break;
 
+            // processMessage asserts that no pending outputs exist
             self.processMessage(&envelope.message, envelope.client_id);
             _ = self.drainOutputToQueue(output_queue);
+
+            // If output queue became full, stop consuming input until drained.
+            if (self.hasPendingOutputs()) {
+                break;
+            }
 
             processed += 1;
 
@@ -244,17 +300,24 @@ pub const Processor = struct {
     }
 
     pub fn cancelClientOrders(self: *Self, client_id: u32) void {
+        // Only safe to overwrite output_buffer if no pending outputs.
+        std.debug.assert(!self.hasPendingOutputs());
         self.output_buffer.reset();
+        self.output_drain_index = 0;
         self.engine.cancelClientOrders(client_id, &self.output_buffer);
     }
 
     pub fn generateTopOfBook(self: *Self, symbol: []const u8) void {
+        std.debug.assert(!self.hasPendingOutputs());
         self.output_buffer.reset();
+        self.output_drain_index = 0;
         self.engine.generateTopOfBook(symbol, &self.output_buffer);
     }
 
     pub fn generateAllTopOfBook(self: *Self) void {
+        std.debug.assert(!self.hasPendingOutputs());
         self.output_buffer.reset();
+        self.output_drain_index = 0;
         self.engine.generateAllTopOfBook(&self.output_buffer);
     }
 };
@@ -354,6 +417,9 @@ pub const SyncProcessor = struct {
         input.type = .new_order;
         input.data.new_order = order.*;
 
+        // Ensure no pending outputs before overwriting
+        std.debug.assert(!self.processor.hasPendingOutputs());
+
         self.processor.processMessage(&input, client_id);
         return self.processor.output_buffer.slice();
     }
@@ -363,6 +429,8 @@ pub const SyncProcessor = struct {
         input.type = .cancel;
         input.data.cancel = cancel.*;
 
+        std.debug.assert(!self.processor.hasPendingOutputs());
+
         self.processor.processMessage(&input, 0);
         return self.processor.output_buffer.slice();
     }
@@ -371,9 +439,13 @@ pub const SyncProcessor = struct {
         var input: msg.InputMsg = undefined;
         input.type = .flush;
 
+        std.debug.assert(!self.processor.hasPendingOutputs());
+
         self.processor.processMessage(&input, 0);
 
         while (self.processor.flush_in_progress) {
+            // Only continue flush when no pending outputs (sync path)
+            std.debug.assert(!self.processor.hasPendingOutputs());
             _ = self.processor.continueFlush();
         }
 
@@ -388,9 +460,9 @@ pub const SyncProcessor = struct {
 // ============================================================================
 // Tests
 // ============================================================================
-
 test "processor stats init" {
     const stats = ProcessorStats.init();
     try std.testing.expectEqual(@as(u64, 0), stats.messages_processed);
     try std.testing.expectEqual(@as(u64, 0), stats.trades_generated);
 }
+

@@ -9,7 +9,7 @@
 
 const std = @import("std");
 
-pub const DEFAULT_CAPACITY: u32 = 8192;
+pub const DEFAULT_CAPACITY: u32 = 4 * 8192;
 const CACHE_LINE_SIZE: usize = 64;
 
 /// Cache-line aligned atomic counter

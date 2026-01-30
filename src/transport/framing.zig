@@ -10,6 +10,10 @@ pub const MIN_DETECT_BYTES: usize = 5; // Need at least length prefix + magic
 pub const READ_BUFFER_SIZE: usize = 8192;
 pub const LENGTH_PREFIX_SIZE: usize = 4;
 
+// How many bytes we’re willing to skip in one call while trying to resync
+// after corruption/overflow/partial frames. Keeps things bounded.
+pub const MAX_RESYNC_STEPS: usize = 4096;
+
 pub const Protocol = enum {
     unknown,
     binary,
@@ -305,22 +309,38 @@ pub const StreamParser = struct {
         return consumed;
     }
 
+    /// Extract the next message if available.
+    ///
+    /// **Important behavior change (fix):**
+    /// If we hit a parse error, we consume 1 byte and keep trying (bounded),
+    /// instead of immediately returning null. This prevents “1 byte per poll”
+    /// slow recovery under load and avoids the system appearing stuck.
     pub fn nextMessage(self: *Self) ?msg.InputMsg {
-        const result = self.buffer.tryExtractMessage() catch {
-            self.parse_errors += 1;
+        var steps: usize = 0;
 
-            if (self.buffer.len > 0) {
-                self.buffer.consume(1);
+        while (steps < MAX_RESYNC_STEPS) : (steps += 1) {
+            const result = self.buffer.tryExtractMessage() catch {
+                self.parse_errors += 1;
+
+                if (self.buffer.len > 0) {
+                    self.buffer.consume(1);
+                    // keep trying to resync within this call
+                    continue;
+                }
+
+                return null;
+            };
+
+            if (result) |message| {
+                self.messages_parsed += 1;
+                return message;
             }
 
+            // No complete message available (need more bytes)
             return null;
-        };
-
-        if (result) |message| {
-            self.messages_parsed += 1;
-            return message;
         }
 
+        // Bounded resync limit hit; let outer loop/poll bring in more data.
         return null;
     }
 
@@ -418,3 +438,4 @@ test "stream parser stats" {
     try std.testing.expectEqual(@as(u64, 0), stats.messages_parsed);
     try std.testing.expectEqual(@as(u64, 0), stats.bytes_received);
 }
+
