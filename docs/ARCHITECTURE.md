@@ -1,970 +1,608 @@
-# Architecture Documentation
+# Architecture
 
-This document describes the technical architecture of the Zig Matching Engine, covering design decisions, data flows, and implementation details.
+This document provides a technical deep-dive into the Zig Matching Engine architecture, covering threading model, data structures, memory layout, and protocol specifications.
 
 ## Table of Contents
 
 1. [System Overview](#system-overview)
 2. [Threading Model](#threading-model)
-3. [Per-Client Output Queues (v3)](#per-client-output-queues-v3)
+3. [Data Flow](#data-flow)
 4. [Core Components](#core-components)
-5. [Protocol Layer](#protocol-layer)
-6. [Transport Layer](#transport-layer)
-7. [Memory Management](#memory-management)
-8. [Data Structures](#data-structures)
-9. [Message Flow](#message-flow)
-10. [Error Handling](#error-handling)
-11. [Performance Optimizations](#performance-optimizations)
+5. [Memory Layout](#memory-layout)
+6. [Protocol Specification](#protocol-specification)
+7. [Performance Optimizations](#performance-optimizations)
+8. [Design Decisions](#design-decisions)
 
 ---
 
 ## System Overview
 
-The matching engine uses a **dual-processor architecture** with **per-client output queues** where network I/O is separated from order matching to minimize latency jitter, and message routing is decoupled from TCP sending for maximum throughput.
-
-### Design Goals
-
-| Goal | Approach |
-|------|----------|
-| Low Latency | Lock-free queues, per-client output queues, no allocation in hot path |
-| High Throughput | Parallel processors, batched I/O, EPOLLOUT-driven sends |
-| Reliability | Bounded resources, graceful degradation, P10 compliance |
-| Cross-Platform | epoll (Linux), kqueue (macOS), abstracted socket options |
-| Client Isolation | Per-client queues prevent slow clients from blocking fast ones |
-
-### High-Level Architecture
-
 ```
-                    ┌─────────────────────────────────────────┐
-                    │              Client Layer               │
-                    │  (TCP Clients, UDP Clients, Multicast)  │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │             I/O Thread                   │
-                    │                                          │
-                    │  ┌─────────┐ ┌─────────┐ ┌───────────┐  │
-                    │  │   TCP   │ │   UDP   │ │ Multicast │  │
-                    │  │ Server  │ │ Server  │ │ Publisher │  │
-                    │  │ :1234   │ │ :1235   │ │ :1236     │  │
-                    │  └────┬────┘ └────┬────┘ └─────┬─────┘  │
-                    │       │           │            │         │
-                    │  ┌────▼───────────▼────┐       │         │
-                    │  │   Protocol Codec    │       │         │
-                    │  │ (CSV/Binary/FIX)    │       │         │
-                    │  └─────────┬───────────┘       │         │
-                    │            │                   │         │
-                    │  ┌─────────▼───────────┐       │         │
-                    │  │   Symbol Router     │       │         │
-                    │  │   (A-M → P0)        │       │         │
-                    │  │   (N-Z → P1)        │       │         │
-                    │  └─────────┬───────────┘       │         │
-                    └────────────┼───────────────────┼─────────┘
-                                 │                   │
-              ┌──────────────────┼───────────────────┼─────────┐
-              │                  │                   │         │
-        ┌─────▼─────┐      ┌─────▼─────┐      ┌─────▼─────┐   │
-        │Input Queue│      │Input Queue│      │Output Drain│   │
-        │  (SPSC)   │      │  (SPSC)   │      │   Loop     │   │
-        └─────┬─────┘      └─────┬─────┘      └─────┬─────┘   │
-              │                  │                   │         │
-   ┌──────────▼──────────┐ ┌────▼────────────┐     │         │
-   │    Processor 0      │ │   Processor 1   │     │         │
-   │    (Symbols A-M)    │ │   (Symbols N-Z) │     │         │
-   │                     │ │                 │     │         │
-   │ ┌─────────────────┐ │ │ ┌─────────────┐ │     │         │
-   │ │ Matching Engine │ │ │ │  Matching   │ │     │         │
-   │ │ ┌─────────────┐ │ │ │ │   Engine    │ │     │         │
-   │ │ │ Order Books │ │ │ │ └─────────────┘ │     │         │
-   │ │ │ Memory Pools│ │ │ │                 │     │         │
-   │ │ │ Order Map   │ │ │ │                 │     │         │
-   │ │ └─────────────┘ │ │ │                 │     │         │
-   │ └─────────────────┘ │ │                 │     │         │
-   │          │          │ │        │        │     │         │
-   │    ┌─────▼─────┐    │ │  ┌─────▼─────┐  │     │         │
-   │    │Output     │    │ │  │Output     │  │─────┘         │
-   │    │Queue(SPSC)│    │ │  │Queue(SPSC)│  │               │
-   │    └───────────┘    │ │  └───────────┘  │               │
-   └─────────────────────┘ └─────────────────┘               │
-                                                              │
-                              ┌────────────────────────────────┘
-                              │
-                    ┌─────────▼───────────────────────────────┐
-                    │      Per-Client Output Queues (v3)       │
-                    │                                          │
-                    │  ┌────────┐ ┌────────┐ ┌────────┐       │
-                    │  │Client 1│ │Client 2│ │Client N│       │
-                    │  │ Queue  │ │ Queue  │ │ Queue  │       │
-                    │  │ (32K)  │ │ (32K)  │ │ (32K)  │       │
-                    │  └───┬────┘ └───┬────┘ └───┬────┘       │
-                    │      │          │          │             │
-                    │      └──────────┼──────────┘             │
-                    │                 │                        │
-                    │         EPOLLOUT triggers                │
-                    │                 │                        │
-                    │      ┌──────────▼──────────┐             │
-                    │      │  drainToSocket()   │             │
-                    │      │  Batched send()    │             │
-                    │      └────────────────────┘             │
-                    └─────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Zig Matching Engine                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐     ┌─────────────────┐     ┌──────────────────────────┐ │
+│  │    Client    │────▶│  Accept Thread  │────▶│  Client Handler Thread   │ │
+│  │  (TCP Conn)  │     └─────────────────┘     │  (one per connection)    │ │
+│  └──────────────┘                              └────────────┬─────────────┘ │
+│                                                             │               │
+│                                                             ▼               │
+│                                              ┌──────────────────────────┐   │
+│                                              │   Global Input Queue     │   │
+│                                              │   (SPSC, 32K slots)      │   │
+│                                              └────────────┬─────────────┘   │
+│                                                           │                 │
+│                                                           ▼                 │
+│                                              ┌──────────────────────────┐   │
+│                                              │   Processor Thread       │   │
+│                                              │   ┌──────────────────┐   │   │
+│                                              │   │ Matching Engine  │   │   │
+│                                              │   │  ┌────────────┐  │   │   │
+│                                              │   │  │ OrderBook  │  │   │   │
+│                                              │   │  │ (per sym)  │  │   │   │
+│                                              │   │  └────────────┘  │   │   │
+│                                              │   └──────────────────┘   │   │
+│                                              └────────────┬─────────────┘   │
+│                                                           │                 │
+│                                                           ▼                 │
+│                                              ┌──────────────────────────┐   │
+│                                              │   Global Output Queue    │   │
+│                                              │   (SPSC, 32K slots)      │   │
+│                                              └────────────┬─────────────┘   │
+│                                                           │                 │
+│                                                           ▼                 │
+│  ┌──────────────┐     ┌──────────────────┐  ┌──────────────────────────┐   │
+│  │    Client    │◀────│ Per-Client Queue │◀─│    Router Thread         │   │
+│  │  (TCP Conn)  │     │   (32K slots)    │  │  (broadcasts/routes)     │   │
+│  └──────────────┘     └──────────────────┘  └──────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Threading Model
 
-### Thread Roles
+### The TCP Backpressure Problem
 
-| Thread | Responsibility | Key Structures |
-|--------|----------------|----------------|
-| I/O Thread | Network I/O, routing, encoding, output dispatch | TcpServer, UdpServer, MulticastPublisher, Per-client queues |
-| Processor 0 | Match A-M symbols | MatchingEngine, MemoryPools, OrderMap |
-| Processor 1 | Match N-Z symbols | MatchingEngine, MemoryPools, OrderMap |
-
-### Communication
-
-All inter-thread communication uses **lock-free SPSC queues**:
+In a naive single-threaded TCP server, one thread handles everything: accepting connections, reading from sockets, processing orders, and writing responses. This creates a deadlock scenario:
 
 ```
-I/O Thread                    Processor Thread
-     │                              │
-     │  ProcessorInput              │
-     │  ┌──────────────┐            │
-     │  │ message      │            │
-     │  │ client_id    │───push────►│
-     │  │ enqueue_time │            │
-     │  └──────────────┘            │
-     │                              │
-     │  ProcessorOutput             │
-     │  ┌──────────────┐            │
-     │◄─│ message      │────pop─────│
-     │  │ latency_ns   │            │
-     │  └──────────────┘            │
-     │                              │
-     │      (I/O Thread)            │
-     │           │                  │
-     │     queueOutput()            │
-     │           │                  │
-     │  ┌────────▼────────┐         │
-     │  │ Per-Client Queue│         │
-     │  │    (32K SPSC)   │         │
-     │  └────────┬────────┘         │
-     │           │                  │
-     │    EPOLLOUT fires            │
-     │           │                  │
-     │  ┌────────▼────────┐         │
-     │  │ drainToSocket() │         │
-     │  │ Batched send()  │         │
-     │  └─────────────────┘         │
+Client sends orders very fast
+         ↓
+Server reads orders → input queue fills
+         ↓
+Server processes orders → output queue fills
+         ↓
+Server tries to send responses → TCP send buffer fills
+         ↓
+Client's receive buffer fills (client busy sending, not reading)
+         ↓
+TCP flow control kicks in → server's send() returns WouldBlock
+         ↓
+Server stuck trying to send → STOPS reading new orders
+         ↓
+DEADLOCK: Server won't read until it can send
+          Client won't read until it can send
 ```
 
-### Symbol Routing
+### The Solution: Thread-Per-Client Architecture
 
-```zig
-pub fn routeSymbol(symbol: *const Symbol) ProcessorId {
-    const first = symbol[0];
-    if (first == 0) return .processor_0;
-    const upper = first & 0xDF;  // ASCII to uppercase
-    if (upper >= 'A' and upper <= 'M') {
-        return .processor_0;
-    }
-    return .processor_1;
-}
+The engine uses dedicated threads to decouple all I/O operations:
+
+| Thread | Count | Responsibility |
+|--------|-------|----------------|
+| **Accept Thread** | 1 | Accepts new TCP connections, spawns client handlers |
+| **Client Handler** | N (per client) | Reads from socket, writes to socket, manages per-client state |
+| **Processor Thread** | 1 | Processes input queue through matching engine, generates output |
+| **Router Thread** | 1 | Routes output messages to per-client output queues |
+
+### Thread Communication
+
+```
+Client Handler ──push──▶ Global Input Queue ──pop──▶ Processor
+                         (InputEnvelopeQueue)
+                         
+Processor ──push──▶ Global Output Queue ──pop──▶ Router
+                    (OutputEnvelopeQueue)
+                    
+Router ──push──▶ Per-Client Output Queue ──pop──▶ Client Handler
+                 (ClientOutputQueue)
 ```
 
-This provides:
-- **Deterministic routing**: Same symbol always goes to same processor
-- **Even distribution**: Roughly 50/50 split for typical symbol sets
-- **No locking**: Routing is a pure function
+All queues are **lock-free SPSC** (Single-Producer Single-Consumer), eliminating mutex contention.
+
+### Per-Client Output Queues
+
+Each client has its own 32,768-slot output queue. This is critical:
+
+- A slow client (backpressure on send) doesn't block other clients
+- The router can keep routing even when one client is congested
+- Reading and writing happen concurrently within each client handler
 
 ---
 
-## Per-Client Output Queues (v3)
+## Data Flow
 
-### The Problem (v1/v2)
-
-In earlier versions, the output routing path looked like this:
+### Order Submission Flow
 
 ```
-drainOutputQueues() → encode() → queueFramedSend() → [16MB buffer] → flushSend() → send()
-                                        ↑                                    ↑
-                                  copies to buffer                    syscall blocks everything
+1. TCP bytes arrive at client socket
+2. Client Handler reads bytes into StreamParser
+3. StreamParser decodes complete message (binary protocol)
+4. Handler wraps message in InputEnvelope with client_id
+5. Handler pushes to Global Input Queue (spins if full)
+6. Processor pops InputEnvelope
+7. Processor calls MatchingEngine.processMessage()
+8. MatchingEngine routes to appropriate OrderBook
+9. OrderBook generates output messages (Ack, Trade, etc.)
+10. Processor wraps outputs in OutputEnvelope
+11. Processor pushes to Global Output Queue
+12. Router pops OutputEnvelope
+13. Router routes to target client(s):
+    - client_id=0 → broadcast to all
+    - client_id=N → specific client only
+14. Router pushes to Per-Client Output Queue
+15. Client Handler pops from its output queue
+16. Handler encodes and sends over TCP
 ```
 
-This had several issues:
-- **Blocking sends**: `flushSend()` would loop calling `send()` until all data was sent
-- **Coupled routing**: Message routing was tied to TCP I/O performance
-- **No client isolation**: A slow client would block all other clients
-- **Syscall overhead**: Many small `send()` calls instead of batched writes
+### Backpressure Handling
 
-### The Solution (v3)
-
-The v3 architecture introduces **per-client lock-free output queues**, inspired by high-performance C matching engine implementations:
-
-```
-drainOutputQueues() → encode() → client.queueOutput() → [per-client SPSC queue]
-                                        ↑                           ↓
-                                  just a queue push           [later, on EPOLLOUT]
-                                  (no syscall!)                      ↓
-                                                    client.drainToSocket() → batched send()
-```
-
-### Key Components
-
-#### Per-Client Output Queue
-
-Each TCP client has its own lock-free SPSC queue:
+The processor implements careful backpressure handling to prevent message loss:
 
 ```zig
-const OutputQueue = SpscQueue(EncodedMessage, OUTPUT_QUEUE_CAPACITY);
+// Processor tracks output drain index to resume if queue was full
+output_drain_index: u32
 
-pub const TcpClient = struct {
-    // ... existing fields ...
-    output_queue: ?*OutputQueue,  // NEW: per-client output queue
-    
-    /// Queue an encoded message for sending. This is FAST - just a queue push.
-    pub fn queueOutput(self: *Self, data: []const u8) bool {
-        const queue = self.output_queue orelse return false;
-        var msg = EncodedMessage.init();
-        if (!msg.set(data)) return false;
-        return queue.push(msg);
+fn drainOutputToQueue(self: *Self, output_queue: *OutputEnvelopeQueue) u32 {
+    // Resume draining where we left off
+    var i: u32 = self.output_drain_index;
+    while (i < total) : (i += 1) {
+        if (output_queue.push(envelope)) {
+            self.output_drain_index = i + 1;
+        } else {
+            // Queue full - remember position for later
+            return drained;
+        }
     }
-    
-    /// Drain queued messages to socket. Called on EPOLLOUT.
-    pub fn drainToSocket(self: *Self) !u32 {
-        // Batch multiple messages into send buffer
-        // Single send() syscall for the batch
-        // Returns number of messages sent
-    }
-};
-```
-
-#### Output Dispatch Flow
-
-```zig
-pub fn pollOnce(self: *Self, timeout_ms: i32) !void {
-    // 1) Service socket events (EPOLLOUT drains client queues)
-    if (self.cfg.tcp_enabled) _ = try self.tcp.poll(0);
-    
-    // 2) Drain processor outputs into per-client queues (fast)
-    _ = self.drainOutputQueues();
-    
-    // 3) Enable EPOLLOUT for clients with queued output
-    self.enableWriteForClientsWithOutput();
-    
-    // 4) Poll again to service EPOLLOUT
-    if (self.cfg.tcp_enabled) _ = try self.tcp.poll(timeout_ms);
 }
-```
-
-### Benefits
-
-| Aspect | v1/v2 | v3 |
-|--------|-------|-----|
-| Routing latency | ~1-10μs (includes syscall) | ~10-50ns (queue push only) |
-| Client isolation | None (shared buffer) | Full (per-client queue) |
-| Batching | Limited | Automatic (batch per EPOLLOUT) |
-| Backpressure | Blocks hot path | Isolated to slow client |
-| Syscall overhead | Many small sends | Few batched sends |
-
-### Configuration
-
-```zig
-// Per-client output queue capacity
-const OUTPUT_QUEUE_CAPACITY: usize = 32768;
-
-// Maximum encoded message size
-const MAX_ENCODED_SIZE: usize = 256;
-
-// Maximum messages to drain per EPOLLOUT event
-const MAX_DRAIN_PER_EVENT: u32 = 1024;
 ```
 
 ---
 
 ## Core Components
 
-### MatchingEngine
+### Order (64 bytes)
 
-The central coordinator that owns order books and dispatches messages.
+Cache-line aligned order structure prevents false sharing between adjacent orders:
 
-```zig
-pub const MatchingEngine = struct {
-    pools: *MemoryPools,
-    order_symbol_map: [ORDER_SYMBOL_MAP_SIZE]OrderSymbolSlot,  // ~48MB
-    next_internal_id: u64,
-    
-    // Statistics
-    orders_processed: u64,
-    trades_executed: u64,
-    orders_rejected: u64,
-
-    pub fn processMessage(
-        self: *Self,
-        msg: *const InputMsg,
-        client_id: u32,
-        output: *OutputBuffer,
-    ) void;
-    
-    pub fn cancelClientOrders(
-        self: *Self,
-        client_id: u32,
-        output: *OutputBuffer,
-    ) u32;
-};
 ```
-
-**Responsibilities**:
-- Route messages to appropriate order book
-- Generate unique internal order IDs
-- Track order ownership for client disconnect cleanup
-- Collect output messages
+┌─────────────────────────────────────────────────────────────────┐
+│ Bytes 0-19: Hot Fields (accessed during matching)               │
+│ ┌─────────┬─────────────┬───────┬──────────┬───────────────┐   │
+│ │ user_id │ user_order  │ price │ quantity │ remaining_qty │   │
+│ │ (4B)    │ _id (4B)    │ (4B)  │ (4B)     │ (4B)          │   │
+│ └─────────┴─────────────┴───────┴──────────┴───────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│ Bytes 20-31: Metadata                                           │
+│ ┌──────┬────────────┬────────┬───────────┬─────────┐           │
+│ │ side │ order_type │ pad[2] │ client_id │ pad[4]  │           │
+│ │ (1B) │ (1B)       │        │ (4B)      │         │           │
+│ └──────┴────────────┴────────┴───────────┴─────────┘           │
+├─────────────────────────────────────────────────────────────────┤
+│ Bytes 32-39: Timestamp (u64)                                    │
+├─────────────────────────────────────────────────────────────────┤
+│ Bytes 40-55: Linked List Pointers                               │
+│ ┌──────────────────────┬──────────────────────┐                 │
+│ │ next: ?*Order (8B)   │ prev: ?*Order (8B)   │                 │
+│ └──────────────────────┴──────────────────────┘                 │
+├─────────────────────────────────────────────────────────────────┤
+│ Bytes 56-63: Padding to cache line                              │
+└─────────────────────────────────────────────────────────────────┘
+                        Total: 64 bytes (one cache line)
+```
 
 ### OrderBook
 
-Price-time priority order book with O(1) operations.
-
-```zig
-pub const OrderBook = struct {
-    // Price levels indexed by price (0 to MAX_PRICE_LEVELS-1)
-    bid_levels: [MAX_PRICE_LEVELS]PriceLevel,
-    ask_levels: [MAX_PRICE_LEVELS]PriceLevel,
-    
-    // Best price tracking
-    best_bid: u32,
-    best_ask: u32,
-    
-    symbol: Symbol,
-
-    pub fn addOrder(self: *Self, order: *Order, output: *OutputBuffer) void;
-    pub fn cancelOrder(self: *Self, order: *Order, output: *OutputBuffer) void;
-    pub fn match(self: *Self, order: *Order, output: *OutputBuffer) void;
-};
-```
-
-**Order Matching Algorithm**:
-```
-For a BUY order at price P with quantity Q:
-1. Find best ASK price
-2. While best_ask <= P and Q > 0:
-   a. Match against orders at best_ask (FIFO within price level)
-   b. Generate trade messages
-   c. Update quantities
-   d. Remove filled orders
-   e. Update best ask if level depleted
-3. If Q > 0, add remaining to BID book at price P
-4. Emit top-of-book update if BBO changed
-```
-
-### Order
-
-Order representation with cache-line alignment considerations.
-
-```zig
-pub const Order = struct {
-    // Identity
-    internal_id: u64,           // Engine-assigned unique ID
-    user_id: u32,
-    user_order_id: u32,
-    client_id: u32,
-    
-    // Order details
-    price: u32,
-    quantity: u32,
-    remaining_qty: u32,
-    side: Side,
-    symbol: Symbol,
-    
-    // Intrusive list pointers (for price level FIFO queue)
-    prev: ?*Order,
-    next: ?*Order,
-    
-    // Metadata
-    timestamp_ns: i128,
-};
-```
-
-### OrderMap
-
-O(1) order lookup by composite key (user_id, user_order_id).
-
-```zig
-pub const OrderMap = struct {
-    slots: [ORDER_MAP_SIZE]OrderMapSlot,  // ~16MB
-    
-    pub fn insert(self: *Self, user_id: u32, order_id: u32, order: *Order) bool;
-    pub fn find(self: *Self, user_id: u32, order_id: u32) ?*Order;
-    pub fn remove(self: *Self, user_id: u32, order_id: u32) ?*Order;
-};
-```
-
-Uses open addressing with linear probing. Key is FNV-1a hash of (user_id, user_order_id).
-
----
-
-## Protocol Layer
-
-### Message Types
-
-**Input Messages** (defined in `message_types.zig`):
-
-| Type | Wire Code | Description |
-|------|-----------|-------------|
-| `new_order` | 'N' | Submit new order |
-| `cancel` | 'C' | Cancel existing order |
-| `flush` | 'F' | Cancel all orders (testing) |
-
-**Output Messages**:
-
-| Type | Wire Code | Description |
-|------|-----------|-------------|
-| `ack` | 'A' | Order accepted |
-| `reject` | 'R' | Order rejected |
-| `trade` | 'T' | Execution report |
-| `cancel_ack` | 'X' / 'C' | Cancel confirmed |
-| `top_of_book` | 'B' | BBO update |
-
-### Protocol Detection
+Single-symbol order book with price-time priority:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Incoming Bytes                        │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-                           ▼
-              ┌────────────────────────┐
-              │   First Byte Analysis  │
-              └────────────┬───────────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         │                 │                 │
-         ▼                 ▼                 ▼
-      0x4D ('M')      'N','C','F'       '8' + "=FIX"
-      (Binary)          (CSV)             (FIX)
-         │                 │                 │
-         ▼                 ▼                 ▼
-  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-  │binary_codec  │ │ csv_codec    │ │ fix_codec    │
-  │.decode()     │ │.decode()     │ │.decode()     │
-  └──────────────┘ └──────────────┘ └──────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         OrderBook                                │
+├─────────────────────────────────────────────────────────────────┤
+│ symbol: [16]u8                                                   │
+├─────────────────────────────────────────────────────────────────┤
+│ Bids (sorted by price descending)                               │
+│ ┌───────────────────────────────────────────────────────────┐   │
+│ │ PriceLevel[0]: price=105, qty=1000, orders→[O1]→[O2]→... │   │
+│ │ PriceLevel[1]: price=104, qty=500,  orders→[O3]→...      │   │
+│ │ PriceLevel[2]: price=103, qty=200,  orders→[O4]          │   │
+│ │ ... (up to 512 levels)                                    │   │
+│ └───────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│ Asks (sorted by price ascending)                                │
+│ ┌───────────────────────────────────────────────────────────┐   │
+│ │ PriceLevel[0]: price=106, qty=800,  orders→[O5]→[O6]→... │   │
+│ │ PriceLevel[1]: price=107, qty=300,  orders→[O7]          │   │
+│ │ ... (up to 512 levels)                                    │   │
+│ └───────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│ order_map: Open-addressing hash table (16K slots)               │
+│   Key: (user_id << 32) | user_order_id                          │
+│   Value: OrderLocation { side, price, order_ptr }               │
+├─────────────────────────────────────────────────────────────────┤
+│ pool: OrderPool (8K pre-allocated orders)                       │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Binary Wire Format
+### MatchingEngine
 
-All integers are **big-endian** (network byte order). Magic byte 0x4D ('M') identifies binary protocol.
-
-**New Order (27 bytes)**:
-```
-Offset  Size  Field         Description
-──────  ────  ───────────   ─────────────────
-0       1     magic         0x4D ('M')
-1       1     msg_type      0x4E ('N')
-2       4     user_id       User identifier
-6       8     symbol        Null-padded ASCII
-14      4     price         Price (integer)
-18      4     quantity      Order quantity
-22      1     side          'B' (0x42) or 'S' (0x53)
-23      4     user_order_id User's order ID
-──────  ────  ───────────
-Total   27    bytes
-```
-
-**Cancel (18 bytes)**:
-```
-Offset  Size  Field
-──────  ────  ───────────
-0       1     magic (0x4D)
-1       1     msg_type (0x43 = 'C')
-2       4     user_id
-6       8     symbol
-14      4     user_order_id
-```
-
-**Trade (34 bytes)**:
-```
-Offset  Size  Field
-──────  ────  ───────────
-0       1     magic (0x4D)
-1       1     msg_type (0x54 = 'T')
-2       8     symbol
-10      4     buy_user_id
-14      4     buy_order_id
-18      4     sell_user_id
-22      4     sell_order_id
-26      4     price
-30      4     quantity
-```
-
-**Ack (18 bytes)**:
-```
-Offset  Size  Field
-──────  ────  ───────────
-0       1     magic (0x4D)
-1       1     msg_type (0x41 = 'A')
-2       8     symbol
-10      4     user_id
-14      4     user_order_id
-```
-
-**Reject (19 bytes)**:
-```
-Offset  Size  Field
-──────  ────  ───────────
-0       1     magic (0x4D)
-1       1     msg_type (0x52 = 'R')
-2       8     symbol
-10      4     user_id
-14      4     user_order_id
-18      1     reason
-```
-
-### CSV Format
-
-Human-readable, newline-terminated:
-```
-# Input
-N, <user_id>, <symbol>, <price>, <qty>, <side>, <order_id>
-C, <user_id>, <order_id>, [symbol]
-F
-
-# Output
-A, <symbol>, <user_id>, <order_id>
-T, <symbol>, <buy_uid>, <buy_oid>, <sell_uid>, <sell_oid>, <price>, <qty>
-B, <symbol>, <side>, <price>, <qty>
-C, <symbol>, <user_id>, <order_id>
-R, <symbol>, <user_id>, <order_id>, <reason>
-```
-
----
-
-## Transport Layer
-
-### TCP Server
-
-**Framing**: 4-byte big-endian length prefix:
-```
-┌────────────────┬─────────────────────────────────┐
-│  4 bytes (BE)  │         N bytes                 │
-│  message len   │         payload                 │
-└────────────────┴─────────────────────────────────┘
-```
-
-**Features**:
-- epoll (Linux) / kqueue (macOS) via `Poller` abstraction
-- Edge-triggered events with drain loops
-- Per-client heap-allocated buffers (16MB recv, 256KB send)
-- **Per-client output queues (32K capacity)** - NEW in v3
-- Idle timeout enforcement (default 300s)
-- Consecutive error tracking with auto-disconnect
-
-**Key Constants** (from `tcp_client.zig`):
-```zig
-RECV_BUFFER_SIZE = 16 * 1024 * 1024    // 16MB per client (receive)
-SEND_BUFFER_SIZE = 256 * 1024          // 256KB per client (send batching)
-OUTPUT_QUEUE_CAPACITY = 32768          // 32K messages per client
-FRAME_HEADER_SIZE = 4                  // Length prefix
-MAX_MESSAGE_SIZE = 65536               // Max payload
-MAX_CONSECUTIVE_ERRORS = 10            // Before disconnect
-MAX_CLIENTS = 64                       // Concurrent connections
-```
-
-### UDP Server
-
-Stateless protocol with O(1) client tracking via hash table:
-
-```zig
-pub const UdpServer = struct {
-    fd: ?posix.fd_t,
-    clients: UdpClientMap,        // Hash table: (IP,port) → client_id
-    on_message: MessageCallback,
-
-    pub fn poll(self: *Self) !usize;
-    pub fn send(self: *Self, client_id: ClientId, data: []const u8) bool;
-};
-```
-
-**Client Tracking**:
-- FNV-1a inspired hash of (IP, port)
-- Open addressing with linear probing
-- LRU eviction when table full (4096 clients max)
-- Protocol auto-detection stored per client
-
-**Key Constants** (from `udp_server.zig`):
-```zig
-MAX_UDP_CLIENTS = 4096
-HASH_TABLE_SIZE = 8192         // 2x for load factor
-SOCKET_RECV_BUF_SIZE = 8MB     // Kernel buffer request
-MAX_PACKETS_PER_POLL = 1000    // Prevent starvation
-```
-
-### Multicast Publisher
-
-Market data distribution with sequence numbers:
-
-```zig
-pub const MulticastPublisher = struct {
-    fd: ?posix.fd_t,
-    sequence: u64,
-    dest_addr: sockaddr.in,
-
-    pub fn publish(self: *Self, msg: *const OutputMsg) bool;
-};
-```
-
-**Wire Format**:
-```
-┌──────────────────┬─────────────────────────────────┐
-│   8 bytes (BE)   │         Payload                 │
-│   sequence num   │    (encoded message)            │
-└──────────────────┴─────────────────────────────────┘
-```
-
-Subscribers use sequence numbers for gap detection.
-
----
-
-## Memory Management
-
-### Strategy
-
-**No dynamic allocation in the hot path.** All memory is pre-allocated at startup:
+Multi-symbol orchestrator:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Memory Layout                            │
-├─────────────────────────────────────────────────────────────┤
-│  Per-Processor:                                              │
-│  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │   Order Pool    │  │  OrderBook Pool │                   │
-│  │   (64K orders)  │  │   (1K books)    │                   │
-│  └─────────────────┘  └─────────────────┘                   │
-│                                                              │
-│  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │   Order Map     │  │ Order-Symbol Map│                   │
-│  │   (~16 MB)      │  │   (~48 MB)      │                   │
-│  └─────────────────┘  └─────────────────┘                   │
-│                                                              │
-│  Shared (I/O Thread):                                        │
-│  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │  Input Queues   │  │  Output Queues  │                   │
-│  │  2 × 256K slots │  │  2 × 256K slots │                   │
-│  └─────────────────┘  └─────────────────┘                   │
-│                                                              │
-│  Per-Client (v3):                                            │
-│  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │  Output Queue   │  │  Send Buffer    │                   │
-│  │  (32K messages) │  │  (256KB)        │                   │
-│  │  × max_clients  │  │  × max_clients  │                   │
-│  └─────────────────┘  └─────────────────┘                   │
-│                                                              │
-│  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │  TCP Recv       │  │  UDP Hash Table │                   │
-│  │  Buffers (heap) │  │  (~64 KB)       │                   │
-│  │  16MB × clients │  │                 │                   │
-│  └─────────────────┘  └─────────────────┘                   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      MatchingEngine                              │
+├─────────────────────────────────────────────────────────────────┤
+│ symbol_map: Hash table (512 slots)                              │
+│   "IBM"  → book_index=0                                         │
+│   "AAPL" → book_index=1                                         │
+│   ...                                                            │
+├─────────────────────────────────────────────────────────────────┤
+│ order_to_symbol: Hash table (8K slots)                          │
+│   (user_id, order_id) → symbol                                  │
+│   Used for cancel lookups                                        │
+├─────────────────────────────────────────────────────────────────┤
+│ books: [64]OrderBook                                            │
+│   books[0]: IBM                                                  │
+│   books[1]: AAPL                                                 │
+│   ...                                                            │
+└─────────────────────────────────────────────────────────────────┘
 ```
-
-### MemoryPools
-
-```zig
-pub const MemoryPools = struct {
-    allocator: std.mem.Allocator,
-    order_pool: OrderPool,
-    book_pool: BookPool,
-    
-    pub fn init(allocator: Allocator) !*MemoryPools;
-    pub fn allocOrder(self: *Self) ?*Order;
-    pub fn freeOrder(self: *Self, order: *Order) void;
-};
-```
-
-### ObjectPool
-
-Fixed-capacity freelist allocator:
-
-```zig
-pub fn ObjectPool(comptime T: type, comptime capacity: usize) type {
-    return struct {
-        items: []T,
-        free_indices: []u32,
-        free_count: u32,
-
-        pub fn alloc(self: *Self) ?*T;
-        pub fn free(self: *Self, item: *T) void;
-    };
-}
-```
-
----
-
-## Data Structures
 
 ### SPSC Queue
 
-Lock-free single-producer/single-consumer queue with cache-line aligned atomics:
+Lock-free single-producer single-consumer queue with cache-line separation:
 
-```zig
-pub fn SpscQueue(comptime T: type, comptime capacity: usize) type {
-    return struct {
-        buffer: [capacity]T align(CACHE_LINE_SIZE),
-        head: CacheLineAtomic,  // Consumer reads here
-        tail: CacheLineAtomic,  // Producer writes here
-
-        pub fn push(self: *Self, item: T) bool;
-        pub fn pop(self: *Self) ?T;
-        pub fn pushBatch(self: *Self, items: []const T) usize;
-        pub fn popBatch(self: *Self, out: []T) usize;
-    };
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        SpscQueue<T>                              │
+├─────────────────────────────────────────────────────────────────┤
+│ Cache Line 0: Producer-owned                                     │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ head: AtomicU64 (producer writes, consumer reads)           │ │
+│ │ _pad: [56]u8                                                 │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│ Cache Line 1: Consumer-owned                                     │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ tail: AtomicU64 (consumer writes, producer reads)           │ │
+│ │ _pad: [56]u8                                                 │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│ Cache Line 2+: Local caches (reduce atomic reads)               │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ cached_head: u64 (consumer's local copy of head)            │ │
+│ │ cached_tail: u64 (producer's local copy of tail)            │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│ Data: [capacity]T (power-of-2 for fast masking)                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Memory Ordering**:
-- `push`: Release semantics on tail update (ensures data visible)
-- `pop`: Acquire semantics on tail read (sees producer's writes)
-- No memory barriers needed within single thread
-
-**Usage in v3**:
-- Input queues: I/O thread → Processor threads (256K capacity)
-- Output queues: Processor threads → I/O thread (256K capacity)
-- **Per-client queues**: I/O thread internal (32K capacity per client)
-
-**Key Constants** (from `processor.zig`):
-```zig
-CHANNEL_CAPACITY = 262144       // Must be power of 2
-```
-
-### PriceLevel (Intrusive Doubly-Linked List)
-
-```zig
-pub const PriceLevel = struct {
-    head: ?*Order,
-    tail: ?*Order,
-    total_quantity: u32,
-    order_count: u16,
-
-    pub fn pushBack(self: *Self, order: *Order) void;
-    pub fn remove(self: *Self, order: *Order) void;
-    pub fn popFront(self: *Self) ?*Order;
-};
-```
-
-Orders maintain `prev/next` pointers for O(1) insertion and removal.
+Key optimizations:
+- **Cache-line separation**: head and tail on different cache lines prevents false sharing
+- **Cached values**: Producer caches tail, consumer caches head to reduce atomic operations
+- **Power-of-2 capacity**: `index & (capacity - 1)` instead of modulo
 
 ---
 
-## Message Flow
+## Memory Layout
 
-### New Order Flow (v3)
-
-```
-1. Client sends:     N, 1, AAPL, 15000, 100, B, 1
-                           │
-2. TCP/UDP receives        │
-                           ▼
-3. Codec decodes:    InputMsg{.new_order, user_id=1, symbol="AAPL", ...}
-                           │
-4. Router hashes:    "AAPL"[0] = 'A' → Processor 0
-                           │
-5. Enqueue:          input_queue[0].push(ProcessorInput{...})
-                           │
-                    ───────┼──────── Thread Boundary ────────
-                           │
-6. Processor pops:   input_queue[0].pop() → ProcessorInput
-                           │
-7. Engine validates: Check qty>0, price>0, no duplicate
-                           │
-8. Engine processes: matching_engine.processMessage(...)
-                           │
-9. Book matches:     order_book.addOrder(order, output)
-                           │
-10. Outputs:         [Ack, Trade?, TopOfBook?]
-                           │
-11. Enqueue:         output_queue[0].push(ProcessorOutput{...})
-                           │
-                    ───────┼──────── Thread Boundary ────────
-                           │
-12. I/O drains:      output_queue[0].pop() → ProcessorOutput
-                           │
-13. Encode:          binary_codec.encodeOutput(...)
-                           │
-14. Queue to client: client.queueOutput(encoded_data)   ◄── FAST (no syscall)
-                           │
-                    ─ ─ ─ ─┼─ ─ ─ ─ Later, on EPOLLOUT ─ ─ ─
-                           │
-15. EPOLLOUT fires:  tcp.poll() triggers writable event
-                           │
-16. Drain & Send:    client.drainToSocket()   ◄── Batched send()
-                           │
-17. Multicast:       multicast.publish(&trade) // if trade
-```
-
-### Key Difference from v1/v2
-
-In v1/v2, steps 14-16 were combined:
-```
-14. Queue + Send:    tcp.send(client_id, data)  ◄── Could block on syscall
-```
-
-In v3, they are separated:
-```
-14. Queue:           client.queueOutput(data)   ◄── Just a queue push (~50ns)
-    ...later...
-16. Send:            client.drainToSocket()     ◄── Batched, EPOLLOUT-driven
-```
-
-### Backpressure Handling
+### Envelope Structures (64 bytes each)
 
 ```
-Per-Client Output Queue Full:
-1. queueOutput() returns false
-2. Increment tcp_queue_failures counter
-3. Message is dropped (client-specific)
-4. Other clients are unaffected
+InputEnvelope (64 bytes):
+┌────────────────────────────────────────┐
+│ message: InputMsg (40 bytes)           │
+│ client_id: u32 (4 bytes)               │
+│ _pad: [20]u8                           │
+└────────────────────────────────────────┘
 
-Processor Output Queue Full:
-1. Spin wait (OUTPUT_SPIN_COUNT iterations)
-2. Yield wait (OUTPUT_YIELD_COUNT iterations)
-3. For critical messages (trade, reject):
-   - In debug: panic
-   - In release: increment critical_drop counter
-4. For non-critical (ack, top_of_book):
-   - Increment drop counter, continue
+OutputEnvelope (64 bytes):
+┌────────────────────────────────────────┐
+│ message: OutputMsg (52 bytes)          │
+│ client_id: u32 (4 bytes)               │
+│ sequence: u64 (8 bytes)                │
+└────────────────────────────────────────┘
 ```
+
+### Queue Capacities
+
+| Queue | Capacity | Element Size | Total Memory |
+|-------|----------|--------------|--------------|
+| Global Input Queue | 32,768 | 64 bytes | 2 MB |
+| Global Output Queue | 32,768 | 64 bytes | 2 MB |
+| Per-Client Output Queue | 32,768 | 52 bytes | ~1.7 MB |
+
+### Pre-allocated Pools
+
+| Pool | Capacity | Element Size | Total Memory |
+|------|----------|--------------|--------------|
+| Order Pool (per book) | 8,192 | 64 bytes | 512 KB |
+| Price Levels (per book) | 512 × 2 | 64 bytes | 64 KB |
 
 ---
 
-## Error Handling
+## Protocol Specification
 
-### Error Categories
+### Binary Protocol
 
-| Category | Examples | Handling |
-|----------|----------|----------|
-| Network | Connection reset, timeout | Log, cleanup client, continue |
-| Protocol | Invalid message, bad checksum | Reject, increment error counter |
-| Validation | Invalid price, duplicate ID | Reject with reason code |
-| Capacity | Queue full, pool exhausted | Backpressure, reject |
-| System | OOM, syscall failure | Propagate up, shutdown |
+All messages use big-endian byte order. Magic byte: `0x4D` ('M').
 
-### Reject Reason Codes
+#### New Order (27 bytes)
 
-| Code | Enum | Description |
-|------|------|-------------|
-| 1 | `unknown_symbol` | Symbol not recognized |
-| 2 | `invalid_quantity` | Quantity is zero |
-| 3 | `invalid_price` | Price is zero (for limit) |
-| 4 | `order_not_found` | Cancel: order doesn't exist |
-| 5 | `duplicate_order_id` | (user_id, order_id) already exists |
-| 6 | `pool_exhausted` | No free order slots |
-| 7 | `unauthorized` | User not permitted |
-| 8 | `throttled` | Rate limit exceeded |
-| 9 | `book_full` | Too many price levels |
-| 10 | `invalid_order_id` | Reserved key (0,0) used |
-
-### Health Monitoring
-
-```zig
-pub fn isHealthy(self: *const ThreadedServer) bool {
-    const stats = self.getStats();
-    // Critical drops indicate system overload
-    // Queue failures indicate client-specific issues (less severe)
-    return stats.totalCriticalDrops() == 0;
-}
 ```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('N')
+2       4     user_id (u32 BE)
+6       8     symbol (8 chars, null-padded)
+14      4     price (u32 BE, 0=market)
+18      4     quantity (u32 BE)
+22      1     side ('B'=buy, 'S'=sell)
+23      4     user_order_id (u32 BE)
+```
+
+#### Cancel (10 bytes)
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('C')
+2       4     user_id (u32 BE)
+6       4     user_order_id (u32 BE)
+```
+
+#### Flush (2 bytes)
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('F')
+```
+
+#### Ack (18 bytes)
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('A')
+2       8     symbol (8 chars)
+10      4     user_id (u32 BE)
+14      4     user_order_id (u32 BE)
+```
+
+#### Cancel Ack (18 bytes)
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('X')
+2       8     symbol (8 chars)
+10      4     user_id (u32 BE)
+14      4     user_order_id (u32 BE)
+```
+
+#### Trade (34 bytes)
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('T')
+2       8     symbol (8 chars)
+10      4     user_id_buy (u32 BE)
+14      4     user_order_id_buy (u32 BE)
+18      4     user_id_sell (u32 BE)
+22      4     user_order_id_sell (u32 BE)
+26      4     price (u32 BE)
+30      4     quantity (u32 BE)
+```
+
+#### Top of Book (19 bytes)
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────
+0       1     Magic (0x4D)
+1       1     Type ('B')
+2       8     symbol (8 chars)
+10      1     side ('B'=buy, 'S'=sell)
+11      4     price (u32 BE, 0=eliminated)
+15      4     quantity (u32 BE, 0=eliminated)
+```
+
+### FIX Protocol
+
+*FIX 4.2 protocol support is planned for a future release. The architecture supports multiple protocols through the `StreamParser` abstraction in `framing.zig`.*
 
 ---
 
 ## Performance Optimizations
 
-### v3 Per-Client Queue Optimizations
+### 1. Cache-Line Alignment
 
-1. **Decoupled Routing**: `queueOutput()` is just a lock-free push (~10-50ns)
-2. **Batched Syscalls**: `drainToSocket()` batches multiple messages per `send()`
-3. **EPOLLOUT-Driven**: Only call `send()` when kernel signals socket readiness
-4. **Client Isolation**: Slow clients don't block fast clients
-5. **Reduced Contention**: No shared send buffer between clients
-
-### Hot Path Optimizations
-
-1. **Zero-Copy Message Passing**: Messages decoded once, pointer passed through queues
-2. **Heap-Allocated Client Buffers**: Avoids stack overflow, allows large buffers
-3. **Lock-Free Queues**: No mutex contention between I/O and processor threads
-4. **O(1) Order Lookup**: Hash-based OrderMap for cancel operations
-5. **Intrusive Lists**: No allocation for queue operations within price levels
-
-### Cache Optimizations
+All frequently-accessed structures are 64-byte aligned:
 
 ```zig
-const CACHE_LINE_SIZE = 64;
-
-// SPSC queue head/tail on separate cache lines
-const CacheLineAtomic = struct {
-    value: std.atomic.Value(usize) align(CACHE_LINE_SIZE),
-    _padding: [CACHE_LINE_SIZE - @sizeOf(std.atomic.Value(usize))]u8,
+pub const Order = extern struct {
+    // ... fields ...
+    comptime {
+        std.debug.assert(@sizeOf(Order) == 64);
+    }
 };
 ```
 
-### Batching
+This prevents false sharing when multiple threads access adjacent memory.
 
-**Output Drain Batching**:
+### 2. RDTSCP Timestamps
+
+On x86-64, orders use the hardware timestamp counter for minimal-latency time priority:
+
 ```zig
-OUTPUT_DRAIN_LIMIT = 262144    // Messages per drain cycle
-MAX_DRAIN_PER_EVENT = 1024     // Messages per EPOLLOUT (per client)
-OUTPUT_BATCH_SIZE = 1400       // Bytes per UDP packet
-MAX_OUTPUT_BATCHES = 64        // UDP batches per drain
+inline fn rdtscp() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtscp"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+        :
+        : .{ .ecx = true }
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
 ```
 
-### Platform-Specific
+~5-10 CPU cycles vs ~20-50ns for `clock_gettime()`.
 
-- **Linux**: epoll with edge-triggered mode, TCP_QUICKACK
-- **macOS**: kqueue with EV_CLEAR (edge-like behavior)
-- **Both**: TCP_NODELAY, large socket buffers, SIGPIPE ignored
+### 3. Open-Addressing Hash Tables
+
+All hash tables use open-addressing with linear probing:
+
+- No pointer chasing (cache-friendly)
+- Power-of-2 sizes for fast masking
+- Tombstone-based deletion
+- Bounded probe lengths (Power of Ten Rule 2)
+
+```zig
+const hash = hashOrderKey(key);
+var i: u32 = 0;
+while (i < MAX_PROBE_LENGTH) : (i += 1) {
+    const idx = (hash + i) & ORDER_MAP_MASK;
+    // ...
+}
+```
+
+### 4. Batch Processing
+
+The processor handles messages in batches to amortize overhead:
+
+```zig
+pub const BATCH_SIZE: u32 = 8;
+
+while (processed < BATCH_SIZE) {
+    const envelope = input_queue.pop() orelse break;
+    self.processMessage(&envelope.message, envelope.client_id);
+    processed += 1;
+}
+```
+
+### 5. Spin-Then-Sleep
+
+Threads use adaptive waiting to balance latency and CPU usage:
+
+```zig
+// Spin briefly for low-latency
+var spin: u32 = 0;
+while (spin < SPIN_COUNT and input_queue.isEmpty()) : (spin += 1) {
+    std.atomic.spinLoopHint();
+}
+
+// Then sleep to save CPU
+if (input_queue.isEmpty()) {
+    std.Thread.sleep(100_000); // 100us
+}
+```
+
+### 6. TCP_NODELAY
+
+All client sockets disable Nagle's algorithm for immediate transmission:
+
+```zig
+const nodelay: u32 = 1;
+try posix.setsockopt(
+    self.stream.handle,
+    posix.IPPROTO.TCP,
+    posix.TCP.NODELAY,
+    &std.mem.toBytes(nodelay),
+);
+```
 
 ---
 
-## Appendix: Configuration Constants
+## Design Decisions
 
-```zig
-// Threading (processor.zig)
-CHANNEL_CAPACITY = 262144       // SPSC queue size (power of 2)
-OUTPUT_DRAIN_LIMIT = 262144     // Max outputs per drain cycle
+### Why Zig?
 
-// Per-Client (tcp_client.zig) - NEW in v3
-OUTPUT_QUEUE_CAPACITY = 32768   // Per-client output queue
-MAX_ENCODED_SIZE = 256          // Bytes per queued message
-MAX_DRAIN_PER_EVENT = 1024      // Messages per EPOLLOUT
+1. **Zero-cost abstractions**: Comptime evaluation, no hidden allocations
+2. **Explicit memory management**: No GC pauses
+3. **C interop**: Easy integration with existing trading infrastructure
+4. **Safety with escape hatches**: Bounds checking with ability to disable
+5. **Cross-compilation**: Single toolchain for all targets
 
-// Network (config.zig, tcp_client.zig, udp_server.zig)
-DEFAULT_TCP_PORT = 1234
-DEFAULT_UDP_PORT = 1235
-DEFAULT_MCAST_PORT = 1236
-DEFAULT_MCAST_GROUP = "239.255.0.1"
-MAX_TCP_CLIENTS = 64
-MAX_UDP_CLIENTS = 4096
-RECV_BUFFER_SIZE = 16 * 1024 * 1024   // 16MB per TCP client
-SEND_BUFFER_SIZE = 256 * 1024         // 256KB per TCP client (batching only)
-MAX_MESSAGE_SIZE = 65536              // Max framed message
-SOCKET_RECV_BUF_SIZE = 8MB            // UDP kernel buffer
+### Why Thread-Per-Client?
 
-// Memory (memory_pool.zig, matching_engine.zig)
-ORDER_POOL_CAPACITY = 65536     // Orders per processor
-BOOK_POOL_CAPACITY = 1024       // Order books per processor
-ORDER_MAP_SIZE = 2097152        // ~2M slots for O(1) lookup
-ORDER_SYMBOL_MAP_SIZE = 2097152 // ~2M for client disconnect cleanup
+Alternatives considered:
 
-// Matching (order_book.zig)
-MAX_PRICE_LEVELS = 1000000      // Price range 0-999999
+| Approach | Pros | Cons |
+|----------|------|------|
+| Single-threaded epoll | Simple, no locks | Backpressure deadlock |
+| Thread pool | Bounded resources | Complex scheduling |
+| **Thread-per-client** | No deadlock, simple | More threads |
+| io_uring | Best performance | Complex, Linux-only |
 
-// Backpressure (processor.zig)
-OUTPUT_SPIN_COUNT = 100         // Spins before yield
-PANIC_ON_CRITICAL_DROP = true   // In debug mode
-```
+Thread-per-client was chosen for simplicity and correctness. The C implementation proved this approach achieves excellent throughput.
+
+### Why Pre-allocated Memory?
+
+Following Power of Ten Rule 3:
+
+- Predictable latency (no malloc during trading)
+- No memory fragmentation
+- Bounded memory usage
+- Easier reasoning about capacity
+
+### Why Separate Order-to-Symbol Map?
+
+Cancel messages only contain `user_id` and `user_order_id`, not the symbol. The `order_to_symbol` map provides O(1) lookup to find which order book contains the order.
+
+### Why 64-Byte Structures?
+
+Modern x86-64 cache lines are 64 bytes. Aligning structures to cache lines:
+
+- Prevents false sharing between threads
+- Ensures atomic access to entire structure
+- Maximizes cache utilization
+
+---
+
+## Future Considerations
+
+### Potential Optimizations
+
+1. **io_uring**: Replace epoll with io_uring for batched syscalls
+2. **Kernel bypass**: DPDK or XDP for zero-copy networking
+3. **NUMA awareness**: Pin threads to specific cores
+4. **Huge pages**: Reduce TLB misses for large allocations
+
+### Planned Features
+
+1. **FIX 4.2 protocol**: Industry-standard messaging
+2. **Multicast market data**: UDP broadcast for price updates
+3. **Persistence**: Order book snapshots and replay
+4. **Monitoring**: Prometheus metrics endpoint
 
 ---
 
 ## References
 
-- [NASA Power of Ten Rules](https://spinroot.com/gerard/pdf/P10.pdf)
-- [Lock-Free Programming](https://www.cs.cmu.edu/~410-s05/lectures/L31_LockFree.pdf)
-- [Trading and Exchanges: Market Microstructure](https://global.oup.com/academic/product/trading-and-exchanges-9780195144703)
-- High-performance C matching engine implementations (design inspiration for v3)
+- [Power of Ten - Rules for Developing Safety Critical Code](https://en.wikipedia.org/wiki/The_Power_of_10:_Rules_for_Developing_Safety-Critical_Code)
+- [Lock-Free Data Structures](https://www.cs.rochester.edu/~scott/papers/1996_PODC_queues.pdf)
+- [What Every Programmer Should Know About Memory](https://people.freebsd.org/~lstewart/articles/cpumemory.pdf)
